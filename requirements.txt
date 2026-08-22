@@ -1,0 +1,21 @@
+# Snapdragon NPU (Hexagon HTP) via ONNX Runtime QNN Execution Provider.
+#
+# IMPORTANT: install into a venv that has NO plain `onnxruntime` package.
+# onnxruntime-qnn ships the same `onnxruntime` module and the two collide.
+# If both ever land, the clean fix is a fresh venv (uninstall + --no-deps
+# reinstall is NOT reliable). See README "Install".
+#
+# Target: Windows on ARM64 (Snapdragon X Elite / X1E80100), Python 3.11-3.14.
+# win_arm64 wheels exist for cp311 / cp312 / cp313 / cp314.
+
+onnxruntime-qnn==2.5.0   # plugin EP for onnxruntime 1.29 (pulls onnxruntime 1.29 as a dep)
+onnx>=1.16               # model construction for the benchmark
+numpy>=1.26
+
+# --- NOT installed here (full-LLM path, optional) ---------------------------
+# onnxruntime-genai is the LLM wrapper (tokenizer + KV-cache + generation loop).
+# Its latest release (0.15.2) has NO cp314 win_arm64 wheel (max cp313), so a
+# genai-based decode harness needs a cp311/cp312/cp313 venv. See
+# docs/MODEL_CONVERSION.md. Do NOT add it to this file; it would force a
+# Python downgrade for the GEMM benchmark, which does not need it.
+#   pip install onnxruntime-genai   # in a cp311/312/313 venv only
