@@ -23,6 +23,7 @@ Config via environment (all have sensible defaults for this repo's scratchpad):
 import ctypes as C
 import json
 import os
+import queue
 import re
 import socket
 import sys
@@ -61,9 +62,14 @@ SENTENCE_CONTINUE = 2
 SENTENCE_END = 3
 SENTENCE_ABORT = 4
 
+# GenieDialog_Action_t
+GENIE_DIALOG_ACTION_ABORT = 0x01
+
 Handle = C.c_void_p
 # void callback(const char* response, int sentenceCode, const void* userData)
 QUERY_CALLBACK = C.CFUNCTYPE(None, C.c_char_p, C.c_int, C.c_void_p)
+# void alloc(const size_t size, const char** allocatedData)  (GenieCommon.h)
+ALLOC_CALLBACK = C.CFUNCTYPE(None, C.c_size_t, C.POINTER(C.c_char_p))
 
 
 class ChatML:
@@ -98,22 +104,29 @@ class ChatML:
 
 
 class GenieEngine:
-    """Resident Genie dialog on the HTP. All queries serialized by a lock."""
+    """Resident Genie dialog on the HTP. All NPU access serialized by a lock."""
 
-    def __init__(self, lib, dialog):
+    def __init__(self, lib, dialog, tokenizer=None):
         self.lib = lib
         self.dialog = dialog
+        self.tokenizer = tokenizer
         self.lock = threading.Lock()
 
+    @staticmethod
+    def _finish(status):
+        if status == GENIE_STATUS_WARNING_CONTEXT_EXCEEDED:
+            return "length"
+        if status != GENIE_STATUS_SUCCESS:
+            raise RuntimeError("GenieDialog_query failed, status=%d" % status)
+        return "stop"
+
     def query(self, prompt, on_text, max_tokens=None):
-        """Run one query. on_text(str) is called for each streamed chunk.
-        Returns finish_reason ('stop' | 'length'). Serialized (NPU is single)."""
+        """Run one query synchronously (for non-streaming). on_text(str) is
+        called per chunk. Returns 'stop' | 'length'. Serialized (NPU is single)."""
         with self.lock:
             self.lib.GenieDialog_reset(self.dialog)
             if max_tokens:
                 self.lib.GenieDialog_setMaxNumTokens(self.dialog, C.c_uint32(max_tokens))
-
-            state = {"finish": "stop"}
 
             def _cb(resp, code, _udata):
                 if resp:
@@ -121,18 +134,86 @@ class GenieEngine:
                         on_text(resp.decode("utf-8", "replace"))
                     except Exception:
                         pass
-                if code == SENTENCE_ABORT:
-                    state["finish"] = "stop"
 
             cb = QUERY_CALLBACK(_cb)  # keep ref alive for the blocking call
             status = self.lib.GenieDialog_query(
-                self.dialog, prompt.encode("utf-8"), SENTENCE_COMPLETE, cb, None
-            )
-            if status == GENIE_STATUS_WARNING_CONTEXT_EXCEEDED:
-                state["finish"] = "length"
-            elif status != GENIE_STATUS_SUCCESS:
-                raise RuntimeError("GenieDialog_query failed, status=%d" % status)
-            return state["finish"]
+                self.dialog, prompt.encode("utf-8"), SENTENCE_COMPLETE, cb, None)
+            return self._finish(status)
+
+    def query_stream(self, prompt, result, max_tokens=None):
+        """Generator: yields text chunks, then sets result['finish'] (and
+        result['error'] on failure) when done. The blocking Genie query runs on
+        a WORKER thread so the consumer (the request/handler thread) can call
+        signal_abort() on client disconnect -- a cross-thread signal, which is
+        how Genie's abort is designed to be delivered. This is what actually
+        frees the single-flight lock instead of running to max_tokens."""
+        q = queue.Queue()
+
+        def worker():
+            try:
+                with self.lock:
+                    self.lib.GenieDialog_reset(self.dialog)
+                    if max_tokens:
+                        self.lib.GenieDialog_setMaxNumTokens(self.dialog, C.c_uint32(max_tokens))
+
+                    def _cb(resp, code, _udata):
+                        if resp:
+                            try:
+                                q.put(("text", resp.decode("utf-8", "replace")))
+                            except Exception:
+                                pass
+
+                    cb = QUERY_CALLBACK(_cb)
+                    status = self.lib.GenieDialog_query(
+                        self.dialog, prompt.encode("utf-8"), SENTENCE_COMPLETE, cb, None)
+                q.put(("done", self._finish(status)))
+            except Exception as e:
+                q.put(("error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        while True:
+            kind, val = q.get()
+            if kind == "text":
+                yield val
+            elif kind == "done":
+                result["finish"] = val
+                return
+            else:
+                result["finish"] = "stop"
+                result["error"] = val
+                return
+
+    def signal_abort(self):
+        """Ask Genie to abort the in-progress query (client disconnected) so the
+        single-flight lock frees without generating to max_tokens."""
+        try:
+            self.lib.GenieDialog_signal(self.dialog, GENIE_DIALOG_ACTION_ABORT)
+        except Exception:
+            pass
+
+    def count_tokens(self, text):
+        """Exact token count via the Genie tokenizer, or None on any failure
+        (callers fall back to an estimate). Serialized with generation."""
+        if not self.tokenizer or not text:
+            return None
+        try:
+            with self.lock:
+                held = []  # keep the alloc'd buffer alive across the encode call
+
+                def _alloc(size, out_pp):
+                    b = C.create_string_buffer(size if size > 0 else 1)
+                    held.append(b)
+                    out_pp[0] = C.cast(b, C.c_char_p)
+
+                acb = ALLOC_CALLBACK(_alloc)
+                tokptr = C.POINTER(C.c_int32)()
+                ntok = C.c_uint32(0)
+                st = self.lib.GenieTokenizer_encode(
+                    self.tokenizer, text.encode("utf-8"), acb,
+                    C.byref(tokptr), C.byref(ntok))
+                return int(ntok.value) if st == GENIE_STATUS_SUCCESS else None
+        except Exception:
+            return None
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
@@ -140,6 +221,41 @@ _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
 def _maybe_strip_think(text):
     return _THINK_RE.sub("", text) if STRIP_THINK else text
+
+
+def _anthropic_text(content):
+    """Flatten an Anthropic content value (str, or a list of content blocks)
+    down to plain text for this text-only model. Text and tool_result blocks
+    contribute text; images / tool_use are ignored."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts = []
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, str):
+                parts.append(b)
+            elif isinstance(b, dict):
+                t = b.get("type")
+                if t == "text":
+                    parts.append(b.get("text", ""))
+                elif t == "tool_result":
+                    parts.append(_anthropic_text(b.get("content")))
+    return "".join(parts)
+
+
+def _anthropic_to_prompt(req):
+    """Build the ChatML prompt from an Anthropic Messages request. Anthropic
+    keeps `system` as a top-level field, so fold it in as a system message."""
+    msgs = []
+    sysval = req.get("system")
+    if sysval:
+        msgs.append({"role": "system", "content": _anthropic_text(sysval)})
+    for m in req.get("messages", []):
+        msgs.append({"role": m.get("role", "user"),
+                     "content": _anthropic_text(m.get("content"))})
+    return TEMPLATE.build(msgs)
 
 
 def load_engine():
@@ -171,6 +287,14 @@ def load_engine():
     lib.GenieDialog_setMaxNumTokens.restype = C.c_int
     lib.GenieDialog_free.argtypes = [Handle]
     lib.GenieDialog_free.restype = C.c_int
+    lib.GenieDialog_signal.argtypes = [Handle, C.c_int]
+    lib.GenieDialog_signal.restype = C.c_int
+    lib.GenieDialog_getTokenizer.argtypes = [Handle, C.POINTER(Handle)]
+    lib.GenieDialog_getTokenizer.restype = C.c_int
+    lib.GenieTokenizer_encode.argtypes = [
+        Handle, C.c_char_p, ALLOC_CALLBACK,
+        C.POINTER(C.POINTER(C.c_int32)), C.POINTER(C.c_uint32)]
+    lib.GenieTokenizer_encode.restype = C.c_int
 
     # Genie resolves the config's relative ctx-bin / tokenizer paths against CWD.
     os.chdir(BUNDLE_DIR)
@@ -190,7 +314,10 @@ def load_engine():
         sys.exit("GenieDialog_create failed, status=%d" % st)
     print("[genie] model resident on HTP in %.1fs" % (time.time() - t0), flush=True)
 
-    return GenieEngine(lib, dialog)
+    tok = Handle()
+    tokenizer = tok if lib.GenieDialog_getTokenizer(
+        dialog, C.byref(tok)) == GENIE_STATUS_SUCCESS else None
+    return GenieEngine(lib, dialog, tokenizer)
 
 
 def load_chat_template():
@@ -213,6 +340,19 @@ def load_chat_template():
 ENGINE = None
 TEMPLATE = None
 
+# Bound the number of in-flight generation requests (1 running on the NPU + a
+# small queue). Excess requests are rejected fast instead of piling up parked
+# threads behind the single-flight lock. 0 disables the cap.
+MAX_INFLIGHT = int(os.environ.get("GENIE_MAX_INFLIGHT", "2"))
+_INFLIGHT = threading.BoundedSemaphore(MAX_INFLIGHT) if MAX_INFLIGHT > 0 else None
+
+
+def _tok_count(text):
+    """Exact token count if the Genie tokenizer is available, else a ~4-char
+    estimate. Never raises."""
+    n = ENGINE.count_tokens(text) if ENGINE else None
+    return n if n is not None else max(0, len(text) // 4)
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -229,6 +369,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quieter
         pass
 
+    def handle_one_request(self):
+        # A client that disconnects (typed cancelling a turn, a closed keep-alive)
+        # otherwise dumps a ConnectionReset/Aborted traceback from the base handler.
+        try:
+            super().handle_one_request()
+        except (ConnectionError, OSError):
+            self.close_connection = True
+
     def _json(self, code, obj):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
@@ -239,8 +387,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/") == "/v1/models":
+            # Superset item: satisfies both OpenAI (id/object) and Anthropic
+            # (type/id/display_name) model-list shapes.
             self._json(200, {"object": "list", "data": [
-                {"id": MODEL_ID, "object": "model", "owned_by": "qualcomm-genie-npu"}
+                {"id": MODEL_ID, "object": "model", "type": "model",
+                 "display_name": MODEL_ID, "owned_by": "qualcomm-genie-npu"}
             ]})
         elif self.path.rstrip("/") in ("/health", "/healthz"):
             self._json(200, {"status": "ok", "model": MODEL_ID})
@@ -248,9 +399,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def do_POST(self):
-        if self.path.rstrip("/") != "/v1/chat/completions":
-            self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
-            return
+        path = self.path.rstrip("/")
         try:
             length = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(length) or b"{}")
@@ -258,7 +407,27 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": {"message": "bad JSON: %s" % e,
                                        "type": "invalid_request_error"}})
             return
+        gen = {"/v1/chat/completions": self._openai_chat,   # OpenAI Chat Completions
+               "/v1/messages": self._anthropic_messages      # Anthropic Messages (typed)
+               }.get(path)
+        if gen is None:
+            self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
+            return
+        if _INFLIGHT is not None and not _INFLIGHT.acquire(blocking=False):
+            # NPU is single-flight and the small queue is full -> shed load.
+            if path == "/v1/messages":
+                self._anthropic_error(529, "overloaded_error", "server busy; NPU is single-flight")
+            else:
+                self._json(429, {"error": {"message": "server busy; NPU is single-flight",
+                                           "type": "overloaded_error"}})
+            return
+        try:
+            gen(req)
+        finally:
+            if _INFLIGHT is not None:
+                _INFLIGHT.release()
 
+    def _openai_chat(self, req):
         messages = req.get("messages", [])
         if not messages:
             self._json(400, {"error": {"message": "messages required",
@@ -269,7 +438,6 @@ class Handler(BaseHTTPRequestHandler):
         prompt = TEMPLATE.build(messages)
         created = int(time.time())
         cmpl_id = "chatcmpl-%d" % created
-
         if stream:
             self._stream(prompt, max_tokens, cmpl_id, created)
         else:
@@ -283,6 +451,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": {"message": str(e), "type": "server_error"}})
             return
         content = _maybe_strip_think("".join(chunks))
+        pt, ct = _tok_count(prompt), _tok_count(content)
         self._json(200, {
             "id": cmpl_id, "object": "chat.completion", "created": created,
             "model": MODEL_ID,
@@ -291,41 +460,138 @@ class Handler(BaseHTTPRequestHandler):
                 "message": {"role": "assistant", "content": content},
                 "finish_reason": finish,
             }],
-            # Best-effort usage (NPU tokenizer count not surfaced cheaply).
-            "usage": {"prompt_tokens": len(prompt) // 4,
-                      "completion_tokens": len(content) // 4,
-                      "total_tokens": (len(prompt) + len(content)) // 4},
+            "usage": {"prompt_tokens": pt, "completion_tokens": ct,
+                      "total_tokens": pt + ct},
         })
 
     def _stream(self, prompt, max_tokens, cmpl_id, created):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        # No Content-Length/chunked on an SSE body, so frame the response by
+        # connection close -- otherwise read-to-EOF clients hang on keep-alive.
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
 
+        gone = {"v": False}
+
         def sse(obj):
-            self.wfile.write(b"data: " + json.dumps(obj).encode("utf-8") + b"\n\n")
-            self.wfile.flush()
+            if gone["v"]:
+                return
+            try:
+                self.wfile.write(b"data: " + json.dumps(obj).encode("utf-8") + b"\n\n")
+                self.wfile.flush()
+            except (ConnectionError, OSError):
+                gone["v"] = True
+                ENGINE.signal_abort()
 
         def frame(delta, finish=None):
             return {"id": cmpl_id, "object": "chat.completion.chunk", "created": created,
                     "model": MODEL_ID,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-        sse(frame({"role": "assistant"}))
         # NOTE: with STRIP_THINK we cannot cleanly strip mid-stream, so streamed
         # output is always faithful (includes <think>); non-stream honors the flag.
-        try:
-            finish = ENGINE.query(
-                prompt, lambda t: sse(frame({"content": t})), max_tokens=max_tokens)
-        except Exception as e:
-            sse(frame({"content": "\n[error: %s]" % e}, finish="stop"))
-            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+        sse(frame({"role": "assistant"}))
+        res = {}
+        for chunk in ENGINE.query_stream(prompt, res, max_tokens=max_tokens):
+            sse(frame({"content": chunk}))
+            if gone["v"]:
+                break
+        if res.get("error") and not gone["v"]:
+            sse(frame({"content": "\n[error: %s]" % res["error"]}))
+        sse(frame({}, finish=res.get("finish", "stop")))
+        if not gone["v"]:
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (ConnectionError, OSError):
+                pass
+
+    # ---- Anthropic Messages API (POST /v1/messages) -----------------------
+
+    def _anthropic_error(self, code, etype, msg):
+        self._json(code, {"type": "error", "error": {"type": etype, "message": msg}})
+
+    def _anthropic_messages(self, req):
+        if not req.get("messages"):
+            self._anthropic_error(400, "invalid_request_error", "messages required")
             return
-        sse(frame({}, finish=finish))
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        model = req.get("model") or MODEL_ID
+        max_tokens = int(req.get("max_tokens") or DEFAULT_MAX_TOKENS)
+        prompt = _anthropic_to_prompt(req)
+        msg_id = "msg_%d" % int(time.time())
+        if bool(req.get("stream", False)):
+            self._anthropic_stream(prompt, max_tokens, model, msg_id)
+        else:
+            self._anthropic_complete(prompt, max_tokens, model, msg_id)
+
+    def _anthropic_complete(self, prompt, max_tokens, model, msg_id):
+        chunks = []
+        try:
+            finish = ENGINE.query(prompt, chunks.append, max_tokens=max_tokens)
+        except Exception as e:
+            self._anthropic_error(500, "api_error", str(e))
+            return
+        content = _maybe_strip_think("".join(chunks))
+        self._json(200, {
+            "id": msg_id, "type": "message", "role": "assistant", "model": model,
+            "content": [{"type": "text", "text": content}],
+            "stop_reason": "max_tokens" if finish == "length" else "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": _tok_count(prompt),
+                      "output_tokens": _tok_count(content)},
+        })
+
+    def _anthropic_stream(self, prompt, max_tokens, model, msg_id):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        # Frame the SSE body by connection close (no Content-Length/chunked).
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+
+        gone = {"v": False}
+
+        def ev(etype, obj):
+            if gone["v"]:
+                return
+            try:
+                self.wfile.write(("event: %s\n" % etype).encode("utf-8"))
+                self.wfile.write(b"data: " + json.dumps(obj).encode("utf-8") + b"\n\n")
+                self.wfile.flush()
+            except (ConnectionError, OSError):
+                gone["v"] = True          # client disconnected mid-stream
+                ENGINE.signal_abort()     # cross-thread abort -> free the NPU lock
+
+        ev("message_start", {"type": "message_start", "message": {
+            "id": msg_id, "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": _tok_count(prompt), "output_tokens": 0}}})
+        ev("content_block_start", {"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}})
+        ev("ping", {"type": "ping"})
+
+        out = []
+        res = {}
+        for chunk in ENGINE.query_stream(prompt, res, max_tokens=max_tokens):
+            out.append(chunk)
+            ev("content_block_delta", {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": chunk}})
+            if gone["v"]:
+                break
+        if res.get("error") and not gone["v"]:
+            ev("content_block_delta", {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "\n[error: %s]" % res["error"]}})
+        finish = res.get("finish", "stop")
+        ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+        ev("message_delta", {"type": "message_delta",
+            "delta": {"stop_reason": "max_tokens" if finish == "length" else "end_turn",
+                      "stop_sequence": None},
+            "usage": {"output_tokens": _tok_count("".join(out))}})
+        ev("message_stop", {"type": "message_stop"})
 
 
 def main():
@@ -333,9 +599,10 @@ def main():
     TEMPLATE = load_chat_template()
     ENGINE = load_engine()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
-    print("[genie] OpenAI-compatible endpoint on http://%s:%d  (model=%s)"
-          % (HOST, PORT, MODEL_ID), flush=True)
-    print("[genie]   POST /v1/chat/completions   GET /v1/models   GET /health", flush=True)
+    print("[genie] endpoint on http://%s:%d  (model=%s)" % (HOST, PORT, MODEL_ID), flush=True)
+    print("[genie]   POST /v1/chat/completions (OpenAI)   POST /v1/messages (Anthropic)",
+          flush=True)
+    print("[genie]   GET /v1/models   GET /health", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
