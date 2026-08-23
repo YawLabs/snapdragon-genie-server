@@ -69,6 +69,27 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 
 ## Notes / limitations
 
+- **Context window: evict, don't crash.** The compiled window is fixed (this
+  bundle: 4096) and Genie has NO sliding-window mode -- QAIRT 2.45 exposes no
+  such flag on `genie-t2t-run` and no equivalent config key, and overflowing is
+  a hard `GenieDialog_query` failure, not a truncation. So the server evicts:
+  oldest turns are dropped until the prompt fits, with the system turn and tool
+  schemas anchored and tool results never separated from the call that produced
+  them. Eviction is logged (never silent). A single message too big to fit even
+  alone gets a 400 naming the token counts, not a doomed query.
+  `GENIE_WINDOW_MARGIN` (default 64) is the headroom left for generation.
+
+- **KV reuse across turns.** The dialog keeps its KV between queries, so when a
+  request's prompt is a byte-exact extension of what the dialog already holds,
+  only the new suffix is prefilled. Measured: 1.23s cold, then 0.66s / 0.68s on
+  the two following turns of the same conversation, versus 5.48s for an
+  unrelated one. The match must be exact -- edited history, an evicted turn, or
+  an aborted generation all fall back to a full re-prefill, because resuming on
+  mismatched KV would answer from a history that never happened.
+  (`GenieDialog_save`/`restore` also exist and work -- measured ~75 KB/token on
+  disk, ~128 MB at 1711 tokens -- but they are not used: in-memory continuation
+  is free and this server serves one conversation at a time.)
+
 - **Single-flight.** The NPU serves one query at a time (concurrent HTP access
   wedges the device), so requests are serialized by a lock. Fine for one agent.
 - **Tool calling works, and thinking dominates its latency.** Enabled when the
