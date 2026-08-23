@@ -78,6 +78,9 @@ SUMMARY_MAX_TOKENS = int(os.environ.get("GENIE_SUMMARY_MAX_TOKENS", "192"))
 # until the notes themselves fill the window.
 SUMMARY_MARKER = "[earlier context]"
 
+_CONTEXT_SIZE = None
+
+
 def read_context_size(default=4096):
     """The context length this bundle was COMPILED with, from genie_config.json.
 
@@ -92,14 +95,22 @@ def read_context_size(default=4096):
     answering with a slightly stale number is far better than the server
     failing to start over a field it only needs for a metadata endpoint.
     """
+    # Cached after the first read: the value cannot change while the bundle is
+    # loaded, and this sits on the request path (build_windowed every request,
+    # again on eviction and on /props) -- re-opening and JSON-parsing the config
+    # per request is blocking file I/O for a constant.
+    global _CONTEXT_SIZE
+    if _CONTEXT_SIZE is not None:
+        return _CONTEXT_SIZE
     try:
         with open(os.path.join(BUNDLE_DIR, "genie_config.json"), "r",
                   encoding="utf-8") as f:
             cfg = json.load(f)
-        size = cfg["dialog"]["context"]["size"]
-        return int(size) if int(size) > 0 else default
+        size = int(cfg["dialog"]["context"]["size"])
+        _CONTEXT_SIZE = size if size > 0 else default
     except Exception:
-        return default
+        _CONTEXT_SIZE = default
+    return _CONTEXT_SIZE
 
 
 LIB_DIR = os.path.join(SDK_DIR, "lib", "aarch64-windows-msvc")
@@ -280,6 +291,36 @@ def parse_tool_calls(text):
     return visible, calls
 
 
+def _content_text(content):
+    """Flatten a message `content` value to plain text.
+
+    Both APIs allow content to be a LIST of blocks, not just a string --
+    OpenAI SDKs emit [{"type":"text","text":...}] by default. ChatML.build
+    string-concatenates, so an unflattened list raised TypeError and killed the
+    handler thread, handing the client a dropped connection with no error body.
+    The Anthropic path already flattened; this is the shared version so the two
+    endpoints cannot drift apart again.
+
+    Text and tool_result blocks contribute text; images and tool_use do not.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts = []
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, str):
+                parts.append(b)
+            elif isinstance(b, dict):
+                t = b.get("type")
+                if t == "text":
+                    parts.append(b.get("text", ""))
+                elif t == "tool_result":
+                    parts.append(_content_text(b.get("content")))
+    return "".join(parts)
+
+
 class ChatML:
     """Prompt formatting from the bundle metadata's chat_template."""
 
@@ -304,7 +345,7 @@ class ChatML:
         sys_text = ""
         for m in messages:
             if m.get("role") == "system":
-                sys_text = m.get("content", "") or ""
+                sys_text = _content_text(m.get("content"))
                 break
         if not sys_text and self.default_system:
             sys_text = self.default_system
@@ -323,7 +364,7 @@ class ChatML:
         while i < n:
             m = messages[i]
             role = m.get("role", "user")
-            content = m.get("content", "") or ""
+            content = _content_text(m.get("content"))
             if role == "system":
                 i += 1                       # already folded into the system turn
                 continue
@@ -331,7 +372,7 @@ class ChatML:
                 # Consecutive tool results share ONE user turn, per the template.
                 chunk = []
                 while i < n and messages[i].get("role") == "tool":
-                    c = messages[i].get("content", "") or ""
+                    c = _content_text(messages[i].get("content"))
                     chunk.append("<tool_response>" + _NL + c + _NL + "</tool_response>")
                     i += 1
                 parts.append(self.usr_pre + _NL.join(chunk) + self.usr_suf)
@@ -377,6 +418,11 @@ class GenieEngine:
         # Exact text the dialog's KV currently holds; None means "unknown,
         # re-prefill". Set by _commit, cleared on any failure or abort.
         self._committed = None
+        # Set by signal_abort (handler thread) and consumed by _commit (worker
+        # thread, under the lock). signal_abort clearing _committed directly is
+        # not enough: the worker can finish and re-commit AFTER the clear,
+        # re-arming reuse against a generation that was cut short.
+        self._aborted = False
         # Assistant turn terminator, needed to reconstruct what the dialog
         # holds after a generation. Filled in from the template at startup.
         self.asst_suffix = ""
@@ -491,8 +537,9 @@ class GenieEngine:
         force the next turn to re-prefill. Guessing here would poison every
         subsequent continuation.
         """
-        if not ok:
+        if not ok or self._aborted:
             self._committed = None
+            self._aborted = False
             return
         # Exactly what was sent plus exactly what came back. Appending a turn
         # terminator we never sent would claim the KV holds a byte it may not,
@@ -503,6 +550,7 @@ class GenieEngine:
         """Run one query synchronously (for non-streaming). on_text(str) is
         called per chunk. Returns 'stop' | 'length'. Serialized (NPU is single)."""
         with self.lock:
+            self._aborted = False       # stale abort must not poison this turn
             self.set_stop_sequences(stop)
             self.apply_sampler(sampler)
             send, reused = self._plan(prompt)
@@ -545,6 +593,7 @@ class GenieEngine:
         def worker():
             try:
                 with self.lock:
+                    self._aborted = False
                     self.set_stop_sequences(stop)
                     self.apply_sampler(sampler)
                     send, reused = self._plan(prompt)
@@ -592,7 +641,10 @@ class GenieEngine:
         single-flight lock frees without generating to max_tokens."""
         # An aborted generation leaves a partial, unrecorded tail in the KV --
         # continuing from it would resume mid-sentence off a history we never
-        # recorded. Force the next turn to re-prefill.
+        # recorded. Force the next turn to re-prefill. The flag is what makes
+        # this stick: clearing _committed alone loses the race against a worker
+        # that commits after the abort lands.
+        self._aborted = True
         self._committed = None
         try:
             self.lib.GenieDialog_signal(self.dialog, GENIE_DIALOG_ACTION_ABORT)
@@ -632,25 +684,9 @@ def _maybe_strip_think(text):
 
 
 def _anthropic_text(content):
-    """Flatten an Anthropic content value (str, or a list of content blocks)
-    down to plain text for this text-only model. Text and tool_result blocks
-    contribute text; images / tool_use are ignored."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    parts = []
-    if isinstance(content, list):
-        for b in content:
-            if isinstance(b, str):
-                parts.append(b)
-            elif isinstance(b, dict):
-                t = b.get("type")
-                if t == "text":
-                    parts.append(b.get("text", ""))
-                elif t == "tool_result":
-                    parts.append(_anthropic_text(b.get("content")))
-    return "".join(parts)
+    """Anthropic content -> text. Delegates to the shared flattener so the two
+    endpoints cannot diverge on block handling."""
+    return _content_text(content)
 
 
 def read_default_sampler():
@@ -737,6 +773,28 @@ def _anthropic_tools(tools):
             "parameters": t.get("input_schema", {}),
         }})
     return out or None
+
+
+def _anthropic_stop_reason(finish, calls, stop):
+    """Anthropic stop_reason, distinguishing a stop-sequence cut from a natural end.
+
+    Reporting end_turn after a stop sequence fired tells the client the model
+    finished on its own when it was actually cut, which is the difference
+    between "done" and "resume from here".
+
+    Imprecision worth stating: Genie STRIPS the matched text, so we cannot
+    confirm which sequence fired, or distinguish a stop-sequence cut from a
+    natural EOS on a request that also supplied stop sequences. We report
+    stop_sequence whenever the caller asked for stop sequences and generation
+    did not run to the token cap -- the caller opted into that boundary, so it
+    is the likelier reading -- and leave `stop_sequence` null rather than guess
+    which one.
+    """
+    if calls:
+        return "tool_use"
+    if finish == "length":
+        return "max_tokens"
+    return "stop_sequence" if stop else "end_turn"
 
 
 def _anthropic_to_prompt(req, tools=None, max_tokens=0):
@@ -1403,14 +1461,11 @@ class Handler(BaseHTTPRequestHandler):
             blocks.append({"type": "tool_use",
                            "id": "toolu_%s_%d" % (msg_id, idx),
                            "name": c["name"], "input": c["arguments"]})
-        if calls:
-            stop = "tool_use"
-        else:
-            stop = "max_tokens" if finish == "length" else "end_turn"
+        reason = _anthropic_stop_reason(finish, calls, stop)
         self._json(200, {
             "id": msg_id, "type": "message", "role": "assistant", "model": model,
             "content": blocks,
-            "stop_reason": stop,
+            "stop_reason": reason,
             "stop_sequence": None,
             "usage": {"input_tokens": _tok_count(prompt),
                       "output_tokens": _tok_count(raw)},
@@ -1475,12 +1530,9 @@ class Handler(BaseHTTPRequestHandler):
                               "partial_json": json.dumps(c["arguments"])}})
                 ev("content_block_stop", {"type": "content_block_stop", "index": idx})
                 idx += 1
-            if calls:
-                stop = "tool_use"
-            else:
-                stop = "max_tokens" if finish == "length" else "end_turn"
+            reason = _anthropic_stop_reason(finish, calls, stop)
             ev("message_delta", {"type": "message_delta",
-                "delta": {"stop_reason": stop, "stop_sequence": None},
+                "delta": {"stop_reason": reason, "stop_sequence": None},
                 "usage": {"output_tokens": _tok_count(
                     _maybe_strip_think("".join(buf)))}})
             ev("message_stop", {"type": "message_stop"})
@@ -1505,7 +1557,7 @@ class Handler(BaseHTTPRequestHandler):
         finish = res.get("finish", "stop")
         ev("content_block_stop", {"type": "content_block_stop", "index": 0})
         ev("message_delta", {"type": "message_delta",
-            "delta": {"stop_reason": "max_tokens" if finish == "length" else "end_turn",
+            "delta": {"stop_reason": _anthropic_stop_reason(finish, None, stop),
                       "stop_sequence": None},
             "usage": {"output_tokens": _tok_count("".join(out))}})
         ev("message_stop", {"type": "message_stop"})
