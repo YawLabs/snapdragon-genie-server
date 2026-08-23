@@ -1,4 +1,4 @@
-# snapdragon-npu-onnx
+# snapdragon-npu-llm
 
 Running LLM compute on the **Snapdragon X Elite Hexagon NPU (HTP)** via
 **ONNX Runtime + the QNN Execution Provider**. This is the *productized* NPU
@@ -14,7 +14,7 @@ run** (not assumed).
 
 | | |
 |---|---|
-| Hardware | Snapdragon X Elite (X1E80100), Hexagon NPU / HTP |
+| Hardware | Snapdragon X Elite / X Plus (Hexagon v73, dev box is X1E80100) or X2 Elite (v81) -- the Windows-on-Snapdragon Hexagons. Verified on v73 only. |
 | OS | Windows on ARM64 (tested on Windows 11, build 26200) |
 | Python | 3.14 (win_arm64 wheels also exist for 3.11 / 3.12 / 3.13) |
 | Runtime | onnxruntime 1.29.0 + onnxruntime-qnn 2.5.0 |

@@ -9,8 +9,17 @@ bundle running on the Snapdragon X Elite NPU (Hexagon v73). The model is loaded
 
 - **Native ARM64 Python** (aarch64). Genie.dll and its Qnn* deps are
   `aarch64-windows-msvc`; an x64/emulated Python cannot load them.
-- The QAIRT 2.45 runtime (extracted) and a precompiled Genie bundle for X Elite.
-  Defaults point at this repo's scratchpad layout.
+- The QAIRT 2.45 runtime (extracted) and a Genie bundle matching this box's
+  Hexagon. Supported: **v73 (X Elite / X Plus)** and **v81 (X2 Elite)** -- the
+  two Windows-on-Snapdragon parts. The server derives that set at startup by
+  intersecting `lib/hexagon-v*/unsigned` (DSP skel) with
+  `lib/aarch64-windows-msvc/QnnHtpV*Stub.dll` (Windows stub); an arch needs
+  both. v75 (8 Gen 3) and v79 (8 Elite) ship a skel but no Windows stub -- they
+  are Android parts -- and are reported as skipped rather than silently
+  offered. `GENIE_HEXAGON_ARCH=v81` pins one arch.
+- A bundle is locked to one arch AND one QAIRT version; a mismatch fails at
+  `GenieDialog_create` with a message naming the archs this box can offer.
+
 - No pip packages. Pure Python stdlib.
 
 ## Run
@@ -33,7 +42,9 @@ is ~35-50s; after that every request reuses the resident model.
 ## Endpoints
 
 - `POST /v1/chat/completions` -- OpenAI chat API. Supports `messages`, `stream`
-  (SSE), `max_tokens`, `stop`. ChatML template is taken from the bundle's own
+  (SSE), `max_tokens`, and `tools`. (`stop` is NOT implemented -- the Genie C
+  API exposes `GenieDialog_setStopSequence`, but this server does not wire it
+  yet.) ChatML template is taken from the bundle's own
   `metadata.json` chat_template.
 - `GET /v1/models` -- lists the served model id (`GENIE_MODEL_ID`).
 - `GET /health` -- liveness.
@@ -48,19 +59,38 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 | var | default | meaning |
 |---|---|---|
 | `GENIE_BUNDLE_DIR` | scratchpad 4B bundle | dir with genie_config.json + part*_of_*.bin + tokenizer.json |
-| `GENIE_SDK_DIR` | scratchpad 2.45 SDK | QAIRT 2.45 root (lib/aarch64-windows-msvc, lib/hexagon-v73) |
+| `GENIE_SDK_DIR` | scratchpad 2.45 SDK | QAIRT 2.45 root (lib/aarch64-windows-msvc, lib/hexagon-v*) |
+| `GENIE_HEXAGON_ARCH` | unset | pin one skel arch (`v81`); default offers all |
 | `GENIE_HOST` / `GENIE_PORT` | 127.0.0.1 / 8080 | bind address |
 | `GENIE_MODEL_ID` | qwen3-4b-npu | id reported to clients |
 | `GENIE_MAX_TOKENS` | 512 | default cap when a request omits max_tokens |
 | `GENIE_STRIP_THINK` | 0 | 1 strips `<think>...</think>` from non-streamed content |
+| `GENIE_THINKING` | 1 | 0 suppresses Qwen3's reasoning block server-wide. Per request: `chat_template_kwargs.enable_thinking`, `reasoning_effort:"none"`, or `thinking:{"type":"disabled"}` |
 
 ## Notes / limitations
 
 - **Single-flight.** The NPU serves one query at a time (concurrent HTP access
   wedges the device), so requests are serialized by a lock. Fine for one agent.
-- **Reasoning model.** Qwen3 emits a `<think>...</think>` block before the answer.
-  Non-streaming honors `GENIE_STRIP_THINK=1`; streaming is always faithful
-  (can't cleanly strip mid-stream).
+- **Tool calling works, and thinking dominates its latency.** Enabled when the
+  bundle's tokenizer carries `<tool_call>` (probed at startup; a bundle without
+  it still gets an honest 400). Measured on this box, same prompt and same
+  correct call:
+
+  | | wall | completion tokens |
+  |---|---|---|
+  | thinking on (default) | 10.7 - 41 s | 113 - 300 |
+  | thinking off | 1.8 - 2.4 s | 17 - 25 |
+
+  Nearly all of the default-path cost is the `<think>` block, and its length
+  varies a lot run to run -- so agent step latency is not just slow but
+  unpredictable. For agentic use, turn thinking off.
+
+- **Tool-call wrappers vary.** `<tool_call>` is the trained, in-vocab tag, but
+  with thinking suppressed the model also emits `<function_call>` and
+  occasionally bare JSON with no wrapper. The parser accepts all of these; a
+  block whose payload does not parse is left VISIBLE in the content rather than
+  silently dropped, so a malformed call is debuggable instead of invisible.
+
 - **Throughput is bandwidth-bound.** Decode is ~13 t/s on a quiet box; it drops
   sharply under memory pressure (the X Elite's 32 GB LPDDR5x is shared by CPU/GPU/NPU),
   so a large resident model elsewhere (e.g. a 26 GB llama-server) will slow it.

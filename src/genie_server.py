@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 OpenAI-compatible HTTP server for a Qualcomm Genie NPU LLM bundle
-(Snapdragon X Elite / Hexagon v73).
+(Snapdragon, Hexagon HTP). Supported targets are the Windows-on-Snapdragon
+Hexagons: v73 (X Elite / X Plus) and v81 (X2 Elite). That set is DERIVED at
+startup, not hardcoded -- an arch counts only if the SDK ships both its skel
+and its Windows stub -- so a future Hexagon works without editing this file,
+and the Android-only archs (v75, v79) are excluded with a reason.
 
 Loads the Genie context-binary bundle ONCE via the Genie C API (ctypes ->
 Genie.dll) so the model stays resident on the HTP; every /v1/chat/completions
@@ -12,12 +16,16 @@ Python, because Genie.dll and its Qnn* deps are aarch64-windows-msvc.
 
 Config via environment (all have sensible defaults for this repo's scratchpad):
   GENIE_BUNDLE_DIR   dir with genie_config.json + part*_of_*.bin + tokenizer.json
-  GENIE_SDK_DIR      QAIRT 2.45 SDK root (contains lib/aarch64-windows-msvc + lib/hexagon-v73)
+  GENIE_SDK_DIR      QAIRT 2.45 SDK root (contains lib/aarch64-windows-msvc + lib/hexagon-v*)
+  GENIE_HEXAGON_ARCH pin one skel arch (e.g. "v81"); default = offer them all
   GENIE_HOST         bind host   (default 127.0.0.1)
   GENIE_PORT         bind port   (default 8080)
   GENIE_MODEL_ID     model id reported to clients (default qwen3-4b-npu)
   GENIE_MAX_TOKENS   default max generated tokens if request omits it (default 512)
   GENIE_STRIP_THINK  "1" strips <think>...</think> from content (default 0 = faithful)
+  GENIE_THINKING     "0" suppresses Qwen3's reasoning block entirely (default 1 = on).
+                     Per request: chat_template_kwargs.enable_thinking,
+                     reasoning_effort:"none", or thinking:{"type":"disabled"}
 """
 
 import ctypes as C
@@ -45,6 +53,13 @@ PORT = int(os.environ.get("GENIE_PORT", "8080"))
 MODEL_ID = os.environ.get("GENIE_MODEL_ID", "qwen3-4b-npu")
 DEFAULT_MAX_TOKENS = int(os.environ.get("GENIE_MAX_TOKENS", "512"))
 STRIP_THINK = os.environ.get("GENIE_STRIP_THINK", "0") == "1"
+# Qwen3 is a reasoning model: left alone it emits a <think> block before every
+# answer. Measured on this box, a single tool-calling turn spent ~280 of its
+# 300 output tokens thinking -- 37s for one agent step at 13 t/s. The bundle's
+# own template supports suppressing it by PREFILLING an empty think block, so
+# expose that as a knob. Default stays ON (faithful to the model); agent
+# clients that want the latency back turn it off per request or per server.
+THINKING_DEFAULT = os.environ.get("GENIE_THINKING", "1") != "0"
 
 def read_context_size(default=4096):
     """The context length this bundle was COMPILED with, from genie_config.json.
@@ -71,7 +86,50 @@ def read_context_size(default=4096):
 
 
 LIB_DIR = os.path.join(SDK_DIR, "lib", "aarch64-windows-msvc")
-HEXAGON_DIR = os.path.join(SDK_DIR, "lib", "hexagon-v73", "unsigned")
+
+
+def hexagon_search_path():
+    """Skel dirs for every Hexagon this box can ACTUALLY drive.
+
+    A Hexagon is usable here only if the SDK ships BOTH halves:
+      * lib/hexagon-vNN/unsigned/                    -- the DSP-side skel
+      * lib/aarch64-windows-msvc/QnnHtpVNNStub.dll   -- the Windows-side stub
+
+    This used to be hardcoded to hexagon-v73, which excluded X2 Elite (v81).
+    Globbing every skel was the other extreme: QAIRT 2.45 ships skels for
+    v66..v81, but Windows stubs for only a subset, because v75 (8 Gen 3) and
+    v79 (8 Elite) are Android parts -- skel present, no way to reach it from
+    Windows. Offering those would be a promise the box cannot keep.
+
+    Intersecting the two halves is what makes the supported set
+    self-maintaining: v73 (X Elite / X Plus) and v81 (X2 Elite) fall out
+    today, a future Hexagon falls out the day QAIRT ships both halves for it,
+    and nothing here has to be edited.
+
+    GENIE_HEXAGON_ARCH ("v81") pins one arch if you need to force it.
+    Returns (path_string, usable_archs, skel_only_archs).
+    """
+    import glob
+    import re
+    stubs = set()
+    for f in glob.glob(os.path.join(LIB_DIR, "QnnHtpV*Stub.dll")):
+        m = re.match(r"QnnHtpV(\d+)Stub\.dll$", os.path.basename(f))
+        if m:
+            stubs.add("v" + m.group(1))
+
+    pin = os.environ.get("GENIE_HEXAGON_ARCH", "").strip()
+    usable, skel_only, dirs = [], [], []
+    for d in sorted(glob.glob(os.path.join(SDK_DIR, "lib", "hexagon-v*", "unsigned"))):
+        if not os.path.isdir(d):
+            continue
+        arch = os.path.basename(os.path.dirname(d)).replace("hexagon-", "")
+        if arch not in stubs:
+            skel_only.append(arch)
+        elif not pin or arch == pin:
+            usable.append(arch)
+            dirs.append(d)
+    return os.pathsep.join(dirs), usable, skel_only
+
 
 # ---------------------------------------------------------------------------
 # Genie C API (from include/Genie/GenieDialog.h + GenieCommon.h)
@@ -96,6 +154,115 @@ QUERY_CALLBACK = C.CFUNCTYPE(None, C.c_char_p, C.c_int, C.c_void_p)
 ALLOC_CALLBACK = C.CFUNCTYPE(None, C.c_size_t, C.POINTER(C.c_char_p))
 
 
+# Qwen3's tool convention, lifted verbatim from the bundle's own
+# tokenizer_config.json chat_template (the Jinja one). We render it by hand
+# because this server is stdlib-only -- no Jinja -- but the strings and the
+# ordering below are the template's, not invented.
+_TOOLS_PREAMBLE_HEAD = """# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>"""
+
+_TOOLS_PREAMBLE_TAIL = """
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>"""
+
+_NL = chr(10)
+
+# Straight from the bundle's Jinja: enable_thinking=false prefills a CLOSED,
+# empty think block so the model resumes after it instead of opening its own.
+_NO_THINK = "<think>" + _NL + _NL + "</think>" + _NL + _NL
+
+# <tool_call>{...}</tool_call> and the aliases this model actually produces.
+# <tool_call> is the trained, in-vocab tag, but with the reasoning block
+# suppressed Qwen3 improvises: <function_call> was observed on this box for the
+# same prompt that wrapped correctly with thinking on. The backreference forces
+# the closing tag to match the opening one, and the payload still has to parse
+# as a call -- so widening the alternation cannot turn prose into a tool call.
+# DOTALL so a pretty-printed argument object matches.
+_TOOL_CALL_RE = re.compile(
+    r"<(?P<tag>tool_call|function_call|tool_use)>\s*(?P<body>.*?)\s*</(?P=tag)>", re.DOTALL)
+
+
+def _bare_tool_calls(text):
+    """Accept a whole-output JSON blob that is unambiguously a tool call.
+
+    Suppressing the reasoning block makes Qwen3 sometimes emit the call JSON
+    BARE -- correct name and arguments, no <tool_call> tags. Observed on this
+    box: the same prompt wraps correctly with thinking on and skips the tags
+    with it off. The caller asked for tools and the model produced a valid
+    call, so recognising it is right; handing back a JSON blob as "content"
+    would make every client re-implement this parse.
+
+    Deliberately strict: whole output only (no prose around it), and BOTH
+    "name" and "arguments" required. A bare {"name": ...} could be an ordinary
+    JSON answer -- the pair together is the documented call shape and little
+    else. Anything less certain stays text.
+    """
+    t = (text or "").strip()
+    if not (t.startswith("{") or t.startswith("[")):
+        return []
+    try:
+        obj = json.loads(t)
+    except Exception:
+        return []
+    items = obj if isinstance(obj, list) else [obj]
+    calls = []
+    for o in items:
+        if not (isinstance(o, dict) and "name" in o and "arguments" in o):
+            return []
+        args = o["arguments"]
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                pass
+        calls.append({"name": o["name"], "arguments": args})
+    return calls
+
+
+def parse_tool_calls(text):
+    """Split generated text into (visible_text, [{name, arguments}, ...]).
+
+    Returns calls only when the JSON actually parses. A malformed block is
+    LEFT IN the visible text rather than silently dropped -- the caller can
+    then see what the model emitted instead of getting a mystery empty
+    response, which is the same reason placement is asserted in bench.py.
+    """
+    calls, spans = [], []
+    for m in _TOOL_CALL_RE.finditer(text or ""):
+        try:
+            obj = json.loads(m.group("body"))
+            name = obj["name"]
+        except Exception:
+            continue  # malformed -> leave the raw block visible
+        args = obj.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                pass
+        calls.append({"name": name, "arguments": args})
+        spans.append(m.span())
+    out, prev = [], 0
+    for a, b in spans:
+        out.append(text[prev:a])
+        prev = b
+    out.append(text[prev:])
+    visible = "".join(out).strip()
+    if not calls:
+        bare = _bare_tool_calls(visible)
+        if bare:
+            return "", bare
+    return visible, calls
+
+
 class ChatML:
     """Prompt formatting from the bundle metadata's chat_template."""
 
@@ -108,22 +275,70 @@ class ChatML:
         self.asst_suf = tmpl["assistant_suffix"]
         self.default_system = tmpl.get("default_system_prompt", "")
 
-    def build(self, messages):
-        """Assemble a ChatML prompt ending with an open assistant turn."""
+    def build(self, messages, tools=None, thinking=True):
+        """Assemble a ChatML prompt ending with an open assistant turn.
+
+        `tools` renders Qwen3's tool preamble into the system turn; assistant
+        `tool_calls` and role="tool" results round-trip in the same shapes the
+        bundle's own Jinja template uses, so a multi-turn tool conversation
+        replays exactly as the model was trained to see it.
+        """
         parts = []
-        have_system = any(m.get("role") == "system" for m in messages)
-        if not have_system and self.default_system:
-            parts.append(self.sys_pre + self.default_system + self.sys_suf)
+        sys_text = ""
         for m in messages:
+            if m.get("role") == "system":
+                sys_text = m.get("content", "") or ""
+                break
+        if not sys_text and self.default_system:
+            sys_text = self.default_system
+
+        if tools:
+            body = sys_text + (_NL + _NL if sys_text else "")
+            body += _TOOLS_PREAMBLE_HEAD
+            for t in tools:
+                body += _NL + json.dumps(t)
+            body += _TOOLS_PREAMBLE_TAIL
+            parts.append(self.sys_pre + body + self.sys_suf)
+        elif sys_text:
+            parts.append(self.sys_pre + sys_text + self.sys_suf)
+
+        i, n = 0, len(messages)
+        while i < n:
+            m = messages[i]
             role = m.get("role", "user")
             content = m.get("content", "") or ""
             if role == "system":
-                parts.append(self.sys_pre + content + self.sys_suf)
-            elif role == "assistant":
-                parts.append(self.asst_pre + content + self.asst_suf)
-            else:  # user (and any tool/other role folded to user)
-                parts.append(self.usr_pre + content + self.usr_suf)
+                i += 1                       # already folded into the system turn
+                continue
+            if role == "tool":
+                # Consecutive tool results share ONE user turn, per the template.
+                chunk = []
+                while i < n and messages[i].get("role") == "tool":
+                    c = messages[i].get("content", "") or ""
+                    chunk.append("<tool_response>" + _NL + c + _NL + "</tool_response>")
+                    i += 1
+                parts.append(self.usr_pre + _NL.join(chunk) + self.usr_suf)
+                continue
+            if role == "assistant":
+                body = content
+                for tc in (m.get("tool_calls") or []):
+                    fn = tc.get("function", tc)
+                    args = fn.get("arguments", {})
+                    if not isinstance(args, str):
+                        args = json.dumps(args)
+                    if body:
+                        body += _NL
+                    body += ("<tool_call>" + _NL + '{"name": "' + fn.get("name", "")
+                             + '", "arguments": ' + args + "}" + _NL + "</tool_call>")
+                parts.append(self.asst_pre + body + self.asst_suf)
+                i += 1
+                continue
+            parts.append(self.usr_pre + content + self.usr_suf)
+            i += 1
+
         parts.append(self.asst_pre)  # open assistant turn for generation
+        if not thinking:
+            parts.append(_NO_THINK)
         return "".join(parts)
 
 
@@ -269,17 +484,84 @@ def _anthropic_text(content):
     return "".join(parts)
 
 
-def _anthropic_to_prompt(req):
-    """Build the ChatML prompt from an Anthropic Messages request. Anthropic
-    keeps `system` as a top-level field, so fold it in as a system message."""
+def _wants_thinking(req):
+    """Resolve the reasoning block for ONE request, newest convention first.
+
+    Three spellings are accepted because three ecosystems disagree and a client
+    should not have to know which one this server speaks:
+      * chat_template_kwargs.enable_thinking  -- the de-facto Qwen3 convention
+      * reasoning_effort: "none"              -- OpenAI's field
+      * thinking: {"type": "disabled"}        -- Anthropic's field
+    Absent all three, fall back to the server default (GENIE_THINKING).
+    """
+    kw = req.get("chat_template_kwargs")
+    if isinstance(kw, dict) and "enable_thinking" in kw:
+        return bool(kw["enable_thinking"])
+    eff = req.get("reasoning_effort")
+    if eff is not None:
+        return str(eff).lower() not in ("none", "minimal", "off")
+    th = req.get("thinking")
+    if isinstance(th, dict) and th.get("type"):
+        return th["type"] != "disabled"
+    return THINKING_DEFAULT
+
+
+def _anthropic_tools(tools):
+    """Anthropic {name, description, input_schema} -> the OpenAI function shape.
+
+    Qwen3 was trained with OpenAI-style function schemas inside <tools>, so we
+    hand it the shape it knows rather than Anthropic's. Same information,
+    familiar packaging -- the model's tool-call accuracy depends on it.
+    """
+    out = []
+    for t in tools or []:
+        out.append({"type": "function", "function": {
+            "name": t.get("name", ""),
+            "description": t.get("description", ""),
+            "parameters": t.get("input_schema", {}),
+        }})
+    return out or None
+
+
+def _anthropic_to_prompt(req, tools=None):
+    """Build the ChatML prompt from an Anthropic Messages request.
+
+    Anthropic carries tool traffic as content BLOCKS (tool_use on assistant
+    turns, tool_result on user turns); ChatML wants them as assistant
+    tool_calls and role="tool" messages. Translating here means a multi-turn
+    tool conversation replays in exactly the shape the bundle's template
+    expects, instead of being flattened to prose the model cannot act on.
+    """
     msgs = []
     sysval = req.get("system")
     if sysval:
         msgs.append({"role": "system", "content": _anthropic_text(sysval)})
     for m in req.get("messages", []):
-        msgs.append({"role": m.get("role", "user"),
-                     "content": _anthropic_text(m.get("content"))})
-    return TEMPLATE.build(msgs)
+        role = m.get("role", "user")
+        content = m.get("content")
+        blocks = content if isinstance(content, list) else None
+        if blocks:
+            def _of(kind):
+                return [x for x in blocks
+                        if isinstance(x, dict) and x.get("type") == kind]
+            text = "".join(x.get("text", "") for x in _of("text"))
+            results, uses = _of("tool_result"), _of("tool_use")
+            if results:
+                for r in results:
+                    msgs.append({"role": "tool",
+                                 "content": _anthropic_text(r.get("content"))})
+                if text:
+                    msgs.append({"role": role, "content": text})
+                continue
+            if uses:
+                msgs.append({"role": "assistant", "content": text,
+                             "tool_calls": [{"function": {
+                                 "name": u.get("name", ""),
+                                 "arguments": u.get("input", {})}} for u in uses]})
+                continue
+        msgs.append({"role": role, "content": _anthropic_text(content)})
+    return TEMPLATE.build(msgs, tools=_anthropic_tools(tools),
+                          thinking=_wants_thinking(req))
 
 
 def load_engine():
@@ -292,7 +574,20 @@ def load_engine():
     if not os.path.isdir(LIB_DIR):
         sys.exit("SDK lib dir not found: %s (check GENIE_SDK_DIR)" % LIB_DIR)
 
-    os.environ["ADSP_LIBRARY_PATH"] = HEXAGON_DIR
+    hex_path, hex_archs, hex_skel_only = hexagon_search_path()
+    if not hex_archs:
+        sys.exit("""no usable Hexagon under %s
+A Hexagon needs BOTH lib/hexagon-vNN/unsigned and
+lib/aarch64-windows-msvc/QnnHtpVNNStub.dll. Skels with no Windows stub
+here: %s  (v75 / v79 are Android parts and never have one.)
+Check GENIE_SDK_DIR, or unset GENIE_HEXAGON_ARCH if you pinned an arch."""
+                 % (SDK_DIR, ", ".join(hex_skel_only) or "(none)"))
+    os.environ["ADSP_LIBRARY_PATH"] = hex_path
+    note = ""
+    if hex_skel_only:
+        note = "  (skel-only, no Windows stub: %s)" % ", ".join(hex_skel_only)
+    print("[genie] hexagon archs usable: %s%s" % (", ".join(hex_archs), note),
+          flush=True)
     os.add_dll_directory(LIB_DIR)  # so Genie.dll's Qnn* deps resolve (py3.8+)
     os.environ["PATH"] = LIB_DIR + os.pathsep + os.environ.get("PATH", "")
 
@@ -335,7 +630,20 @@ def load_engine():
     print("[genie] loading model on the NPU (this takes ~8-12s)...", flush=True)
     st = lib.GenieDialog_create(cfg, C.byref(dialog))
     if st != GENIE_STATUS_SUCCESS:
-        sys.exit("GenieDialog_create failed, status=%d" % st)
+        # The overwhelmingly likely cause is an arch/version mismatch: a Genie
+        # context binary is compiled for ONE dsp_arch AND one QAIRT version, so
+        # a bundle built for another Hexagon cannot load here. A bare status
+        # code sends people hunting through their config; name the real suspect
+        # and show what this box can actually offer.
+        sys.exit("""GenieDialog_create failed, status=%d
+  bundle:      %s
+  SDK:         %s
+  archs here:  %s
+A Genie bundle is locked to one Hexagon arch AND one QAIRT version.
+If this bundle was built for an arch this box does not have (or for a
+different QAIRT), it cannot load -- get a bundle matching one of the
+archs above, or rebuild it for this device."""
+                 % (st, BUNDLE_DIR, SDK_DIR, ", ".join(hex_archs)))
     print("[genie] model resident on HTP in %.1fs" % (time.time() - t0), flush=True)
 
     tok = Handle()
@@ -361,8 +669,28 @@ def load_chat_template():
     })
 
 
+def probe_tool_support():
+    """Does THIS bundle's tokenizer actually know the tool-call tokens?
+
+    Derived from the artifact, never assumed. A bundle whose vocab lacks
+    <tool_call> cannot emit a parseable call no matter what we put in the
+    prompt, and answering normally while dropping the caller's tools is the
+    exact silent degradation this server refuses elsewhere. Qwen3 bundles
+    carry the tokens in added_tokens.json / tokenizer_config.json.
+    """
+    for fn in ("added_tokens.json", "tokenizer_config.json"):
+        try:
+            with open(os.path.join(BUNDLE_DIR, fn), "r", encoding="utf-8") as f:
+                if "<tool_call>" in f.read():
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 ENGINE = None
 TEMPLATE = None
+TOOLS_OK = False
 
 # Bound the number of in-flight generation requests (1 running on the NPU + a
 # small queue). Excess requests are rejected fast instead of piling up parked
@@ -464,25 +792,19 @@ class Handler(BaseHTTPRequestHandler):
         if gen is None:
             self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
             return
-        # REFUSE a tools payload rather than dropping it.
+        # Tools are supported when the BUNDLE can do them, and refused
+        # loudly when it cannot -- never accepted-and-dropped. The capability
+        # is probed from the tokenizer's vocab at startup (probe_tool_support),
+        # so a text-only bundle still gets the old honest 400 and typed's
+        # probeLocalToolCalls still reads it as "disable tools for this
+        # session" instead of shipping schemas the model would ignore.
         #
-        # This bundle is a text-only 4B build: it cannot emit tool_use /
-        # tool_calls blocks. Accepting `tools` and answering normally -- which
-        # is what this server did before -- looks like success to every client,
-        # so the caller registers its tool set and then watches every tool call
-        # silently not happen. There is no error to find and nothing on screen
-        # says why.
-        #
-        # A 400 naming the limitation converts that into something a client can
-        # act on. typed probes exactly this at startup (probeLocalToolCalls),
-        # and reads a 4xx as "tools unsupported" -> it disables them for the
-        # session and says so, instead of shipping schemas the model ignores.
-        #
-        # Checked BEFORE the single-flight lock: refusing costs no NPU time, so
-        # it must not queue behind a live generation.
-        if req.get("tools"):
-            msg = ("tool calling is not supported: %s is a text-only build and "
-                   "cannot emit tool_use blocks. Retry without `tools`." % MODEL_ID)
+        # Checked BEFORE the single-flight lock: refusing costs no NPU time,
+        # so it must not queue behind a live generation.
+        if req.get("tools") and not TOOLS_OK:
+            msg = ("tool calling is not supported: this bundle's tokenizer has "
+                   "no <tool_call> token, so %s cannot emit a parseable call. "
+                   "Retry without `tools`." % MODEL_ID)
             if path == "/v1/messages":
                 self._anthropic_error(400, "invalid_request_error", msg)
             else:
@@ -509,38 +831,56 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": {"message": "messages required",
                                        "type": "invalid_request_error"}})
             return
+        tools = req.get("tools") or None
         stream = bool(req.get("stream", False))
         max_tokens = int(req.get("max_tokens") or DEFAULT_MAX_TOKENS)
-        prompt = TEMPLATE.build(messages)
+        prompt = TEMPLATE.build(messages, tools=tools,
+                                thinking=_wants_thinking(req))
         created = int(time.time())
         cmpl_id = "chatcmpl-%d" % created
         if stream:
-            self._stream(prompt, max_tokens, cmpl_id, created)
+            self._stream(prompt, max_tokens, cmpl_id, created,
+                         tools_active=bool(tools))
         else:
-            self._complete(prompt, max_tokens, cmpl_id, created)
+            self._complete(prompt, max_tokens, cmpl_id, created,
+                           tools_active=bool(tools))
 
-    def _complete(self, prompt, max_tokens, cmpl_id, created):
+    def _complete(self, prompt, max_tokens, cmpl_id, created, tools_active=False):
         chunks = []
         try:
             finish = ENGINE.query(prompt, chunks.append, max_tokens=max_tokens)
         except Exception as e:
             self._json(500, {"error": {"message": str(e), "type": "server_error"}})
             return
-        content = _maybe_strip_think("".join(chunks))
-        pt, ct = _tok_count(prompt), _tok_count(content)
+        raw = _maybe_strip_think("".join(chunks))
+        content = raw
+        tool_calls = []
+        if tools_active:
+            content, calls = parse_tool_calls(content)
+            for idx, c in enumerate(calls):
+                tool_calls.append({
+                    "id": "call_%s_%d" % (cmpl_id, idx),
+                    "type": "function",
+                    "function": {"name": c["name"],
+                                 "arguments": json.dumps(c["arguments"])},
+                })
+        message = {"role": "assistant", "content": content or None}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            finish = "tool_calls"
+        # Count what the MODEL produced, not what survives parsing: the
+        # <tool_call> block is real generated output, and billing/budgeting a
+        # tool turn as 0 tokens is a lie the client cannot detect.
+        pt, ct = _tok_count(prompt), _tok_count(raw)
         self._json(200, {
             "id": cmpl_id, "object": "chat.completion", "created": created,
             "model": MODEL_ID,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": finish,
-            }],
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
             "usage": {"prompt_tokens": pt, "completion_tokens": ct,
                       "total_tokens": pt + ct},
         })
 
-    def _stream(self, prompt, max_tokens, cmpl_id, created):
+    def _stream(self, prompt, max_tokens, cmpl_id, created, tools_active=False):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -570,6 +910,42 @@ class Handler(BaseHTTPRequestHandler):
         # NOTE: with STRIP_THINK we cannot cleanly strip mid-stream, so streamed
         # output is always faithful (includes <think>); non-stream honors the flag.
         sse(frame({"role": "assistant"}))
+
+        def done():
+            if not gone["v"]:
+                try:
+                    self.wfile.write(("data: [DONE]" + chr(10) * 2).encode("utf-8"))
+                    self.wfile.flush()
+                except (ConnectionError, OSError):
+                    pass
+
+        if tools_active:
+            # A <tool_call> block means nothing until it CLOSES -- streaming it
+            # token-by-token would hand the client half a call to guess about.
+            # So generate fully, then emit well-formed frames: still SSE (the
+            # client asked for SSE), just not incremental. Buffering is the
+            # honest trade; a partial tool call is not.
+            buf = []
+            try:
+                finish = ENGINE.query(prompt, buf.append, max_tokens=max_tokens)
+            except Exception as e:
+                sse(frame({"content": "[error: %s]" % e}, finish="stop"))
+                done()
+                return
+            text, calls = parse_tool_calls(_maybe_strip_think("".join(buf)))
+            if text:
+                sse(frame({"content": text}))
+            for idx, c in enumerate(calls):
+                sse(frame({"tool_calls": [{
+                    "index": idx,
+                    "id": "call_%s_%d" % (cmpl_id, idx),
+                    "type": "function",
+                    "function": {"name": c["name"],
+                                 "arguments": json.dumps(c["arguments"])}}]}))
+            sse(frame({}, finish="tool_calls" if calls else finish))
+            done()
+            return
+
         res = {}
         for chunk in ENGINE.query_stream(prompt, res, max_tokens=max_tokens):
             sse(frame({"content": chunk}))
@@ -578,12 +954,7 @@ class Handler(BaseHTTPRequestHandler):
         if res.get("error") and not gone["v"]:
             sse(frame({"content": "\n[error: %s]" % res["error"]}))
         sse(frame({}, finish=res.get("finish", "stop")))
-        if not gone["v"]:
-            try:
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-            except (ConnectionError, OSError):
-                pass
+        done()
 
     # ---- Anthropic Messages API (POST /v1/messages) -----------------------
 
@@ -596,31 +967,51 @@ class Handler(BaseHTTPRequestHandler):
             return
         model = req.get("model") or MODEL_ID
         max_tokens = int(req.get("max_tokens") or DEFAULT_MAX_TOKENS)
-        prompt = _anthropic_to_prompt(req)
+        tools = req.get("tools") or None
+        prompt = _anthropic_to_prompt(req, tools=tools)
         msg_id = "msg_%d" % int(time.time())
         if bool(req.get("stream", False)):
-            self._anthropic_stream(prompt, max_tokens, model, msg_id)
+            self._anthropic_stream(prompt, max_tokens, model, msg_id,
+                                   tools_active=bool(tools))
         else:
-            self._anthropic_complete(prompt, max_tokens, model, msg_id)
+            self._anthropic_complete(prompt, max_tokens, model, msg_id,
+                                     tools_active=bool(tools))
 
-    def _anthropic_complete(self, prompt, max_tokens, model, msg_id):
+    def _anthropic_complete(self, prompt, max_tokens, model, msg_id,
+                            tools_active=False):
         chunks = []
         try:
             finish = ENGINE.query(prompt, chunks.append, max_tokens=max_tokens)
         except Exception as e:
             self._anthropic_error(500, "api_error", str(e))
             return
-        content = _maybe_strip_think("".join(chunks))
+        raw = _maybe_strip_think("".join(chunks))
+        content = raw
+        calls = []
+        if tools_active:
+            content, calls = parse_tool_calls(content)
+        blocks = []
+        if content:
+            blocks.append({"type": "text", "text": content})
+        for idx, c in enumerate(calls):
+            blocks.append({"type": "tool_use",
+                           "id": "toolu_%s_%d" % (msg_id, idx),
+                           "name": c["name"], "input": c["arguments"]})
+        if calls:
+            stop = "tool_use"
+        else:
+            stop = "max_tokens" if finish == "length" else "end_turn"
         self._json(200, {
             "id": msg_id, "type": "message", "role": "assistant", "model": model,
-            "content": [{"type": "text", "text": content}],
-            "stop_reason": "max_tokens" if finish == "length" else "end_turn",
+            "content": blocks,
+            "stop_reason": stop,
             "stop_sequence": None,
             "usage": {"input_tokens": _tok_count(prompt),
-                      "output_tokens": _tok_count(content)},
+                      "output_tokens": _tok_count(raw)},
         })
 
-    def _anthropic_stream(self, prompt, max_tokens, model, msg_id):
+    def _anthropic_stream(self, prompt, max_tokens, model, msg_id,
+                          tools_active=False):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -646,6 +1037,48 @@ class Handler(BaseHTTPRequestHandler):
             "id": msg_id, "type": "message", "role": "assistant", "model": model,
             "content": [], "stop_reason": None, "stop_sequence": None,
             "usage": {"input_tokens": _tok_count(prompt), "output_tokens": 0}}})
+        if tools_active:
+            # Same reasoning as the OpenAI stream: a tool_use block only means
+            # something once complete, so buffer the generation and emit whole
+            # blocks rather than a half-formed call the client must guess at.
+            buf = []
+            try:
+                finish = ENGINE.query(prompt, buf.append, max_tokens=max_tokens)
+            except Exception as e:
+                ev("error", {"type": "error",
+                             "error": {"type": "api_error", "message": str(e)}})
+                ev("message_stop", {"type": "message_stop"})
+                return
+            text, calls = parse_tool_calls(_maybe_strip_think("".join(buf)))
+            idx = 0
+            if text:
+                ev("content_block_start", {"type": "content_block_start", "index": idx,
+                    "content_block": {"type": "text", "text": ""}})
+                ev("content_block_delta", {"type": "content_block_delta", "index": idx,
+                    "delta": {"type": "text_delta", "text": text}})
+                ev("content_block_stop", {"type": "content_block_stop", "index": idx})
+                idx += 1
+            for n, c in enumerate(calls):
+                ev("content_block_start", {"type": "content_block_start", "index": idx,
+                    "content_block": {"type": "tool_use",
+                                      "id": "toolu_%s_%d" % (msg_id, n),
+                                      "name": c["name"], "input": {}}})
+                ev("content_block_delta", {"type": "content_block_delta", "index": idx,
+                    "delta": {"type": "input_json_delta",
+                              "partial_json": json.dumps(c["arguments"])}})
+                ev("content_block_stop", {"type": "content_block_stop", "index": idx})
+                idx += 1
+            if calls:
+                stop = "tool_use"
+            else:
+                stop = "max_tokens" if finish == "length" else "end_turn"
+            ev("message_delta", {"type": "message_delta",
+                "delta": {"stop_reason": stop, "stop_sequence": None},
+                "usage": {"output_tokens": _tok_count(
+                    _maybe_strip_think("".join(buf)))}})
+            ev("message_stop", {"type": "message_stop"})
+            return
+
         ev("content_block_start", {"type": "content_block_start", "index": 0,
             "content_block": {"type": "text", "text": ""}})
         ev("ping", {"type": "ping"})
@@ -671,14 +1104,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global ENGINE, TEMPLATE
+    global ENGINE, TEMPLATE, TOOLS_OK
     TEMPLATE = load_chat_template()
+    TOOLS_OK = probe_tool_support()
     ENGINE = load_engine()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print("[genie] endpoint on http://%s:%d  (model=%s)" % (HOST, PORT, MODEL_ID), flush=True)
     print("[genie]   POST /v1/chat/completions (OpenAI)   POST /v1/messages (Anthropic)",
           flush=True)
     print("[genie]   GET /v1/models   GET /health", flush=True)
+    print("[genie]   tool calling: %s" %
+          ("enabled (<tool_call> in bundle vocab)" if TOOLS_OK
+           else "unsupported by this bundle -- requests with `tools` get a 400"),
+          flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
