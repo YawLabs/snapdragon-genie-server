@@ -1023,18 +1023,47 @@ def _fit(messages, tools, thinking, budget):
     """
     sys_msgs = [m for m in messages if m.get("role") == "system"]
     rest = [m for m in messages if m.get("role") != "system"]
-    evicted = []
-    while True:
-        prompt = TEMPLATE.build(sys_msgs + rest, tools=tools, thinking=thinking)
-        if _tok_count(prompt) <= budget:
-            return prompt, rest, evicted, True
-        if len(rest) <= 1:
-            # Nothing left to evict but the current turn; the caller owes the
-            # client a real error rather than a doomed query.
-            return prompt, rest, evicted, False
-        evicted.append(rest.pop(0))
-        while len(rest) > 1 and rest[0].get("role") == "tool":
-            evicted.append(rest.pop(0))
+
+    def _drop(k):
+        """Drop the k oldest turns, advancing past any now-orphaned tool
+        results. Returns (kept, actual_dropped)."""
+        k = max(0, min(k, len(rest)))
+        while k < len(rest) - 1 and rest[k].get("role") == "tool":
+            k += 1
+        return rest[k:], k
+
+    def _render(kept):
+        return TEMPLATE.build(sys_msgs + kept, tools=tools, thinking=thinking)
+
+    prompt = _render(rest)                      # common case: nothing to evict
+    if _tok_count(prompt) <= budget:
+        return prompt, rest, [], True
+    if len(rest) <= 1:
+        # Nothing left to evict but the current turn; the caller owes the
+        # client a real error rather than a doomed query.
+        return prompt, rest, [], False
+
+    # Bisect for the FEWEST turns to drop. The previous linear scan re-rendered
+    # and re-tokenized the entire prompt once per evicted message -- measured
+    # at 90 full tokenizer calls on a 122-message conversation, each taking the
+    # engine lock, and build_windowed runs this twice when summarising.
+    # Dropping more turns can only shrink the prompt, so "fits" is monotonic in
+    # k and a bisection reaches the same kept-set in ~log2(n) renders.
+    lo, hi, best = 1, len(rest) - 1, None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        kept, n = _drop(mid)
+        cand = _render(kept)
+        if _tok_count(cand) <= budget:
+            best = (cand, kept, n)
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    if best is None:
+        kept, n = _drop(len(rest) - 1)
+        return _render(kept), kept, rest[:n], False
+    cand, kept, n = best
+    return cand, kept, rest[:n], True
 
 
 def _transcript(msgs, cap_chars=6000):
@@ -1042,7 +1071,10 @@ def _transcript(msgs, cap_chars=6000):
     lines = []
     for m in msgs:
         role = m.get("role", "user")
-        c = (m.get("content") or "").strip()
+        # _content_text, not the raw value: content may be a LIST of blocks,
+        # and .strip() on a list raises. The renderer was fixed for this; these
+        # helpers are the other consumers and had to be fixed with it.
+        c = _content_text(m.get("content")).strip()
         for tc in (m.get("tool_calls") or []):
             fn = tc.get("function", tc)
             c = (c + " [called %s]" % fn.get("name", "")).strip()
@@ -1092,7 +1124,7 @@ def _apply_note(messages, note):
     out, placed = [], False
     for m in messages:
         if m.get("role") == "system" and not placed:
-            base = (m.get("content") or "").split(SUMMARY_MARKER)[0].rstrip()
+            base = _content_text(m.get("content")).split(SUMMARY_MARKER)[0].rstrip()
             joined = base + (_NL + _NL if base else "") + SUMMARY_MARKER + _NL + note
             out.append(dict(m, content=joined))
             placed = True
@@ -1104,9 +1136,17 @@ def _apply_note(messages, note):
 
 
 def _prior_note(messages):
+    # Flatten before the membership test: `MARKER in [block, ...]` is a LIST
+    # membership check, which quietly returns False instead of raising. The
+    # prior note then goes unfound and each eviction appends a fresh one until
+    # the notes themselves crowd out the window -- exactly what the marker
+    # exists to prevent.
     for m in messages:
-        if m.get("role") == "system" and SUMMARY_MARKER in (m.get("content") or ""):
-            return m["content"].split(SUMMARY_MARKER, 1)[1].strip()
+        if m.get("role") != "system":
+            continue
+        c = _content_text(m.get("content"))
+        if SUMMARY_MARKER in c:
+            return c.split(SUMMARY_MARKER, 1)[1].strip()
     return ""
 
 
