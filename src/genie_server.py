@@ -546,7 +546,8 @@ class GenieEngine:
         # and every later continuation would resume one token out of step.
         self._committed = prompt + generated
 
-    def query(self, prompt, on_text, max_tokens=None, stop=None, sampler=None):
+    def query(self, prompt, on_text, max_tokens=None, stop=None, sampler=None,
+              commit=True):
         """Run one query synchronously (for non-streaming). on_text(str) is
         called per chunk. Returns 'stop' | 'length'. Serialized (NPU is single)."""
         with self.lock:
@@ -577,7 +578,14 @@ class GenieEngine:
             cb = QUERY_CALLBACK(_cb)  # keep ref alive for the blocking call
             status = self.lib.GenieDialog_query(
                 self.dialog, send.encode("utf-8"), SENTENCE_COMPLETE, cb, None)
-            self._commit(prompt, "".join(seen), status == GENIE_STATUS_SUCCESS)
+            # commit=False for internal calls (summarisation): they leave the
+            # dialog holding text that is NOT the caller's conversation, so
+            # recording it as the resident prefix would be a false claim. None
+            # says "unknown, re-prefill", which is the truth.
+            if commit:
+                self._commit(prompt, "".join(seen), status == GENIE_STATUS_SUCCESS)
+            else:
+                self._committed = None
             return self._finish(status)
 
     def query_stream(self, prompt, result, max_tokens=None, stop=None,
@@ -775,6 +783,13 @@ def _anthropic_tools(tools):
     return out or None
 
 
+def _with_overhead(usage, overhead):
+    """Attach summarisation cost to a usage block, only when there was any."""
+    if overhead:
+        usage["genie_context_overhead_tokens"] = overhead
+    return usage
+
+
 def _anthropic_stop_reason(finish, calls, stop):
     """Anthropic stop_reason, distinguishing a stop-sequence cut from a natural end.
 
@@ -836,7 +851,7 @@ def _anthropic_to_prompt(req, tools=None, max_tokens=0):
         msgs.append({"role": role, "content": _anthropic_text(content)})
     return build_windowed(msgs, tools=_anthropic_tools(tools),
                           thinking=_wants_thinking(req),
-                          max_tokens=max_tokens)
+                          max_tokens=max_tokens)   # 4-tuple, passed through
 
 
 def load_engine():
@@ -984,8 +999,21 @@ TOOLS_OK = False
 # Bound the number of in-flight generation requests (1 running on the NPU + a
 # small queue). Excess requests are rejected fast instead of piling up parked
 # threads behind the single-flight lock. 0 disables the cap.
-MAX_INFLIGHT = int(os.environ.get("GENIE_MAX_INFLIGHT", "2"))
-_INFLIGHT = threading.BoundedSemaphore(MAX_INFLIGHT) if MAX_INFLIGHT > 0 else None
+# Concurrency vs KV reuse, a real tradeoff worth stating: the dialog holds ONE
+# resident KV, so when two conversations interleave here each one resets the
+# other's prefix and both pay a full re-prefill. MAX_INFLIGHT=2 keeps the
+# default (one running, one queued) because a queued request still completes
+# while a rejected one costs a client round-trip; set 1 to protect KV reuse for
+# a single-conversation workload, higher only if callers prefer queueing to a
+# fast 429. Correctness does not depend on the choice -- the engine lock
+# serialises regardless -- only reuse hit-rate does.
+#
+# Floored at 1, never disabled. The NPU serves one request at a time, so an
+# "unlimited" setting does not buy concurrency -- it just lets unbounded
+# threads park on the engine lock until the box runs out of stack, and every
+# one of those callers waits instead of getting a fast 429 it could act on.
+MAX_INFLIGHT = max(1, int(os.environ.get("GENIE_MAX_INFLIGHT", "2")))
+_INFLIGHT = threading.BoundedSemaphore(MAX_INFLIGHT)
 
 
 def _tok_count(text):
@@ -1090,16 +1118,18 @@ def _transcript(msgs, cap_chars=6000):
 def _summarize_turns(msgs, prior=""):
     """One cheap NPU call condensing evicted turns (plus any prior note).
 
-    Returns None on any failure -- the caller then falls back to plain
-    eviction. A summary is a nice-to-have; never let it break the request.
+    Returns (note, tokens); (None, 0) on any failure -- the caller then falls
+    back to plain eviction. A summary is a nice-to-have; never let it break the
+    request. The token count is returned so the cost can be surfaced instead of
+    being spent invisibly on the caller's behalf.
     """
     if ENGINE is None:
-        return None
+        return None, 0
     body = _transcript(msgs)
     if prior:
         body = prior + _NL + body
     if not body.strip():
-        return None
+        return None, 0
     ask = ("Condense this conversation excerpt into a few terse factual bullet "
            "points. Keep file paths, identifiers, decisions made, and results "
            "already obtained. Drop pleasantries and reasoning."
@@ -1107,11 +1137,14 @@ def _summarize_turns(msgs, prior=""):
     prompt = TEMPLATE.build([{"role": "user", "content": ask}], thinking=False)
     out = []
     try:
-        ENGINE.query(prompt, out.append, max_tokens=SUMMARY_MAX_TOKENS)
+        ENGINE.query(prompt, out.append, max_tokens=SUMMARY_MAX_TOKENS,
+                     commit=False)
     except Exception:
-        return None
+        return None, 0
     text = _THINK_RE.sub("", "".join(out)).strip()
-    return text or None
+    if not text:
+        return None, 0
+    return text, _tok_count(text)
 
 
 def _apply_note(messages, note):
@@ -1160,7 +1193,8 @@ def build_windowed(messages, tools=None, thinking=True, max_tokens=0,
     happens here, and (unless disabled) what leaves is condensed rather than
     discarded.
 
-    Returns (prompt, dropped, fits).
+    Returns (prompt, dropped, fits, overhead_tokens), where overhead_tokens is
+    NPU work spent summarising rather than answering.
     """
     if summarize is None:
         summarize = SUMMARIZE_EVICTED
@@ -1168,11 +1202,11 @@ def build_windowed(messages, tools=None, thinking=True, max_tokens=0,
 
     prompt, kept, evicted, fits = _fit(messages, tools, thinking, budget)
     if not (fits and evicted and summarize):
-        return prompt, len(evicted), fits
+        return prompt, len(evicted), fits, 0
 
-    note = _summarize_turns(evicted, prior=_prior_note(messages))
+    note, overhead = _summarize_turns(evicted, prior=_prior_note(messages))
     if not note:
-        return prompt, len(evicted), fits          # fall back to plain eviction
+        return prompt, len(evicted), fits, overhead   # fall back to plain evict
 
     merged = _apply_note([m for m in messages if m.get("role") == "system"], note) + kept
     # Second pass WITHOUT summarising: the note itself costs tokens and may push
@@ -1181,9 +1215,10 @@ def build_windowed(messages, tools=None, thinking=True, max_tokens=0,
     p2, _, ev2, fits2 = _fit(merged, tools, thinking, budget)
     if fits2:
         print("[genie] context window: summarised %d evicted message(s) into a "
-              "%d-char note" % (len(evicted), len(note)), flush=True)
-        return p2, len(evicted) + len(ev2), True
-    return prompt, len(evicted), fits              # note did not fit; plain evict
+              "%d-char note (%d tokens of NPU time)"
+              % (len(evicted), len(note), overhead), flush=True)
+        return p2, len(evicted) + len(ev2), True, overhead
+    return prompt, len(evicted), fits, overhead    # note did not fit; plain evict
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1314,7 +1349,7 @@ class Handler(BaseHTTPRequestHandler):
         tools = req.get("tools") or None
         stream = bool(req.get("stream", False))
         max_tokens = int(req.get("max_tokens") or DEFAULT_MAX_TOKENS)
-        prompt, dropped, fits = build_windowed(
+        prompt, dropped, fits, overhead = build_windowed(
             messages, tools=tools, thinking=_wants_thinking(req),
             max_tokens=max_tokens)
         if not fits:
@@ -1326,7 +1361,8 @@ class Handler(BaseHTTPRequestHandler):
         created = int(time.time())
         cmpl_id = "chatcmpl-%d" % created
         gen_kw = {"stop": _stop_sequences(req),
-                  "sampler": _sampler_params(req, tools_active=bool(tools))}
+                  "sampler": _sampler_params(req, tools_active=bool(tools)),
+                  "overhead": overhead}
         if stream:
             self._stream(prompt, max_tokens, cmpl_id, created,
                          tools_active=bool(tools), **gen_kw)
@@ -1335,7 +1371,7 @@ class Handler(BaseHTTPRequestHandler):
                            tools_active=bool(tools), **gen_kw)
 
     def _complete(self, prompt, max_tokens, cmpl_id, created, tools_active=False,
-                  stop=None, sampler=None):
+                  stop=None, sampler=None, overhead=0):
         chunks = []
         try:
             finish = ENGINE.query(prompt, chunks.append, max_tokens=max_tokens,
@@ -1363,16 +1399,24 @@ class Handler(BaseHTTPRequestHandler):
         # <tool_call> block is real generated output, and billing/budgeting a
         # tool turn as 0 tokens is a lie the client cannot detect.
         pt, ct = _tok_count(prompt), _tok_count(raw)
+        usage = {"prompt_tokens": pt, "completion_tokens": ct,
+                 "total_tokens": pt + ct}
+        if overhead:
+            # Namespaced and only present when non-zero, so an ordinary
+            # response is byte-identical to before and no standard field is
+            # misreported. This is NPU time the request really spent -- on
+            # summarising evicted history, not on the answer -- and spending it
+            # invisibly is the same failure as the completion_tokens=0 bug.
+            usage["genie_context_overhead_tokens"] = overhead
         self._json(200, {
             "id": cmpl_id, "object": "chat.completion", "created": created,
             "model": MODEL_ID,
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-            "usage": {"prompt_tokens": pt, "completion_tokens": ct,
-                      "total_tokens": pt + ct},
+            "usage": usage,
         })
 
     def _stream(self, prompt, max_tokens, cmpl_id, created, tools_active=False,
-                stop=None, sampler=None):
+                stop=None, sampler=None, overhead=0):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -1462,8 +1506,8 @@ class Handler(BaseHTTPRequestHandler):
         model = req.get("model") or MODEL_ID
         max_tokens = int(req.get("max_tokens") or DEFAULT_MAX_TOKENS)
         tools = req.get("tools") or None
-        prompt, dropped, fits = _anthropic_to_prompt(req, tools=tools,
-                                                     max_tokens=max_tokens)
+        prompt, dropped, fits, overhead = _anthropic_to_prompt(
+            req, tools=tools, max_tokens=max_tokens)
         if not fits:
             self._anthropic_error(400, "invalid_request_error",
                                   _overflow_msg(prompt, max_tokens))
@@ -1472,7 +1516,8 @@ class Handler(BaseHTTPRequestHandler):
             _log_dropped(dropped)
         msg_id = "msg_%d" % int(time.time())
         gen_kw = {"stop": _stop_sequences(req),
-                  "sampler": _sampler_params(req, tools_active=bool(tools))}
+                  "sampler": _sampler_params(req, tools_active=bool(tools)),
+                  "overhead": overhead}
         if bool(req.get("stream", False)):
             self._anthropic_stream(prompt, max_tokens, model, msg_id,
                                    tools_active=bool(tools), **gen_kw)
@@ -1481,7 +1526,8 @@ class Handler(BaseHTTPRequestHandler):
                                      tools_active=bool(tools), **gen_kw)
 
     def _anthropic_complete(self, prompt, max_tokens, model, msg_id,
-                            tools_active=False, stop=None, sampler=None):
+                            tools_active=False, stop=None, sampler=None,
+                            overhead=0):
         chunks = []
         try:
             finish = ENGINE.query(prompt, chunks.append, max_tokens=max_tokens,
@@ -1507,12 +1553,14 @@ class Handler(BaseHTTPRequestHandler):
             "content": blocks,
             "stop_reason": reason,
             "stop_sequence": None,
-            "usage": {"input_tokens": _tok_count(prompt),
-                      "output_tokens": _tok_count(raw)},
+            "usage": _with_overhead({"input_tokens": _tok_count(prompt),
+                                     "output_tokens": _tok_count(raw)},
+                                    overhead),
         })
 
     def _anthropic_stream(self, prompt, max_tokens, model, msg_id,
-                          tools_active=False, stop=None, sampler=None):
+                          tools_active=False, stop=None, sampler=None,
+                          overhead=0):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")

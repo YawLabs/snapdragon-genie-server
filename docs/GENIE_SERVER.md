@@ -63,6 +63,7 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 | `GENIE_SUMMARIZE_EVICTED` | 1 | 0 disables summarising evicted turns (plain drop) |
 | `GENIE_SUMMARY_MAX_TOKENS` | 192 | cap on the retained note |
 | `GENIE_WINDOW_MARGIN` | 64 | headroom left between prompt and n_ctx |
+| `GENIE_MAX_INFLIGHT` | 2 | requests admitted at once (1 running + queue). Floored at 1 -- it cannot be disabled, since the NPU is single-flight and an unbounded setting only parks threads on the engine lock. Set 1 to protect KV reuse: two interleaved conversations share one resident KV and reset each other's prefix. |
 | `GENIE_HOST` / `GENIE_PORT` | 127.0.0.1 / 8080 | bind address |
 | `GENIE_MODEL_ID` | qwen3-4b-npu | id reported to clients |
 | `GENIE_MAX_TOKENS` | 512 | default cap when a request omits max_tokens |
@@ -100,6 +101,15 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   summarisation call fails, or the note itself will not fit, the server falls
   back to plain eviction -- a summary is never allowed to break a request.
   `GENIE_SUMMARY_MAX_TOKENS` (default 192) bounds the note.
+
+- **Summarisation cost is reported, not hidden.** A request that evicts spends
+  extra NPU time condensing the outgoing turns. That shows up as
+  `usage.genie_context_overhead_tokens` on non-streaming responses (present
+  only when non-zero, so an ordinary response is unchanged) and in the server
+  log line. The summarisation call deliberately does NOT claim the resident KV
+  -- it leaves text in the dialog that is not the caller's conversation, so it
+  records "unknown" and the next turn re-prefills rather than resuming from a
+  false prefix.
 
 - **KV reuse across turns.** The dialog keeps its KV between queries, so when a
   request's prompt is a byte-exact extension of what the dialog already holds,
