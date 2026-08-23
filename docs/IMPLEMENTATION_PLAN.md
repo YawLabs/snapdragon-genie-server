@@ -279,6 +279,24 @@ JSON (no external code):**
   rates. Needs the draft-head artifact. Best steady-state decode.
 - **LADE (Lookahead Decoding)** -- parallel n-gram speculation, no draft model.
 
+**MEASURED 2026-08-23 -- LADE is a correctness regression on this bundle, not free speed.**
+Enabling it is genuinely config-only (`dialog.type: "lade"` plus a `lade` block; no draft
+model, no extra tensors, and the Qwen3-4B w4a16 bundle loads it cleanly in 18.4s). But under
+LADE the model **stops calling tools and hallucinates their results instead** -- asked to read
+`src/main.py` with a `read_file` tool available, it emitted a confident description of file
+contents it never read, `tool_calls: None`, `finish_reason: stop`. Stop sequences are also
+ignored (`stop=["5"]` returned the full 1..8). Both features pass on the same bundle under
+`dialog.type: "basic"` and pass again after reverting, so it is LADE, not drift.
+
+Throughput was NOT measured -- a mode that fabricates tool results is disqualified for the
+agent workload regardless of how fast it is. Do not enable LADE expecting free decode.
+
+**SSD/Eaglet remain untested and are NOT config-only**, contrary to the note below: the SDK's
+`llama2-7b-htp-ssd.json` requires `forecast-prefix-name`, a tensor the model binary must
+expose, and `llama3-3b-eaglet-htp.json` needs a trained draft head. The current bundle is
+`type: basic` with neither. Both need a recompile, so the vendor's 4x claim stays unvalidated
+here.
+
 Implication: the decode wash we measured is a *baseline*, not a ceiling. Once a Genie bundle runs
 (Phase 1/2), enabling SSD/Eaglet is a config-only change that can multiply decode tg -- the single
 biggest lever for the agent workload, and something the llama.cpp eager backend never offered.
