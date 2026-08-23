@@ -61,7 +61,7 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 | `GENIE_SDK_DIR` | scratchpad 2.45 SDK | QAIRT 2.45 root (lib/aarch64-windows-msvc, lib/hexagon-v*) |
 | `GENIE_HEXAGON_ARCH` | unset | pin one skel arch (`v81`); default offers all |
 | `GENIE_SUMMARIZE_EVICTED` | 1 | 0 disables summarising evicted turns (plain drop) |
-| `GENIE_SUMMARY_MAX_TOKENS` | 192 | cap on the retained note |
+| `GENIE_SUMMARY_MAX_TOKENS` | 192 | cap on the retained note. Clamped at runtime to `n_ctx / 8` (floor 32) so the note cannot crowd out the window on a small-context bundle; the server logs the clamp when it bites. |
 | `GENIE_WINDOW_MARGIN` | 64 | headroom left between prompt and n_ctx |
 | `GENIE_MAX_INFLIGHT` | 2 | requests admitted at once (1 running + queue). Floored at 1 -- it cannot be disabled, since the NPU is single-flight and an unbounded setting only parks threads on the engine lock. Set 1 to protect KV reuse: two interleaved conversations share one resident KV and reset each other's prefix. |
 | `GENIE_HOST` / `GENIE_PORT` | 127.0.0.1 / 8080 | bind address |
@@ -101,6 +101,13 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   summarisation call fails, or the note itself will not fit, the server falls
   back to plain eviction -- a summary is never allowed to break a request.
   `GENIE_SUMMARY_MAX_TOKENS` (default 192) bounds the note.
+
+- **Streaming reports usage too.** OpenAI streams emit a final chunk with an
+  empty `choices` list carrying `usage`, but only when the caller sets
+  `stream_options.include_usage` -- clients that do not ask see a
+  byte-identical stream to before. Anthropic streams carry `output_tokens` in
+  `message_delta` as usual. Both include the summarisation overhead below when
+  there was any.
 
 - **Summarisation cost is reported, not hidden.** A request that evicts spends
   extra NPU time condensing the outgoing turns. That shows up as

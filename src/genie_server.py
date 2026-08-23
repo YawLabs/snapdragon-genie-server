@@ -72,6 +72,19 @@ WINDOW_MARGIN = int(os.environ.get("GENIE_WINDOW_MARGIN", "64"))
 # going to happen anyway (i.e. the alternative was losing the content).
 SUMMARIZE_EVICTED = os.environ.get("GENIE_SUMMARIZE_EVICTED", "1") != "0"
 SUMMARY_MAX_TOKENS = int(os.environ.get("GENIE_SUMMARY_MAX_TOKENS", "192"))
+
+
+def summary_token_cap():
+    """SUMMARY_MAX_TOKENS, clamped so the note cannot crowd out the window.
+
+    The note is retained context, so on a small-context bundle a large setting
+    makes it a meaningful fraction of n_ctx. build_windowed already re-fits
+    afterwards and falls back to plain eviction if the note does not fit -- but
+    that fails LATE, after the summarisation call has already been paid for.
+    An eighth of the window is a cheap early bound; the floor of 32 keeps the
+    note useful on a tiny bundle rather than clamping it to nothing.
+    """
+    return max(32, min(SUMMARY_MAX_TOKENS, read_context_size() // 8))
 # Marker delimiting the retained note inside the system turn. Load-bearing:
 # it is how a LATER eviction finds the previous note and re-summarises it
 # together with the newly evicted turns, instead of stacking note after note
@@ -1137,7 +1150,7 @@ def _summarize_turns(msgs, prior=""):
     prompt = TEMPLATE.build([{"role": "user", "content": ask}], thinking=False)
     out = []
     try:
-        ENGINE.query(prompt, out.append, max_tokens=SUMMARY_MAX_TOKENS,
+        ENGINE.query(prompt, out.append, max_tokens=summary_token_cap(),
                      commit=False)
     except Exception:
         return None, 0
@@ -1365,7 +1378,10 @@ class Handler(BaseHTTPRequestHandler):
                   "overhead": overhead}
         if stream:
             self._stream(prompt, max_tokens, cmpl_id, created,
-                         tools_active=bool(tools), **gen_kw)
+                         tools_active=bool(tools),
+                         include_usage=bool((req.get("stream_options") or {})
+                                            .get("include_usage")),
+                         **gen_kw)
         else:
             self._complete(prompt, max_tokens, cmpl_id, created,
                            tools_active=bool(tools), **gen_kw)
@@ -1416,7 +1432,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _stream(self, prompt, max_tokens, cmpl_id, created, tools_active=False,
-                stop=None, sampler=None, overhead=0):
+                stop=None, sampler=None, overhead=0, include_usage=False):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -1447,7 +1463,25 @@ class Handler(BaseHTTPRequestHandler):
         # output is always faithful (includes <think>); non-stream honors the flag.
         sse(frame({"role": "assistant"}))
 
-        def done():
+        def done(text=""):
+            """Optional usage frame, then [DONE].
+
+            Non-streaming responses carry usage (including the summarisation
+            overhead); streams carried none at all, so a streaming client could
+            not see token counts by any means. OpenAI's shape for this is a
+            final chunk with an EMPTY choices list, emitted only when the
+            caller asked via stream_options.include_usage -- so clients that
+            did not ask see a byte-identical stream to before.
+            """
+            if include_usage and not gone["v"]:
+                pt, ct = _tok_count(prompt), _tok_count(text)
+                usage = {"prompt_tokens": pt, "completion_tokens": ct,
+                         "total_tokens": pt + ct}
+                if overhead:
+                    usage["genie_context_overhead_tokens"] = overhead
+                sse({"id": cmpl_id, "object": "chat.completion.chunk",
+                     "created": created, "model": MODEL_ID,
+                     "choices": [], "usage": usage})
             if not gone["v"]:
                 try:
                     self.wfile.write(("data: [DONE]" + chr(10) * 2).encode("utf-8"))
@@ -1467,7 +1501,7 @@ class Handler(BaseHTTPRequestHandler):
                                    stop=stop, sampler=sampler)
             except Exception as e:
                 sse(frame({"content": "[error: %s]" % e}, finish="stop"))
-                done()
+                done("".join(buf))
                 return
             text, calls = parse_tool_calls(_maybe_strip_think("".join(buf)))
             if text:
@@ -1480,19 +1514,21 @@ class Handler(BaseHTTPRequestHandler):
                     "function": {"name": c["name"],
                                  "arguments": json.dumps(c["arguments"])}}]}))
             sse(frame({}, finish="tool_calls" if calls else finish))
-            done()
+            done("".join(buf))
             return
 
         res = {}
+        seen = []
         for chunk in ENGINE.query_stream(prompt, res, max_tokens=max_tokens,
                                         stop=stop, sampler=sampler):
+            seen.append(chunk)
             sse(frame({"content": chunk}))
             if gone["v"]:
                 break
         if res.get("error") and not gone["v"]:
             sse(frame({"content": "\n[error: %s]" % res["error"]}))
         sse(frame({}, finish=res.get("finish", "stop")))
-        done()
+        done("".join(seen))
 
     # ---- Anthropic Messages API (POST /v1/messages) -----------------------
 
@@ -1621,8 +1657,8 @@ class Handler(BaseHTTPRequestHandler):
             reason = _anthropic_stop_reason(finish, calls, stop)
             ev("message_delta", {"type": "message_delta",
                 "delta": {"stop_reason": reason, "stop_sequence": None},
-                "usage": {"output_tokens": _tok_count(
-                    _maybe_strip_think("".join(buf)))}})
+                "usage": _with_overhead({"output_tokens": _tok_count(
+                    _maybe_strip_think("".join(buf)))}, overhead)})
             ev("message_stop", {"type": "message_stop"})
             return
 
@@ -1647,7 +1683,8 @@ class Handler(BaseHTTPRequestHandler):
         ev("message_delta", {"type": "message_delta",
             "delta": {"stop_reason": _anthropic_stop_reason(finish, None, stop),
                       "stop_sequence": None},
-            "usage": {"output_tokens": _tok_count("".join(out))}})
+            "usage": _with_overhead({"output_tokens": _tok_count("".join(out))},
+                                    overhead)})
         ev("message_stop", {"type": "message_stop"})
 
 
@@ -1667,6 +1704,11 @@ def main():
           "genie_config.json). Per-request temperature/top_p are accepted but "
           "NOT honoured -- QAIRT 2.45 ignores a post-create sampler apply.",
           flush=True)
+    cap = summary_token_cap()
+    if cap != SUMMARY_MAX_TOKENS:
+        print("[genie]   summary note capped at %d tokens (n_ctx=%d), not the "
+              "requested %d" % (cap, read_context_size(), SUMMARY_MAX_TOKENS),
+              flush=True)
     print("[genie]   tool calling: %s" %
           ("enabled (<tool_call> in bundle vocab)" if TOOLS_OK
            else "unsupported by this bundle -- requests with `tools` get a 400"),
