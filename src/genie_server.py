@@ -380,6 +380,14 @@ class GenieEngine:
         # Assistant turn terminator, needed to reconstruct what the dialog
         # holds after a generation. Filled in from the template at startup.
         self.asst_suffix = ""
+        # The bundle's own sampler block, read at startup and used as the
+        # restore baseline. The dialog is RESIDENT and shared across requests,
+        # so a per-request override that is never undone leaks into the next
+        # caller -- one request asking for temp 0 would silently make every
+        # later request deterministic.
+        self.default_sampler = {}
+        self._sampler_dirty = False
+        self._stop_dirty = False
 
     @staticmethod
     def _finish(status):
@@ -388,6 +396,69 @@ class GenieEngine:
         if status != GENIE_STATUS_SUCCESS:
             raise RuntimeError("GenieDialog_query failed, status=%d" % status)
         return "stop"
+
+    def set_stop_sequences(self, seqs):
+        """Apply per-request stop sequences, clearing any previous ones.
+
+        Must be called on EVERY request, not just those that specify `stop` --
+        the dialog is resident, so a stop sequence set by one caller would
+        otherwise silently truncate the next caller's output.
+        """
+        if not seqs and not self._stop_dirty:
+            return                      # nothing set, nothing to clear
+        # Genie wants a keyed OBJECT, not a bare array: passing ["x"] returns
+        # -8 "Top level config is not an object" and is silently ignored by the
+        # generation. The idle value is [""], which is what the SDK's own
+        # example dialog configs carry -- an empty string resets cleanly where
+        # passing "" as the whole payload logs a JSON parse error.
+        payload = json.dumps({"stop-sequence": list(seqs) if seqs else [""]})
+        st = self.lib.GenieDialog_setStopSequence(self.dialog, payload.encode("utf-8"))
+        if st == GENIE_STATUS_SUCCESS:
+            self._stop_dirty = bool(seqs)
+        return st
+
+    def apply_sampler(self, params):
+        """Apply per-request sampler params, restoring bundle defaults when None.
+
+        DOES NOT TAKE EFFECT on QAIRT 2.45 with this bundle. Measured directly:
+        GenieDialog_getSampler returns a valid handle, GenieSamplerConfig_
+        createFromJson({"sampler": {...}}) returns 0, GenieSampler_applyConfig
+        returns 0 -- and generation is BYTE-IDENTICAL across seed 1 / 999 /
+        12345 and temp 0.0 / 1.5 / 2.0. The dialog appears to bind its sampler
+        at GenieDialog_create time, so a post-create apply is accepted and
+        ignored.
+
+        Kept, not deleted, because the call sequence is correct and costs one
+        no-op per request -- if a later QAIRT honours it, this starts working
+        with no changes. What is NOT done is pretending it works: the server
+        logs the limitation once at startup and the docs say sampling is
+        server-level (edit dialog.sampler in genie_config.json before load),
+        not per-request.
+
+        The restore-to-default path below is likewise correct-but-inert today.
+        It stays because the resident-dialog hazard it guards against is real:
+        if applyConfig ever starts working, an unrestored temp=0 from a tool
+        turn would silently make every later request deterministic.
+        """
+        if not params and not self._sampler_dirty:
+            return
+        cfg = dict(self.default_sampler)
+        cfg.update(params or {})
+        sampler = Handle()
+        if self.lib.GenieDialog_getSampler(self.dialog, C.byref(sampler)) != GENIE_STATUS_SUCCESS:
+            return
+        handle = Handle()
+        # Keyed wrapper, not a bare object: a bare {...} returns -8
+        # "Missing field: sampler or standalone-sampler".
+        if self.lib.GenieSamplerConfig_createFromJson(
+                json.dumps({"sampler": cfg}).encode("utf-8"),
+                C.byref(handle)) != GENIE_STATUS_SUCCESS:
+            return
+        try:
+            self.lib.GenieSampler_applyConfig(sampler, handle)
+            self._sampler_dirty = bool(params)
+        finally:
+            self.lib.GenieSamplerConfig_free(handle)
 
     def _plan(self, prompt):
         """Decide whether this prompt CONTINUES the resident KV or replaces it.
@@ -428,10 +499,12 @@ class GenieEngine:
         # and every later continuation would resume one token out of step.
         self._committed = prompt + generated
 
-    def query(self, prompt, on_text, max_tokens=None):
+    def query(self, prompt, on_text, max_tokens=None, stop=None, sampler=None):
         """Run one query synchronously (for non-streaming). on_text(str) is
         called per chunk. Returns 'stop' | 'length'. Serialized (NPU is single)."""
         with self.lock:
+            self.set_stop_sequences(stop)
+            self.apply_sampler(sampler)
             send, reused = self._plan(prompt)
             if reused:
                 print("[genie] kv reuse: prefilling %d new chars, not %d"
@@ -459,7 +532,8 @@ class GenieEngine:
             self._commit(prompt, "".join(seen), status == GENIE_STATUS_SUCCESS)
             return self._finish(status)
 
-    def query_stream(self, prompt, result, max_tokens=None):
+    def query_stream(self, prompt, result, max_tokens=None, stop=None,
+                     sampler=None):
         """Generator: yields text chunks, then sets result['finish'] (and
         result['error'] on failure) when done. The blocking Genie query runs on
         a WORKER thread so the consumer (the request/handler thread) can call
@@ -471,6 +545,8 @@ class GenieEngine:
         def worker():
             try:
                 with self.lock:
+                    self.set_stop_sequences(stop)
+                    self.apply_sampler(sampler)
                     send, reused = self._plan(prompt)
                     if reused:
                         print("[genie] kv reuse: prefilling %d new chars, not %d"
@@ -575,6 +651,53 @@ def _anthropic_text(content):
                 elif t == "tool_result":
                     parts.append(_anthropic_text(b.get("content")))
     return "".join(parts)
+
+
+def read_default_sampler():
+    """The bundle's own sampler block -- the baseline a per-request override
+    is restored to. Read rather than hardcoded, same reasoning as n_ctx: the
+    values belong to the bundle, and a literal here goes quietly wrong on the
+    next bundle."""
+    try:
+        with open(os.path.join(BUNDLE_DIR, "genie_config.json"), encoding="utf-8") as f:
+            return dict(json.load(f)["dialog"]["sampler"])
+    except Exception:
+        return {"version": 1}
+
+
+def _stop_sequences(req):
+    """OpenAI `stop` (string or list) and Anthropic `stop_sequences`."""
+    v = req.get("stop")
+    if v is None:
+        v = req.get("stop_sequences")
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = [v]
+    seqs = [x for x in v if isinstance(x, str) and x]
+    return seqs or None
+
+
+def _sampler_params(req, tools_active=False):
+    """Map request sampling fields onto the bundle's sampler keys.
+
+    Tool turns default to temp 0: Genie owns sampling and there is no grammar
+    hook, so low temperature is the only lever we have on JSON validity. An
+    explicit temperature in the request still wins -- the caller may know
+    better than this default.
+    """
+    out = {}
+    if "temperature" in req and req["temperature"] is not None:
+        out["temp"] = float(req["temperature"])
+    elif tools_active:
+        out["temp"] = 0.0
+    if "top_p" in req and req["top_p"] is not None:
+        out["top-p"] = float(req["top_p"])
+    if "top_k" in req and req["top_k"] is not None:
+        out["top-k"] = int(req["top_k"])
+    if out.get("temp") == 0.0:
+        out.setdefault("top-k", 1)      # temp 0 without top-k 1 is not greedy
+    return out or None
 
 
 def _wants_thinking(req):
@@ -704,6 +827,20 @@ Check GENIE_SDK_DIR, or unset GENIE_HEXAGON_ARCH if you pinned an arch."""
     lib.GenieDialog_signal.restype = C.c_int
     lib.GenieDialog_getTokenizer.argtypes = [Handle, C.POINTER(Handle)]
     lib.GenieDialog_getTokenizer.restype = C.c_int
+    # Stop sequences: a JSON array string, applied to the resident dialog.
+    lib.GenieDialog_setStopSequence.argtypes = [Handle, C.c_char_p]
+    lib.GenieDialog_setStopSequence.restype = C.c_int
+    # Per-request sampling: get the dialog's sampler, build a config from JSON,
+    # apply it. This is what lets a tool-call turn run at temp 0 while ordinary
+    # chat keeps the bundle's creative defaults.
+    lib.GenieDialog_getSampler.argtypes = [Handle, C.POINTER(Handle)]
+    lib.GenieDialog_getSampler.restype = C.c_int
+    lib.GenieSamplerConfig_createFromJson.argtypes = [C.c_char_p, C.POINTER(Handle)]
+    lib.GenieSamplerConfig_createFromJson.restype = C.c_int
+    lib.GenieSamplerConfig_free.argtypes = [Handle]
+    lib.GenieSamplerConfig_free.restype = C.c_int
+    lib.GenieSampler_applyConfig.argtypes = [Handle, Handle]
+    lib.GenieSampler_applyConfig.restype = C.c_int
     lib.GenieTokenizer_encode.argtypes = [
         Handle, C.c_char_p, ALLOC_CALLBACK,
         C.POINTER(C.POINTER(C.c_int32)), C.POINTER(C.c_uint32)]
@@ -1090,17 +1227,21 @@ class Handler(BaseHTTPRequestHandler):
             _log_dropped(dropped)
         created = int(time.time())
         cmpl_id = "chatcmpl-%d" % created
+        gen_kw = {"stop": _stop_sequences(req),
+                  "sampler": _sampler_params(req, tools_active=bool(tools))}
         if stream:
             self._stream(prompt, max_tokens, cmpl_id, created,
-                         tools_active=bool(tools))
+                         tools_active=bool(tools), **gen_kw)
         else:
             self._complete(prompt, max_tokens, cmpl_id, created,
-                           tools_active=bool(tools))
+                           tools_active=bool(tools), **gen_kw)
 
-    def _complete(self, prompt, max_tokens, cmpl_id, created, tools_active=False):
+    def _complete(self, prompt, max_tokens, cmpl_id, created, tools_active=False,
+                  stop=None, sampler=None):
         chunks = []
         try:
-            finish = ENGINE.query(prompt, chunks.append, max_tokens=max_tokens)
+            finish = ENGINE.query(prompt, chunks.append, max_tokens=max_tokens,
+                                   stop=stop, sampler=sampler)
         except Exception as e:
             self._json(500, {"error": {"message": str(e), "type": "server_error"}})
             return
@@ -1132,7 +1273,8 @@ class Handler(BaseHTTPRequestHandler):
                       "total_tokens": pt + ct},
         })
 
-    def _stream(self, prompt, max_tokens, cmpl_id, created, tools_active=False):
+    def _stream(self, prompt, max_tokens, cmpl_id, created, tools_active=False,
+                stop=None, sampler=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -1179,7 +1321,8 @@ class Handler(BaseHTTPRequestHandler):
             # honest trade; a partial tool call is not.
             buf = []
             try:
-                finish = ENGINE.query(prompt, buf.append, max_tokens=max_tokens)
+                finish = ENGINE.query(prompt, buf.append, max_tokens=max_tokens,
+                                   stop=stop, sampler=sampler)
             except Exception as e:
                 sse(frame({"content": "[error: %s]" % e}, finish="stop"))
                 done()
@@ -1199,7 +1342,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         res = {}
-        for chunk in ENGINE.query_stream(prompt, res, max_tokens=max_tokens):
+        for chunk in ENGINE.query_stream(prompt, res, max_tokens=max_tokens,
+                                        stop=stop, sampler=sampler):
             sse(frame({"content": chunk}))
             if gone["v"]:
                 break
@@ -1229,18 +1373,21 @@ class Handler(BaseHTTPRequestHandler):
         if dropped:
             _log_dropped(dropped)
         msg_id = "msg_%d" % int(time.time())
+        gen_kw = {"stop": _stop_sequences(req),
+                  "sampler": _sampler_params(req, tools_active=bool(tools))}
         if bool(req.get("stream", False)):
             self._anthropic_stream(prompt, max_tokens, model, msg_id,
-                                   tools_active=bool(tools))
+                                   tools_active=bool(tools), **gen_kw)
         else:
             self._anthropic_complete(prompt, max_tokens, model, msg_id,
-                                     tools_active=bool(tools))
+                                     tools_active=bool(tools), **gen_kw)
 
     def _anthropic_complete(self, prompt, max_tokens, model, msg_id,
-                            tools_active=False):
+                            tools_active=False, stop=None, sampler=None):
         chunks = []
         try:
-            finish = ENGINE.query(prompt, chunks.append, max_tokens=max_tokens)
+            finish = ENGINE.query(prompt, chunks.append, max_tokens=max_tokens,
+                                   stop=stop, sampler=sampler)
         except Exception as e:
             self._anthropic_error(500, "api_error", str(e))
             return
@@ -1270,7 +1417,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _anthropic_stream(self, prompt, max_tokens, model, msg_id,
-                          tools_active=False):
+                          tools_active=False, stop=None, sampler=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -1302,7 +1449,8 @@ class Handler(BaseHTTPRequestHandler):
             # blocks rather than a half-formed call the client must guess at.
             buf = []
             try:
-                finish = ENGINE.query(prompt, buf.append, max_tokens=max_tokens)
+                finish = ENGINE.query(prompt, buf.append, max_tokens=max_tokens,
+                                   stop=stop, sampler=sampler)
             except Exception as e:
                 ev("error", {"type": "error",
                              "error": {"type": "api_error", "message": str(e)}})
@@ -1344,7 +1492,8 @@ class Handler(BaseHTTPRequestHandler):
 
         out = []
         res = {}
-        for chunk in ENGINE.query_stream(prompt, res, max_tokens=max_tokens):
+        for chunk in ENGINE.query_stream(prompt, res, max_tokens=max_tokens,
+                                        stop=stop, sampler=sampler):
             out.append(chunk)
             ev("content_block_delta", {"type": "content_block_delta", "index": 0,
                 "delta": {"type": "text_delta", "text": chunk}})
@@ -1368,11 +1517,16 @@ def main():
     TOOLS_OK = probe_tool_support()
     ENGINE = load_engine()
     ENGINE.asst_suffix = TEMPLATE.asst_suf
+    ENGINE.default_sampler = read_default_sampler()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print("[genie] endpoint on http://%s:%d  (model=%s)" % (HOST, PORT, MODEL_ID), flush=True)
     print("[genie]   POST /v1/chat/completions (OpenAI)   POST /v1/messages (Anthropic)",
           flush=True)
     print("[genie]   GET /v1/models   GET /health", flush=True)
+    print("[genie]   sampling: server-level only (dialog.sampler in "
+          "genie_config.json). Per-request temperature/top_p are accepted but "
+          "NOT honoured -- QAIRT 2.45 ignores a post-create sampler apply.",
+          flush=True)
     print("[genie]   tool calling: %s" %
           ("enabled (<tool_call> in bundle vocab)" if TOOLS_OK
            else "unsupported by this bundle -- requests with `tools` get a 400"),

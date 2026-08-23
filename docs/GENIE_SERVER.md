@@ -42,9 +42,8 @@ is ~35-50s; after that every request reuses the resident model.
 ## Endpoints
 
 - `POST /v1/chat/completions` -- OpenAI chat API. Supports `messages`, `stream`
-  (SSE), `max_tokens`, and `tools`. (`stop` is NOT implemented -- the Genie C
-  API exposes `GenieDialog_setStopSequence`, but this server does not wire it
-  yet.) ChatML template is taken from the bundle's own
+  (SSE), `max_tokens`, `stop` (also Anthropic `stop_sequences`), and `tools`.
+  ChatML template is taken from the bundle's own
   `metadata.json` chat_template.
 - `GET /v1/models` -- lists the served model id (`GENIE_MODEL_ID`).
 - `GET /health` -- liveness.
@@ -112,6 +111,21 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   (`GenieDialog_save`/`restore` also exist and work -- measured ~75 KB/token on
   disk, ~128 MB at 1711 tokens -- but they are not used: in-memory continuation
   is free and this server serves one conversation at a time.)
+
+- **Sampling is server-level, not per-request.** `temperature` / `top_p` /
+  `top_k` are accepted and **not honoured**. Measured directly against QAIRT
+  2.45: `GenieDialog_getSampler` returns a valid handle,
+  `GenieSamplerConfig_createFromJson({"sampler": {...}})` returns 0, and
+  `GenieSampler_applyConfig` returns 0 -- yet generation is byte-identical
+  across seeds 1 / 999 / 12345 and temperatures 0.0 / 1.5 / 2.0. The dialog
+  binds its sampler at `GenieDialog_create` time. To change sampling, edit
+  `dialog.sampler` in `genie_config.json` before the server loads it. The
+  server prints this limitation at startup rather than letting it be silent.
+
+  Two JSON shapes worth knowing, both found by probing: the sampler config
+  must be wrapped as `{"sampler": {...}}` (a bare object returns -8 "Missing
+  field"), and stop sequences must be `{"stop-sequence": [...]}` (a bare array
+  returns -8 "Top level config is not an object" and is silently ignored).
 
 - **Single-flight.** The NPU serves one query at a time (concurrent HTP access
   wedges the device), so requests are serialized by a lock. Fine for one agent.
