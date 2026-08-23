@@ -65,6 +65,18 @@ THINKING_DEFAULT = os.environ.get("GENIE_THINKING", "1") != "0"
 # it does not truncate -- so the margin is what stands between a long session
 # and a 500.
 WINDOW_MARGIN = int(os.environ.get("GENIE_WINDOW_MARGIN", "64"))
+# Plain eviction drops the oldest turns outright, so the agent forgets it
+# already read a file and reads it again -- burning the window a second time on
+# information it had. Summarising the turns on their way out keeps the facts and
+# discards only the tokens. Costs one extra NPU call, and ONLY when eviction was
+# going to happen anyway (i.e. the alternative was losing the content).
+SUMMARIZE_EVICTED = os.environ.get("GENIE_SUMMARIZE_EVICTED", "1") != "0"
+SUMMARY_MAX_TOKENS = int(os.environ.get("GENIE_SUMMARY_MAX_TOKENS", "192"))
+# Marker delimiting the retained note inside the system turn. Load-bearing:
+# it is how a LATER eviction finds the previous note and re-summarises it
+# together with the newly evicted turns, instead of stacking note after note
+# until the notes themselves fill the window.
+SUMMARY_MARKER = "[earlier context]"
 
 def read_context_size(default=4096):
     """The context length this bundle was COMPILED with, from genie_config.json.
@@ -805,45 +817,138 @@ def _log_dropped(n):
           % (n, read_context_size()), flush=True)
 
 
-def build_windowed(messages, tools=None, thinking=True, max_tokens=0):
-    """Render a prompt that FITS, evicting oldest turns when it does not.
+def _fit(messages, tools, thinking, budget):
+    """Evict oldest turns until the render fits. Returns (prompt, kept, evicted, fits).
 
-    Genie has no sliding-window mode -- QAIRT 2.45 exposes no such flag on
-    genie-t2t-run and no equivalent config key -- and overflowing the compiled
-    window is a hard `GenieDialog_query` failure, not a truncation. So the
-    eviction has to happen here.
-
-    Doing it server-side is better than a token-level evictor would be anyway,
-    because at this layer we know MESSAGE boundaries: whole turns go, and a
-    tool result is never separated from the assistant turn that called it.
-    A token-level window would happily cut a tool_response in half.
-
-    Anchored: the system turn and the tool schemas always survive -- dropping
-    those is how an agent forgets it has tools, which looks like the model
-    getting dumber rather than like context loss.
-
-    Returns (prompt, dropped, fits). `fits` False means eviction ran out of
-    turns to drop and the remaining prompt STILL overflows -- a single
-    oversized message -- which the caller must surface rather than send.
+    Anchored: the system turn and tool schemas always survive -- dropping those
+    is how an agent forgets it has tools, which reads as the model getting
+    dumber rather than as context loss. A tool result is never separated from
+    the assistant turn that called it, which a token-level evictor could not
+    guarantee.
     """
-    budget = read_context_size() - max(0, max_tokens) - WINDOW_MARGIN
     sys_msgs = [m for m in messages if m.get("role") == "system"]
     rest = [m for m in messages if m.get("role") != "system"]
-    dropped = 0
+    evicted = []
     while True:
         prompt = TEMPLATE.build(sys_msgs + rest, tools=tools, thinking=thinking)
         if _tok_count(prompt) <= budget:
-            return prompt, dropped, True
+            return prompt, rest, evicted, True
         if len(rest) <= 1:
-            # Nothing left to evict but the current turn. Report it; the
-            # caller owes the client a real error, not a doomed query.
-            return prompt, dropped, False
-        rest.pop(0)
-        dropped += 1
-        # Never leave a tool result whose calling turn just went away.
+            # Nothing left to evict but the current turn; the caller owes the
+            # client a real error rather than a doomed query.
+            return prompt, rest, evicted, False
+        evicted.append(rest.pop(0))
         while len(rest) > 1 and rest[0].get("role") == "tool":
-            rest.pop(0)
-            dropped += 1
+            evicted.append(rest.pop(0))
+
+
+def _transcript(msgs, cap_chars=6000):
+    """Flatten turns to a compact transcript for summarisation."""
+    lines = []
+    for m in msgs:
+        role = m.get("role", "user")
+        c = (m.get("content") or "").strip()
+        for tc in (m.get("tool_calls") or []):
+            fn = tc.get("function", tc)
+            c = (c + " [called %s]" % fn.get("name", "")).strip()
+        if c:
+            lines.append("%s: %s" % (role, c))
+    text = _NL.join(lines)
+    # Bound the input: the summarisation call has to fit the SAME window we are
+    # already over. Keep the TAIL -- the most recent evicted turns are the ones
+    # most likely to still matter.
+    return text[-cap_chars:] if len(text) > cap_chars else text
+
+
+def _summarize_turns(msgs, prior=""):
+    """One cheap NPU call condensing evicted turns (plus any prior note).
+
+    Returns None on any failure -- the caller then falls back to plain
+    eviction. A summary is a nice-to-have; never let it break the request.
+    """
+    if ENGINE is None:
+        return None
+    body = _transcript(msgs)
+    if prior:
+        body = prior + _NL + body
+    if not body.strip():
+        return None
+    ask = ("Condense this conversation excerpt into a few terse factual bullet "
+           "points. Keep file paths, identifiers, decisions made, and results "
+           "already obtained. Drop pleasantries and reasoning."
+           + _NL + _NL + body)
+    prompt = TEMPLATE.build([{"role": "user", "content": ask}], thinking=False)
+    out = []
+    try:
+        ENGINE.query(prompt, out.append, max_tokens=SUMMARY_MAX_TOKENS)
+    except Exception:
+        return None
+    text = _THINK_RE.sub("", "".join(out)).strip()
+    return text or None
+
+
+def _apply_note(messages, note):
+    """Fold the note into the system turn, REPLACING any previous note.
+
+    It rides in the system turn because that is the one thing eviction never
+    touches -- a note stored anywhere else would itself be evicted, which is
+    the problem it exists to solve.
+    """
+    out, placed = [], False
+    for m in messages:
+        if m.get("role") == "system" and not placed:
+            base = (m.get("content") or "").split(SUMMARY_MARKER)[0].rstrip()
+            joined = base + (_NL + _NL if base else "") + SUMMARY_MARKER + _NL + note
+            out.append(dict(m, content=joined))
+            placed = True
+        else:
+            out.append(m)
+    if not placed:
+        out.insert(0, {"role": "system", "content": SUMMARY_MARKER + _NL + note})
+    return out
+
+
+def _prior_note(messages):
+    for m in messages:
+        if m.get("role") == "system" and SUMMARY_MARKER in (m.get("content") or ""):
+            return m["content"].split(SUMMARY_MARKER, 1)[1].strip()
+    return ""
+
+
+def build_windowed(messages, tools=None, thinking=True, max_tokens=0,
+                   summarize=None):
+    """Render a prompt that FITS, summarising what it has to evict.
+
+    Genie has no sliding-window mode -- QAIRT 2.45 exposes no such flag on
+    genie-t2t-run and no equivalent config key -- and overflowing the compiled
+    window is a hard GenieDialog_query failure, not a truncation. So eviction
+    happens here, and (unless disabled) what leaves is condensed rather than
+    discarded.
+
+    Returns (prompt, dropped, fits).
+    """
+    if summarize is None:
+        summarize = SUMMARIZE_EVICTED
+    budget = read_context_size() - max(0, max_tokens) - WINDOW_MARGIN
+
+    prompt, kept, evicted, fits = _fit(messages, tools, thinking, budget)
+    if not (fits and evicted and summarize):
+        return prompt, len(evicted), fits
+
+    note = _summarize_turns(evicted, prior=_prior_note(messages))
+    if not note:
+        return prompt, len(evicted), fits          # fall back to plain eviction
+
+    merged = _apply_note([m for m in messages if m.get("role") == "system"], note) + kept
+    # Second pass WITHOUT summarising: the note itself costs tokens and may push
+    # the render back over budget. Re-fitting can only drop more turns, and
+    # recursing here would summarise the summary on every request.
+    p2, _, ev2, fits2 = _fit(merged, tools, thinking, budget)
+    if fits2:
+        print("[genie] context window: summarised %d evicted message(s) into a "
+              "%d-char note" % (len(evicted), len(note)), flush=True)
+        return p2, len(evicted) + len(ev2), True
+    return prompt, len(evicted), fits              # note did not fit; plain evict
 
 
 class Handler(BaseHTTPRequestHandler):

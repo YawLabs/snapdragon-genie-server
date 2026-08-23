@@ -61,6 +61,9 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 | `GENIE_BUNDLE_DIR` | scratchpad 4B bundle | dir with genie_config.json + part*_of_*.bin + tokenizer.json |
 | `GENIE_SDK_DIR` | scratchpad 2.45 SDK | QAIRT 2.45 root (lib/aarch64-windows-msvc, lib/hexagon-v*) |
 | `GENIE_HEXAGON_ARCH` | unset | pin one skel arch (`v81`); default offers all |
+| `GENIE_SUMMARIZE_EVICTED` | 1 | 0 disables summarising evicted turns (plain drop) |
+| `GENIE_SUMMARY_MAX_TOKENS` | 192 | cap on the retained note |
+| `GENIE_WINDOW_MARGIN` | 64 | headroom left between prompt and n_ctx |
 | `GENIE_HOST` / `GENIE_PORT` | 127.0.0.1 / 8080 | bind address |
 | `GENIE_MODEL_ID` | qwen3-4b-npu | id reported to clients |
 | `GENIE_MAX_TOKENS` | 512 | default cap when a request omits max_tokens |
@@ -78,6 +81,26 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   them. Eviction is logged (never silent). A single message too big to fit even
   alone gets a 400 naming the token counts, not a doomed query.
   `GENIE_WINDOW_MARGIN` (default 64) is the headroom left for generation.
+
+- **Eviction summarises instead of discarding.** Dropping the oldest turns
+  outright makes the agent forget it already read a file and read it again --
+  burning the window a second time on information it had. So when eviction
+  fires, the outgoing turns are condensed by one NPU call into a short note
+  folded into the SYSTEM turn (the one thing eviction never touches). A later
+  eviction re-summarises the previous note together with the newly evicted
+  turns, so notes never stack.
+
+  Measured, same 30-turn conversation with a fact stated at the start:
+
+  | | wall | answer |
+  |---|---|---|
+  | `GENIE_SUMMARIZE_EVICTED=1` (default) | 12.6s | recalled the key |
+  | `=0` | 8.5s | lost it |
+
+  The extra ~4s is paid only when eviction was going to happen anyway. If the
+  summarisation call fails, or the note itself will not fit, the server falls
+  back to plain eviction -- a summary is never allowed to break a request.
+  `GENIE_SUMMARY_MAX_TOKENS` (default 192) bounds the note.
 
 - **KV reuse across turns.** The dialog keeps its KV between queries, so when a
   request's prompt is a byte-exact extension of what the dialog already holds,
