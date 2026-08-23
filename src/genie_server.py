@@ -464,6 +464,31 @@ class Handler(BaseHTTPRequestHandler):
         if gen is None:
             self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
             return
+        # REFUSE a tools payload rather than dropping it.
+        #
+        # This bundle is a text-only 4B build: it cannot emit tool_use /
+        # tool_calls blocks. Accepting `tools` and answering normally -- which
+        # is what this server did before -- looks like success to every client,
+        # so the caller registers its tool set and then watches every tool call
+        # silently not happen. There is no error to find and nothing on screen
+        # says why.
+        #
+        # A 400 naming the limitation converts that into something a client can
+        # act on. typed probes exactly this at startup (probeLocalToolCalls),
+        # and reads a 4xx as "tools unsupported" -> it disables them for the
+        # session and says so, instead of shipping schemas the model ignores.
+        #
+        # Checked BEFORE the single-flight lock: refusing costs no NPU time, so
+        # it must not queue behind a live generation.
+        if req.get("tools"):
+            msg = ("tool calling is not supported: %s is a text-only build and "
+                   "cannot emit tool_use blocks. Retry without `tools`." % MODEL_ID)
+            if path == "/v1/messages":
+                self._anthropic_error(400, "invalid_request_error", msg)
+            else:
+                self._json(400, {"error": {"message": msg,
+                                           "type": "invalid_request_error"}})
+            return
         if _INFLIGHT is not None and not _INFLIGHT.acquire(blocking=False):
             # NPU is single-flight and the small queue is full -> shed load.
             if path == "/v1/messages":
