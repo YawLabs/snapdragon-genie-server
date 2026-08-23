@@ -46,6 +46,30 @@ MODEL_ID = os.environ.get("GENIE_MODEL_ID", "qwen3-4b-npu")
 DEFAULT_MAX_TOKENS = int(os.environ.get("GENIE_MAX_TOKENS", "512"))
 STRIP_THINK = os.environ.get("GENIE_STRIP_THINK", "0") == "1"
 
+def read_context_size(default=4096):
+    """The context length this bundle was COMPILED with, from genie_config.json.
+
+    Read rather than hardcoded, for the same reason llama.cpp reports n_ctx at
+    /props instead of publishing a constant: the value belongs to the bundle,
+    and a different bundle (or a recompile at another length) makes any literal
+    here quietly wrong. A client that plans against the wrong window does not
+    error -- it silently overruns the model, which is the failure this endpoint
+    exists to prevent.
+
+    Falls back to `default` when the config is missing or malformed: /props
+    answering with a slightly stale number is far better than the server
+    failing to start over a field it only needs for a metadata endpoint.
+    """
+    try:
+        with open(os.path.join(BUNDLE_DIR, "genie_config.json"), "r",
+                  encoding="utf-8") as f:
+            cfg = json.load(f)
+        size = cfg["dialog"]["context"]["size"]
+        return int(size) if int(size) > 0 else default
+    except Exception:
+        return default
+
+
 LIB_DIR = os.path.join(SDK_DIR, "lib", "aarch64-windows-msvc")
 HEXAGON_DIR = os.path.join(SDK_DIR, "lib", "hexagon-v73", "unsigned")
 
@@ -393,6 +417,33 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": MODEL_ID, "object": "model", "type": "model",
                  "display_name": MODEL_ID, "owned_by": "qualcomm-genie-npu"}
             ]})
+        elif self.path.rstrip("/") == "/props":
+            # llama.cpp's metadata endpoint, which typed probes at startup to
+            # size the context window and name the served model. Without it
+            # typed falls back to DEFAULT_CONTEXT_WINDOW_TOKENS (200_000) and
+            # plans every turn against a window ~49x larger than this bundle
+            # has -- and that number is not decorative, it feeds the per-turn
+            # token budget and the compaction threshold, so the client would
+            # never suggest /compact and would overrun the model instead.
+            #
+            # Only the two fields typed actually reads are emitted:
+            #   default_generation_settings.n_ctx -- the window
+            #   model_alias / model_id            -- the served model's name
+            #
+            # `model_path` is deliberately OMITTED even though typed checks it
+            # FIRST: it would take precedence and typed would then display the
+            # bundle directory, disagreeing with the name /health and
+            # /v1/models already report. One name everywhere beats a more
+            # detailed name in one place.
+            #
+            # No modality field: absence reads as text-only, which is the
+            # truth for this bundle. Claiming a modality it does not have
+            # would be worse than saying nothing.
+            self._json(200, {
+                "default_generation_settings": {"n_ctx": read_context_size()},
+                "model_alias": MODEL_ID,
+                "model_id": MODEL_ID,
+            })
         elif self.path.rstrip("/") in ("/health", "/healthz"):
             self._json(200, {"status": "ok", "model": MODEL_ID})
         else:
