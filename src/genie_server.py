@@ -1006,6 +1006,41 @@ def probe_tool_support():
     return False
 
 
+class Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer that refuses to share a port on Windows.
+
+    HTTPServer sets allow_reuse_address = 1 (SO_REUSEADDR). On POSIX that means
+    "rebind a socket still in TIME_WAIT", which is what you want when
+    restarting a server. On WINDOWS it means something else entirely: a second
+    process can bind a port another process is actively serving. Both binds
+    succeed, the ORIGINAL process keeps receiving the connections, and the new
+    one sits there looking healthy while serving nobody.
+
+    That is not theoretical -- it cost a real measurement here. A server
+    started on the 8192 bundle logged a clean startup and the right HTP
+    allocation, while every request was answered by an older process still
+    holding the port with the 4096 bundle. The only reason it was caught is
+    that /props disagreed with the bundle that had just been loaded. A
+    benchmark that silently measures the wrong model is exactly the failure
+    this repo keeps finding, so make the second bind fail instead.
+    """
+    allow_reuse_address = (os.name != "nt")
+
+
+def port_in_use(host, port, timeout=0.5):
+    """Is something already accepting connections here?
+
+    Checked BEFORE the model loads. The bind itself would catch this on POSIX,
+    but only after 30-50s of loading a 3 GB bundle onto the HTP -- and on
+    Windows it would not catch it at all.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 ENGINE = None
 TEMPLATE = None
 TOOLS_OK = False
@@ -1750,12 +1785,22 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global ENGINE, TEMPLATE, TOOLS_OK
+    # Before the model load, not after: loading is 30-50s of work, and finding
+    # out afterwards that the port is taken wastes all of it. On Windows the
+    # bind would not report the collision at all -- see Server.
+    if port_in_use(HOST, PORT):
+        sys.exit(
+            "something is already serving %s:%d.\n"
+            "This server would appear to start normally while that other "
+            "process kept answering, so requests would hit ITS model, not the "
+            "bundle named here. Stop it first, or set GENIE_PORT to a free "
+            "port." % (HOST, PORT))
     TEMPLATE = load_chat_template()
     TOOLS_OK = probe_tool_support()
     ENGINE = load_engine()
     ENGINE.asst_suffix = TEMPLATE.asst_suf
     ENGINE.default_sampler = read_default_sampler()
-    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    srv = Server((HOST, PORT), Handler)
     print("[genie] endpoint on http://%s:%d  (model=%s)" % (HOST, PORT, MODEL_ID), flush=True)
     print("[genie]   POST /v1/chat/completions (OpenAI)   POST /v1/messages (Anthropic)",
           flush=True)

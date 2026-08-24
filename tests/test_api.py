@@ -7,6 +7,8 @@ that fails.
 """
 
 import json
+import os
+import socket
 
 import pytest
 
@@ -209,3 +211,40 @@ def test_anthropic_tool_use_block_shape(gs, handler):
     block = [b for b in body["content"] if b["type"] == "tool_use"][0]
     assert block["name"] == "read_file" and block["input"] == {"path": "a.py"}
     assert block["id"].startswith("toolu_")
+
+
+# --- port collision -------------------------------------------------------
+# A second server on a port another process is already serving must not start.
+# On Windows it silently could: HTTPServer sets allow_reuse_address, which
+# there permits binding a LIVE socket rather than just a TIME_WAIT one, so both
+# binds succeed and the OLD process keeps answering. That happened while
+# benchmarking -- the new bundle loaded and logged a clean startup while every
+# request was served by the previous bundle -- and it is the same class of bug
+# as a silent CPU fallback: the measurement looks fine and describes the wrong
+# thing.
+
+def test_port_in_use_detects_a_live_listener(gs):
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    host, port = srv.getsockname()
+    try:
+        assert gs.port_in_use(host, port) is True
+    finally:
+        srv.close()
+
+
+def test_port_in_use_false_when_nothing_listens(gs):
+    # Bind to grab a free port, then close it so the port is known-unused.
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    host, port = s.getsockname()
+    s.close()
+    assert gs.port_in_use(host, port) is False
+
+
+def test_server_does_not_share_a_live_port_on_windows(gs):
+    # The guarantee is per-platform: on Windows SO_REUSEADDR is what allows the
+    # hijack, so the class must not set it. On POSIX it stays on, because there
+    # it only means "rebind TIME_WAIT" and turning it off makes restarts fail.
+    assert gs.Server.allow_reuse_address == (os.name != "nt")

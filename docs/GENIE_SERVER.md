@@ -156,6 +156,19 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   field"), and stop sequences must be `{"stop-sequence": [...]}` (a bare array
   returns -8 "Top level config is not an object" and is silently ignored).
 
+- **It will not start on a port something else is already serving.** Checked
+  before the model loads, so a collision costs 0.3s rather than 30-50s of
+  loading followed by a failure. The check exists because on Windows the bind
+  does NOT fail: `HTTPServer` sets `allow_reuse_address`, which on POSIX means
+  "rebind a TIME_WAIT socket" but on Windows lets a second process bind a port
+  another process is actively serving. Both binds succeed and the OLD process
+  keeps answering -- so the new server logs a clean startup, reports the right
+  HTP allocation for its bundle, and serves nobody, while requests are answered
+  by whatever was already there. That happened during the window benchmarking
+  and was caught only because `/props` disagreed with the bundle just loaded.
+  A server that silently answers from the wrong model is the same failure mode
+  as a silent CPU fallback, so it now refuses instead.
+
 - **Single-flight.** The NPU serves one query at a time (concurrent HTP access
   wedges the device), so requests are serialized by a lock. Fine for one agent.
 - **Tool calling works, and thinking dominates its latency.** Enabled when the
