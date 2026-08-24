@@ -146,3 +146,74 @@ def test_refuses_when_free_memory_cannot_be_determined(monkeypatch):
     monkeypatch.setattr(bc, "free_physical_gb", lambda: None)
     monkeypatch.setattr(sys, "argv", ["bench_contention.py"])
     assert bc.main() == 2
+
+
+def test_wait_for_cool_handles_a_real_counter_reading(monkeypatch):
+    # The two cases above both dodge the body: an unreadable counter returns
+    # before the tracking, and limit=0 never enters the loop. So a gate that
+    # crashed on EVERY real reading passed both. It did -- `first` was read
+    # before it was assigned, so the first successful sample raised
+    # UnboundLocalError. The gate had never gated anything, first because it
+    # was dead code and then because wiring it exposed this.
+    import bench_contention as bc
+    monkeypatch.setattr(bc, "cpu_performance_pct", lambda: 97.0)
+    assert bc.wait_for_cool(92.0, limit=5) == 97.0
+
+
+def test_wait_for_cool_returns_the_sample_it_gated_on(monkeypatch):
+    # Below the floor once, then above: the value returned must be the reading
+    # that satisfied the gate, not a fresh sample taken afterwards.
+    import bench_contention as bc
+    seq = iter([80.0, 95.0])
+    monkeypatch.setattr(bc, "cpu_performance_pct", lambda: next(seq))
+    monkeypatch.setattr(bc.time, "sleep", lambda _s: None)
+    # Stubbed because the power check added later SHELLS OUT, which made this
+    # environment-dependent: run on a laptop actually on battery, the gate
+    # aborts on the 80.0 reading and this returns 80.0 instead of 95.0. It
+    # caught exactly that the day the check landed. A suite whose header
+    # promises "no device, no server, no network" has to stub every probe, not
+    # only the ones that existed when the test was written.
+    monkeypatch.setattr(bc, "on_battery", lambda: False)
+    monkeypatch.setattr(bc, "cpu_busy_pct", lambda: 90.0)
+    assert bc.wait_for_cool(92.0, limit=30) == 95.0
+
+
+def test_power_limited_note_is_silent_when_the_clock_is_fine(monkeypatch):
+    assert bc.power_limited_note(99.0, 92.0) is None
+    assert bc.power_limited_note(None, 92.0) is None
+
+
+def test_power_limited_note_names_the_battery(monkeypatch):
+    # Definitive path: the machine reports it is on battery.
+    monkeypatch.setattr(bc, "on_battery", lambda: True)
+    msg = bc.power_limited_note(31.0, 92.0)
+    assert msg is not None and "BATTERY" in msg
+    assert "will NOT recover" in msg, "must say waiting is futile, not just why"
+
+
+def test_power_limited_note_falls_back_to_the_idle_fingerprint(monkeypatch):
+    # No battery info (desktop / query failed) -- a low clock on an IDLE box is
+    # power limiting; a thermally limited box would be BUSY.
+    monkeypatch.setattr(bc, "on_battery", lambda: None)
+    monkeypatch.setattr(bc, "cpu_busy_pct", lambda: 9.0)
+    msg = bc.power_limited_note(31.0, 92.0)
+    assert msg is not None and "power" in msg.lower()
+
+
+def test_power_limited_note_stays_quiet_when_the_box_is_busy(monkeypatch):
+    # Low clock + BUSY cpu is the thermal case: waiting DOES help, so the gate
+    # must keep waiting rather than aborting.
+    monkeypatch.setattr(bc, "on_battery", lambda: None)
+    monkeypatch.setattr(bc, "cpu_busy_pct", lambda: 85.0)
+    assert bc.power_limited_note(31.0, 92.0) is None
+
+
+def test_wait_for_cool_aborts_instead_of_blocking_on_battery(monkeypatch):
+    # The behaviour that matters: no ten-minute silence waiting for a recovery
+    # that cannot come.
+    monkeypatch.setattr(bc, "cpu_performance_pct", lambda: 31.0)
+    monkeypatch.setattr(bc, "on_battery", lambda: True)
+    slept = []
+    monkeypatch.setattr(bc.time, "sleep", lambda s: slept.append(s))
+    assert bc.wait_for_cool(92.0, limit=300) == 31.0
+    assert slept == [], "must return immediately, not spin out the limit"

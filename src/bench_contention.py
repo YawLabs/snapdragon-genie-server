@@ -194,6 +194,75 @@ def cpu_performance_pct():
         return None
 
 
+def on_battery():
+    """True if running on battery, False on AC, None if undeterminable.
+
+    Because a low clock has two causes that look identical in a results table
+    and take two seconds to tell apart live: THERMAL limiting (waiting fixes
+    it) and POWER-SOURCE limiting (waiting never fixes it). On 2026-08-24 this
+    box sat at 998 MHz of a 3417 MHz base -- 31.6% -- with the CPU at 11%,
+    which is the power-source fingerprint: a thermally-limited box is BUSY.
+    A run that blocks for a cooling recovery on battery blocks forever.
+    """
+    if sys.platform != "win32":
+        return None
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             "(Get-CimInstance -Namespace root\\wmi -ClassName BatteryStatus "
+             "-ErrorAction SilentlyContinue | Select-Object -First 1)"
+             ".PowerOnline"],
+            capture_output=True, text=True, timeout=30)
+        v = out.stdout.strip()
+        if v == "":
+            return None          # no battery (desktop) or query unavailable
+        return v.lower() != "true"
+    except Exception:
+        return None
+
+
+def cpu_busy_pct():
+    """Box-wide CPU utilisation, or None. The second half of the fingerprint."""
+    if sys.platform != "win32":
+        return None
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             "(Get-Counter '\\Processor(_Total)\\% Processor Time')"
+             ".CounterSamples.CookedValue"],
+            capture_output=True, text=True, timeout=30)
+        return float(out.stdout.strip().splitlines()[0])
+    except Exception:
+        return None
+
+
+def power_limited_note(pct, floor):
+    """Why the clock is low, when it is low for a reason waiting cannot fix.
+
+    Returns a message, or None if the clock is fine or the cause looks thermal.
+    Checks the power source directly first -- that is definitive -- and falls
+    back to the low-clock-with-idle-CPU fingerprint for machines that report no
+    battery.
+    """
+    if pct is None or pct >= floor:
+        return None
+    batt = on_battery()
+    if batt is True:
+        return ("clock is %.0f%% of base and this machine is ON BATTERY. That "
+                "is power limiting, not heat -- waiting will NOT recover it. "
+                "Plug in AC and re-run; nothing measured on battery is worth "
+                "keeping." % pct)
+    busy = cpu_busy_pct()
+    if batt is None and busy is not None and busy < 15.0:
+        return ("clock is %.0f%% of base while the CPU is only %.0f%% busy. A "
+                "THERMALLY limited box is busy; an idle box at a low clock is "
+                "power limited. Check the power source rather than waiting for "
+                "a cooldown that is not coming." % (pct, busy))
+    return None
+
+
 def wait_for_cool(floor, limit=300):
     """Block until the clock recovers to `floor`% of base, or `limit` seconds.
 
@@ -214,6 +283,16 @@ def wait_for_cool(floor, limit=300):
             return None
         if first is None:
             first = pct
+            # Checked ONCE, on the first below-floor reading, rather than every
+            # loop: the power source does not change while we spin, and this
+            # costs two subprocess calls. Bailing immediately matters because
+            # the alternative is blocking the full `limit` for a recovery that
+            # cannot happen -- observed 2026-08-24 as ten minutes of silence
+            # from a run whose box had been unplugged, which read as a hang.
+            why = power_limited_note(pct, floor)
+            if why is not None:
+                print("    (ABORTING THE GATE: %s)" % why, flush=True)
+                return pct
         if pct >= floor:
             if time.time() - start > 5:
                 print("    (cooled %.0f%% -> %.0f%% after %ds)"
