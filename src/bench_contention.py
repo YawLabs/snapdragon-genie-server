@@ -209,6 +209,21 @@ def cpu_performance_pct():
         return None
 
 
+def power_source():
+    """'battery' | 'ac' | 'no-battery' | 'unknown'.
+
+    Distinguishing the last two matters: a transient PowerShell failure used to
+    return the same None as a desktop with no battery, silently downgrading a
+    definitive check to a heuristic on a laptop that could have answered.
+    """
+    v = _power_online_raw()
+    if v is None:
+        return "unknown"
+    if v == "":
+        return "no-battery"
+    return "battery" if v.lower() != "true" else "ac"
+
+
 def on_battery():
     """True if running on battery, False on AC, None if undeterminable.
 
@@ -237,6 +252,29 @@ def on_battery():
         return None
 
 
+def _power_online_raw():
+    """Raw PowerOnline string, "" if the class reports nothing, None on error.
+
+    Split out so power_source() can tell "no battery" from "query failed"; the
+    two are indistinguishable through on_battery()'s tri-state return.
+    """
+    if sys.platform != "win32":
+        return None
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             "(Get-CimInstance -Namespace root\\wmi -ClassName BatteryStatus "
+             "-ErrorAction SilentlyContinue | Select-Object -First 1)"
+             ".PowerOnline"],
+            capture_output=True, text=True, timeout=30)
+        if out.returncode != 0:
+            return None
+        return out.stdout.strip()
+    except Exception:
+        return None
+
+
 def cpu_busy_pct():
     """Box-wide CPU utilisation, or None. The second half of the fingerprint."""
     if sys.platform != "win32":
@@ -256,26 +294,42 @@ def cpu_busy_pct():
 def power_limited_note(pct, floor):
     """Why the clock is low, when it is low for a reason waiting cannot fix.
 
-    Returns a message, or None if the clock is fine or the cause looks thermal.
-    Checks the power source directly first -- that is definitive -- and falls
-    back to the low-clock-with-idle-CPU fingerprint for machines that report no
-    battery.
+    Returns (message, abort) or (None, False). `abort` says whether waiting is
+    provably futile; a message with abort=False is advisory only.
+
+    The power SOURCE is the one definitive signal, so it is the only thing that
+    aborts. The low-clock-with-idle-CPU fingerprint is kept as advice but must
+    NOT abort, because it is wrong in the case this function is called from:
+    this gate runs BEFORE each sample, when the box is legitimately idle, and
+    an idle CPU downclocks by design. Treating that as power limiting aborts
+    the gate on a perfectly healthy run -- which on a machine reporting no
+    battery would mean the gate never works at all. The fingerprint is only
+    sound when the CPU is BUSY, which is its own premise: a thermally limited
+    box is busy.
     """
     if pct is None or pct >= floor:
-        return None
-    batt = on_battery()
-    if batt is True:
+        return None, False
+    src = power_source()
+    if src == "battery":
         return ("clock is %.0f%% of base and this machine is ON BATTERY. That "
                 "is power limiting, not heat -- waiting will NOT recover it. "
                 "Plug in AC and re-run; nothing measured on battery is worth "
-                "keeping." % pct)
+                "keeping." % pct), True
+    if src == "unknown":
+        return ("clock is %.0f%% of base and the power source could not be "
+                "read, so it is not known whether waiting can help." % pct), False
     busy = cpu_busy_pct()
-    if batt is None and busy is not None and busy < 15.0:
-        return ("clock is %.0f%% of base while the CPU is only %.0f%% busy. A "
-                "THERMALLY limited box is busy; an idle box at a low clock is "
-                "power limited. Check the power source rather than waiting for "
-                "a cooldown that is not coming." % (pct, busy))
-    return None
+    if src == "no-battery" and busy is not None and busy < 15.0:
+        return ("clock is %.0f%% of base while the CPU is only %.0f%% busy. On "
+                "a box with no battery that is most likely ordinary idle "
+                "downclocking rather than a limit -- but if the clock stays "
+                "low once work starts, check the power budget." % (pct, busy)), False
+    return None, False
+
+
+# Notes raised inside wait_for_cool, drained into the run's warnings so they
+# reach the JSON as well as the terminal.
+GATE_NOTES = []
 
 
 def wait_for_cool(floor, limit=300):
@@ -304,10 +358,18 @@ def wait_for_cool(floor, limit=300):
             # the alternative is blocking the full `limit` for a recovery that
             # cannot happen -- observed 2026-08-24 as ten minutes of silence
             # from a run whose box had been unplugged, which read as a hang.
-            why = power_limited_note(pct, floor)
+            why, abort = power_limited_note(pct, floor)
             if why is not None:
-                print("    (ABORTING THE GATE: %s)" % why, flush=True)
-                return pct
+                # Recorded, not just printed. A warning that exists only in the
+                # terminal is absent from the artifact a consumer reads, which
+                # is how a suspect number becomes a clean-looking one
+                # downstream -- the same record-vs-reality drift this harness
+                # keeps finding elsewhere.
+                GATE_NOTES.append(why)
+                print("    (%s: %s)"
+                      % ("ABORTING THE GATE" if abort else "note", why), flush=True)
+                if abort:
+                    return pct
         if pct >= floor:
             if time.time() - start > 5:
                 print("    (cooled %.0f%% -> %.0f%% after %ds)"
@@ -530,7 +592,7 @@ def main():
         else:
             print("  %-4s incomplete (every measurement was skipped)" % name)
 
-    warnings = []
+    warnings = list(GATE_NOTES)
     for name, _b, _m in engines:
         w = drift_note(per_engine[name]["solo"], "%s solo decode" % name)
         if w:

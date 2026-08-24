@@ -173,46 +173,72 @@ def test_wait_for_cool_returns_the_sample_it_gated_on(monkeypatch):
     # caught exactly that the day the check landed. A suite whose header
     # promises "no device, no server, no network" has to stub every probe, not
     # only the ones that existed when the test was written.
-    monkeypatch.setattr(bc, "on_battery", lambda: False)
+    monkeypatch.setattr(bc, "power_source", lambda: "ac")
     monkeypatch.setattr(bc, "cpu_busy_pct", lambda: 90.0)
     assert bc.wait_for_cool(92.0, limit=30) == 95.0
 
 
 def test_power_limited_note_is_silent_when_the_clock_is_fine(monkeypatch):
-    assert bc.power_limited_note(99.0, 92.0) is None
-    assert bc.power_limited_note(None, 92.0) is None
+    assert bc.power_limited_note(99.0, 92.0) == (None, False)
+    assert bc.power_limited_note(None, 92.0) == (None, False)
 
 
 def test_power_limited_note_names_the_battery(monkeypatch):
     # Definitive path: the machine reports it is on battery.
-    monkeypatch.setattr(bc, "on_battery", lambda: True)
-    msg = bc.power_limited_note(31.0, 92.0)
+    monkeypatch.setattr(bc, "power_source", lambda: "battery")
+    msg, abort = bc.power_limited_note(31.0, 92.0)
     assert msg is not None and "BATTERY" in msg
     assert "will NOT recover" in msg, "must say waiting is futile, not just why"
+    assert abort is True, "the battery case is the ONLY one that aborts"
 
 
-def test_power_limited_note_falls_back_to_the_idle_fingerprint(monkeypatch):
-    # No battery info (desktop / query failed) -- a low clock on an IDLE box is
-    # power limiting; a thermally limited box would be BUSY.
-    monkeypatch.setattr(bc, "on_battery", lambda: None)
+def test_idle_fingerprint_advises_but_does_NOT_abort(monkeypatch):
+    # The gate runs BEFORE each sample, when the box is legitimately idle and
+    # downclocked. Treating that as power limiting aborted the gate on a
+    # healthy run -- on a machine reporting no battery the gate would never
+    # work at all. Advice yes, abort no.
+    monkeypatch.setattr(bc, "power_source", lambda: "no-battery")
     monkeypatch.setattr(bc, "cpu_busy_pct", lambda: 9.0)
-    msg = bc.power_limited_note(31.0, 92.0)
-    assert msg is not None and "power" in msg.lower()
+    msg, abort = bc.power_limited_note(31.0, 92.0)
+    assert msg is not None
+    assert abort is False, "an idle low clock must not abort the gate"
+
+
+def test_unknown_power_source_does_not_abort(monkeypatch):
+    # A failed query used to return the same None as "no battery", silently
+    # downgrading a definitive check to a heuristic on a laptop.
+    monkeypatch.setattr(bc, "power_source", lambda: "unknown")
+    msg, abort = bc.power_limited_note(31.0, 92.0)
+    assert msg is not None and "could not be read" in msg
+    assert abort is False
+
+
+def test_gate_note_reaches_the_json_not_only_the_terminal(monkeypatch):
+    # A warning that exists only in stdout is absent from the artifact a
+    # consumer reads -- the record-vs-reality drift this harness keeps finding.
+    bc.GATE_NOTES.clear()
+    monkeypatch.setattr(bc, "power_source", lambda: "battery")
+    monkeypatch.setattr(bc, "cpu_performance_pct", lambda: 31.0)
+    bc.wait_for_cool(92.0, limit=5)
+    assert bc.GATE_NOTES and "BATTERY" in bc.GATE_NOTES[0]
+    bc.GATE_NOTES.clear()
 
 
 def test_power_limited_note_stays_quiet_when_the_box_is_busy(monkeypatch):
     # Low clock + BUSY cpu is the thermal case: waiting DOES help, so the gate
     # must keep waiting rather than aborting.
-    monkeypatch.setattr(bc, "on_battery", lambda: None)
+    monkeypatch.setattr(bc, "power_source", lambda: "no-battery")
     monkeypatch.setattr(bc, "cpu_busy_pct", lambda: 85.0)
-    assert bc.power_limited_note(31.0, 92.0) is None
+    msg, abort = bc.power_limited_note(31.0, 92.0)
+    assert abort is False, "thermal case: the gate must keep waiting"
+    assert msg is None, "and it must not muddy the log with a power note"
 
 
 def test_wait_for_cool_aborts_instead_of_blocking_on_battery(monkeypatch):
     # The behaviour that matters: no ten-minute silence waiting for a recovery
     # that cannot come.
     monkeypatch.setattr(bc, "cpu_performance_pct", lambda: 31.0)
-    monkeypatch.setattr(bc, "on_battery", lambda: True)
+    monkeypatch.setattr(bc, "power_source", lambda: "battery")
     slept = []
     monkeypatch.setattr(bc.time, "sleep", lambda s: slept.append(s))
     assert bc.wait_for_cool(92.0, limit=300) == 31.0

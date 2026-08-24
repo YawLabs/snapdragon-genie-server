@@ -380,6 +380,27 @@ def main():
         print("\nPREFILL (one decode step removed; raw wall also shown)", flush=True)
         for d in depths:
             measure_prefill(base, args.model, d, args.timeout, per_step)
+        if args.prefill_only and per_step:
+            # With --prefill-only there is no decode phase to check the probe
+            # against, and the probe is the ONLY thing shaping these numbers --
+            # one taken during a blip corrupts every figure above silently.
+            # Re-probe at the end: the two bracket the sweep, so agreement
+            # means the box held throughout it.
+            again = decode_probe(base, args.model, args.timeout,
+                                 depth=min(500, depths[0]))
+            if again:
+                a, b = 1.0 / per_step, 1.0 / again
+                if max(a, b) / min(a, b) > 1.5:
+                    print("\n  WARNING: the decode probe read %.2f t/s before the "
+                          "sweep and %.2f t/s after it -- the box did not hold, so "
+                          "the corrections above are unreliable. Re-run quiet."
+                          % (a, b), flush=True)
+                else:
+                    print("\n  probe before/after: %.2f / %.2f t/s -- consistent, "
+                          "so the corrections above stand." % (a, b), flush=True)
+            else:
+                print("\n  NOTE: the closing probe failed, so the corrections "
+                      "above could not be cross-checked.", flush=True)
 
     if not args.prefill_only:
         print("\nDECODE (delta of N-token vs 1-token run at the same depth)", flush=True)
