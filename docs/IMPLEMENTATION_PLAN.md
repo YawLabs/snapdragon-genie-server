@@ -481,6 +481,15 @@ and record tg uplift + acceptance rate per model.
   prefill up and run-to-run noise down. Nothing measured got worse. Beyond the throughput, an idle NPU
   server stealing 2.7 cores contaminates any concurrent measurement of another engine, which matters
   directly for the multi-engine work. Every measurement in the repo predating this is pessimistic.
+- 2026-08-24: measurement provenance on a shared box. The numbers quoted in the docs were taken
+  22:57-23:24 on 08-23 and 02:2x-02:4x on 08-24, with per-process CPU checked at the time. An EARLIER
+  batch (20:18-20:39 on 08-23, the runs behind commits 41cae30 and 879a50c) overlaps a window in which
+  another session was running heavy llama-bench jobs on this machine, so treat those specific figures as
+  provisional -- they are already superseded by the later re-measurements, and the direction held across
+  both. Two lessons, both learned by collision rather than foresight: a benchmark on a shared box must
+  record its wall-clock window, and two sessions measuring different engines can invalidate each other
+  invisibly in BOTH directions (a resident `poll: true` genie_server cost a concurrent llama.cpp
+  investigation ~2.7 cores it could not see).
 - 2026-08-24: **8192 is the default window to target.** Measured 8.8 t/s decode (poll false) against
   18.0 at 4096 and 3.3 at 16384: 2x the context for ~half the decode rate, where 16384 gives 4x the
   context for under a fifth. The earlier hope that 8192 might be *disproportionately* cheap was a

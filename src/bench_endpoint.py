@@ -51,6 +51,14 @@ Method, and its limits:
   * A failed request (429 backpressure, a 400, a dropped connection) skips that
     data point and the sweep carries on. Losing a twenty-minute run to one
     transient 429 would be worse than a gap in the table.
+  * CHECK THE BOX FOR CO-TENANTS FIRST. This tool cannot see them and will
+    happily report a contended number as a clean one. On a shared machine that
+    is not hypothetical: a batch measured here was invalidated by another
+    session's llama-bench running concurrently, and one of ITS investigations
+    was in turn invalidated by a resident genie_server busy-waiting on 2.7
+    cores. Before a batch, confirm nothing else is loading the box, and record
+    the wall-clock window with the numbers so an overlap can be reconstructed
+    later instead of argued about.
 
 Read the results next to `docs/GENIE_SERVER.md`: on this engine throughput is
 set by the window the BUNDLE WAS COMPILED AT, so a run is only comparable to
