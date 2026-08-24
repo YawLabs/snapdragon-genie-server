@@ -184,8 +184,10 @@ attribution of the CONCURRENCY flip (0.78x -> 1.45x) to the same cause -- the
 GPU's solo rate being identical across both configurations is what makes that
 inference a strong one, but it is not an A/B. Closing it means re-running the
 contention benchmark against a `poll: true` bundle at matched conditions (d469,
-n=3, Q4_K_M on the GPU leg via `llama-bench`, clock-gated, poll value recorded
-in the output).
+n=3, Q4_K_M on the GPU leg via `llama-bench`, poll value recorded in the
+output, and clock-gated -- noting that the gate is currently dead code in
+`bench_contention.py` and a fix is in flight, so that run must wait for it
+rather than inherit the same thermal exposure).
 
 ## Concurrency measured: 1.45x (corrected 2026-08-24)
 
@@ -196,8 +198,26 @@ dispatch a kernel every token. It was measuring CPU starvation, not contention.
 With `poll: false` the pair is a **1.45x gain**. Both configurations are below,
 because the losing one is what a bundle does out of the box.
 
-Both engines hot, same model on each leg, decode at d469, n=3, every sample
-gated to >=92% of base clock.
+Both engines hot, same model on each leg, decode at d469, n=3.
+
+**RETRACTED 2026-08-24: these samples were NOT clock-gated.** This paragraph
+claimed every sample was gated to >=92% of base clock. The harness cannot do
+that -- `bench_contention.py` defines `wait_for_cool()` and a `cool_floor`
+parameter, but neither `measure()` call site passes it and no CLI flag can set
+it, so the gate has never executed. Verified by reading the two call sites.
+
+That is worse than never claiming it, because a reader inherits the thermal
+artifact while believing the numbers are protected from it -- and sustained
+load drops this box to 48.9% of base clock, which is the same decay that
+manufactured a fake monotonic depth curve for two of us today.
+
+**What it does and does not undermine.** The 1.45x-vs-0.78x comparison is a
+between-configuration difference measured the same way on both sides, and the
+GPU's solo rate is identical across them, so a shared thermal bias largely
+cancels. The absolute retention percentages below are the exposed part: they
+are single-round figures with no protection against decay within the round.
+Treat the ratio as sound and the absolutes as provisional until a gated re-run
+lands. A fix is in flight from the session that owns the harness.
 
 **`poll: false` -- correct configuration:**
 
