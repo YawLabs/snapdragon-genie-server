@@ -213,6 +213,40 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   with `poll: false`, and **0.1%** with `poll: false` thirty seconds after a
   generation. It is a spin, not drain.
 
+  The decode figure is now measured four times, three of which agree. Interleaved
+  legs, single engine, no contention, AC, cool box:
+
+  | | poll=false | poll=true | ratio |
+  |---|---|---|---|
+  | single server (`bench_endpoint`) | 18.0 | 11.6 | 1.55x |
+  | interleaved, on battery | 17.91 | 12.36 | 1.45x |
+  | **interleaved, solo, AC** | **17.11** (16.92-17.23) | **11.28** (9.69-12.99) | **1.51x** |
+  | via the contention harness | 17.58 | 20.72 | 0.85x -- INVERTED |
+
+  **The inverted one is an artifact of the contention harness and should not be
+  read as a real result.** In that harness a GPU server is resident throughout,
+  and `poll: true` heats the package enough to drag the whole box down -- its
+  legs ran at a clock-under-load median of 56-64% of base against `poll:
+  false`'s 73-79%. The two arms were therefore not measured under comparable
+  conditions, which a ratio survives and an absolute does not. Removing the
+  contention reproduces the original result.
+
+  Note also the spread: `poll: false` holds a 0.31 t/s range across three
+  interleaved pairs while `poll: true` spans 3.30. **The busy-wait costs
+  predictability as well as throughput**, which matters more than the median for
+  an agent workload where a slow turn is a stall a human notices.
+
+- **The contention ABSOLUTES could not be established on this box, and that is
+  a property of the hardware rather than a gap in effort.** The poll ratios are
+  solid (see `TYPED_ROUTER_BRIEF.md`), but every attempt at absolute
+  tokens/sec under two hot engines failed the same way: the package sags to as
+  low as **34.8% of base clock** under load, on AC at high charge, and it sags
+  further with `poll: true` because the spin adds heat. Six legs produced a
+  20x wider spread in one arm than the other. If absolutes are ever needed,
+  they want sequential legs with cooling between them, not two engines hot at
+  once -- and the per-leg clock has to be sampled DURING the measurement, since
+  a pre-flight check certifies nothing about what follows it.
+
   Prefill improves too (4096: 629 -> 1157 t/s median) and run-to-run noise
   drops sharply (1.85 -> 0.23 t/s at 4096). Nothing measured got worse. The
   penalty shrinks as the window grows because the NPU work per token grows
