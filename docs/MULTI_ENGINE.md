@@ -20,12 +20,28 @@ The good news is that the real per-instance cost is nowhere near 16 GB:
 
 | | weights | KV cache | resident |
 |---|---|---|---|
-| one instance @ 4k ctx | ~3.0 GB | ~0.6 GB | **~3.6 GB** |
-| one instance @ 16k ctx | ~3.0 GB | ~2.3 GB | **~5.3 GB** |
+| one instance @ 4k ctx | ~3.0 GB | ~0.29 GB | **~3.3 GB** |
+| one instance @ 16k ctx | ~3.0 GB | ~1.18 GB | **~4.2 GB** |
 
-Three instances land around **11 GB at 4k** or **16 GB at 16k**, which fits
-comfortably. KV is ~144 KB/token (36 layers, 8 KV heads GQA, head_dim 128,
-fp16). **Capacity was never the constraint.**
+Three instances land around **10 GB at 4k** or **13 GB at 16k**, which fits
+comfortably. **Capacity was never the constraint.**
+
+KV is **~72 KB/token, not 144** -- corrected 2026-08-23 by reading the
+bundle's own `metadata.json` rather than assuming. `past_key_0_in` /
+`past_value_0_in` are `dtype: uint8` with a fixed quant scale, so the arithmetic
+is 36 layers x 2 x 8 KV heads x 128 head_dim x **1 byte** = 73,728 B/token. The
+earlier figure assumed fp16 and was exactly 2x high. Confirmed against the
+HTP allocator: the 4096 bundle reports 343,933,440 bytes across 8 buffers and
+the 16384 bundle 1,253,048,832 -- a delta of 73,983 B per extra token of
+window, 0.3% off the uint8 prediction.
+
+**And that KV is allocated for the whole COMPILED window up front, not as the
+context fills**, because the KV tensors are statically-shaped graph inputs.
+That makes window size a throughput knob, not just a memory one -- the 16k
+bundle decodes at ~3.1 t/s versus ~13.0 t/s for the 4k one *at identical,
+nearly empty context*. See the window-tax note in `GENIE_SERVER.md`; it is the single
+most important number for sizing a multi-engine deployment, because a bigger
+window costs every request rather than only the long ones.
 
 ## The actual constraint is bandwidth
 
@@ -42,9 +58,20 @@ Measured single-engine baselines (prefill / decode, tokens/sec):
 
 | engine | prefill | decode | notes |
 |---|---|---|---|
-| NPU (Genie / QnnHtp) | 277 | 13.2 | best of the three |
+| NPU (Genie / QnnHtp) | 277 (see below) | 13.2 | best of the three |
 | GPU (Adreno) | 117 | 6.0 | ~half the NPU's decode |
 | CPU (KleidiAI) | fine | **~0.2** | **broken -- unresolved anomaly** |
+
+The NPU prefill figure above is **understated and should be re-measured**. A
+re-run on a quiet box against the same 4096 bundle, via the committed
+`src/bench_endpoint.py`, measured a median **914 t/s** prefill (845-960) and
+**13.0 t/s** decode (11.2-13.2). Decode agrees with the recorded 13.2; prefill
+is over 3x the recorded 277. The likeliest explanation is the warning at the
+bottom of this file -- the original sweep was taken while something large was
+resident. Treat 277 as a loaded-box number, not the NPU's prefill ceiling. The
+GPU and CPU rows were measured in that same window and carry the same doubt;
+`bench_endpoint.py` speaks plain OpenAI HTTP, so it can re-measure a
+`llama-server` leg on identical prompts.
 
 **The CPU leg is not worth building yet.** At 0.2 t/s it contributes nothing
 while consuming bandwidth the other two need. Until that anomaly is understood

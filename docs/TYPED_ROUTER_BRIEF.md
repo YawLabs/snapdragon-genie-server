@@ -37,15 +37,21 @@ Same model, three backends, one shared 31.6 GB memory pool (no dedicated VRAM
 
 | engine | server | prefill t/s | decode t/s | status |
 |---|---|---|---|---|
-| NPU (Hexagon) | Genie server | 277 | 13.2 | best; **single-flight** |
+| NPU (Hexagon) | Genie server | 277* | 13.2 | best; **single-flight** |
 | GPU (Adreno) | `llama-server` | 117 | 6.0 | works |
 | CPU (KleidiAI) | `llama-server` | fine | **~0.2** | **broken, unexplained** |
 
-Resident cost is ~3.6 GB per instance at 4k context, ~5.3 GB at 16k -- so three
-instances fit in ~11-16 GB. **Capacity is not the constraint; memory bandwidth
-is.** Decode streams the whole model per token and all engines share one bus,
+Resident cost is ~3.3 GB per instance at 4k context, ~4.2 GB at 16k (KV is
+`uint8`, ~72 KB/token, allocated for the whole compiled window at load) -- so
+three instances fit in ~10-13 GB. **Capacity is not the constraint; memory
+bandwidth is.** Decode streams the whole model per token and all engines share one bus,
 so concurrent instances divide throughput rather than multiplying it. Budget
 for **1.5-2x aggregate, not 3x**.
+
+\* The NPU prefill figure is understated -- a re-measurement on a quiet box
+gave a median **914 t/s** on the same 4096 bundle (decode agreed, 13.0). The
+original sweep looks to have been taken while the box was loaded. Do not plan
+capacity against 277.
 
 Do not plan around the CPU leg until its 0.2 t/s decode is explained. Treat
 this as a two-engine design today.
@@ -76,11 +82,33 @@ gives you concurrency, plus somewhere to go when the HTP throws its transient
 
 These are properties of the NPU endpoint that a router must not assume away:
 
-- **Context is 4096 tokens** on the current bundle (a 16k rebuild is in
-  progress). Read it from `/props`; do not hardcode. For scale: a realistic
-  agent preamble (system prompt + 6 tool schemas + one user turn) measured
-  **626 tokens**, leaving ~3470, and real source code runs ~10-13 tokens/line.
-  That is roughly one medium file in context.
+- **Context is 4096 tokens** on the default bundle. Read it from `/props`; do
+  not hardcode. For scale: a realistic agent preamble (system prompt + 6 tool
+  schemas + one user turn) measured **626 tokens**, leaving ~3470, and real
+  source code runs ~10-13 tokens/line. That is roughly one medium file in
+  context.
+
+- **A 16384-token bundle now exists, and it is a TIER, not an upgrade.** The
+  16k rebuild finished and runs. But a Genie bundle's KV tensors are graph
+  inputs statically shaped to the compiled window, so the whole buffer moves on
+  every decode step regardless of how full it is. Measured on the same box,
+  same server, same prompts, both bundles otherwise byte-identical:
+
+  | compiled n_ctx | prefill t/s (median) | decode t/s (median) |
+  |---|---|---|
+  | 4096 | **914** (845-960) | **13.0** (11.2-13.2) |
+  | 16384 | **167** (160-169) | **3.1** (3.0-3.2) |
+
+  Both are FLAT with depth -- the 16k bundle decodes at 3.13 t/s with 469
+  tokens of context and 3.02 t/s with 10532, so the ~4x penalty applies to
+  short requests too. A 10532-token prefill takes **63 seconds**.
+
+  **Routing rule that falls out of this: send a request to the smallest window
+  that fits it.** Do not treat a larger `n_ctx` as strictly better when
+  ranking endpoints -- on this engine it is a latency class. The 16k endpoint
+  earns its cost only for requests that genuinely cannot fit in 4096, and even
+  then the 4k endpoint plus server-side eviction/summarisation is usually the
+  faster answer.
 - **Tool calling works.** Verified end-to-end on both APIs. If a bundle cannot
   do tools, the server returns a `400` naming the limitation rather than
   accepting `tools` and ignoring them -- so a 4xx on a tools probe means

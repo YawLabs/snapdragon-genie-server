@@ -101,6 +101,28 @@ session (placement-verified) and a CPU-EP session for each, times both, and
 prints ms/run, GOP/s, and the NPU-vs-CPU speedup. `--no-verify` downgrades the
 placement check from hard-fail to a flag in the output.
 
+### End-to-end LLM throughput
+
+`src/bench.py` measures one matmul. To measure a whole served model, point
+`src/bench_endpoint.py` at a running `genie_server.py`:
+
+```powershell
+python src\bench_endpoint.py                          # prefill + decode sweep
+python src\bench_endpoint.py --base http://127.0.0.1:8080 --decode-only
+```
+
+It reports prefill and decode in tokens/sec at several context depths, with
+prefill subtracted out of the decode figure (timing an N-token run against a
+1-token run at the same depth) so decode is not understated by folding prefill
+into the rate. Because it speaks plain OpenAI HTTP, the same command benchmarks
+a `llama-server` GPU or CPU leg -- which is the only way to get a cross-engine
+comparison on identical prompts.
+
+**Read the result next to the bundle's `n_ctx`.** On Genie the compiled context
+window sets throughput for every request, so a run is only comparable to
+another run at the same `/props` `n_ctx` -- see the window-tax note in
+`docs/GENIE_SERVER.md`.
+
 ## Tests
 
 ```powershell
@@ -204,22 +226,49 @@ a full model is **smaller** than the NPU-vs-ORT-CPU-EP ratios above.
   distinguishes a real HTP run from a silent CPU fallback.
 - The single-GEMM benchmark (FP16, INT8 QDQ, prompt-length sweep) runs and
   shows an order-of-magnitude FP16 NPU advantage over the ORT CPU EP.
+- **A full LLM runs on the NPU and serves HTTP.** A Qwen3-4B w4a16 Genie bundle
+  sits resident on the HTP behind `src/genie_server.py`, answering both the
+  OpenAI and Anthropic APIs with streaming, tool calls, stop sequences and
+  context eviction. See [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md).
+- **Full-model prefill and decode, measured.** ~900 tok/s prefill and ~13 tok/s
+  decode on the 4096-window bundle, via `src/bench_endpoint.py`. Decode is
+  bandwidth-bound and, on this engine, is set by the window the bundle was
+  COMPILED at rather than by how much context is in use -- a 16384 bundle of
+  the same model decodes ~4x slower at identical context.
+- **Model conversion via Qualcomm AI Hub**, run end-to-end here: both bundles
+  on this box came from `qai-hub-models export` (from WSL -- the Windows path
+  dies on `fcntl`).
 
 **Untested here (documented, not measured):**
-- **Full-model decode tokens/sec.** The LLM wrapper `onnxruntime-genai` (0.15.2)
-  has no cp314 win_arm64 wheel (max cp313), so it cannot share the proven 3.14
-  venv. A genai decode harness needs a separate cp311/312/313 venv. See
-  [docs/MODEL_CONVERSION.md](docs/MODEL_CONVERSION.md).
-- **Model conversion pipelines** (Olive INT4, Qualcomm AI Hub, Foundry Local) --
-  documented from vendor tooling, not run end-to-end here.
+- **The `onnxruntime-genai` path to full-model decode.** genai 0.15.2 has no
+  cp314 win_arm64 wheel (max cp313), so it cannot share the proven 3.14 venv,
+  and it is now the *alternative* rather than the plan -- Genie got there
+  first. See [docs/MODEL_CONVERSION.md](docs/MODEL_CONVERSION.md).
+- **The other conversion pipelines** (Olive INT4, Foundry Local) -- documented
+  from vendor tooling, not run end-to-end here.
+- **Speculative decoding** (SSD / Eaglet). Not config-only on this bundle:
+  both need a re-export. LADE *is* config-only and was measured -- it breaks
+  tool calling, so it is disqualified rather than merely unproven.
+- **Power draw**, which is the NPU's real claimed edge over CPU and GPU.
 
 ## Layout
 
 ```
-src/qnn_ep.py            register + pick-NPU + build-session + HTP placement assertion
-src/bench.py             CLI GEMM benchmark (FP16 / INT8 QDQ / prompt-length sweep)
-docs/MODEL_CONVERSION.md full-LLM path: Olive / AI Hub / Foundry Local + genai caveat
-requirements.txt         onnxruntime-qnn, onnx, numpy (genai is separate/optional)
+src/qnn_ep.py             register + pick-NPU + build-session + HTP placement assertion
+src/bench.py              CLI GEMM benchmark (FP16 / INT8 QDQ / prompt-length sweep)
+src/genie_server.py       OpenAI + Anthropic HTTP server over a resident Genie bundle
+src/bench_endpoint.py     prefill/decode benchmark against any OpenAI-compatible server
+src/genie_smoke.py        minimal one-shot Genie generation, for isolating server bugs
+src/run-genie-server.ps1  launcher; edit the bundle/SDK paths at the top
+tests/                    78 device-free tests (no NPU, no bundle, no SDK needed)
+
+docs/GENIE_SERVER.md      the server: endpoints, env vars, and its measured limits
+docs/IMPLEMENTATION_PLAN.md  living plan + decision log; start here for the why
+docs/MODEL_CONVERSION.md  full-LLM path: Olive / AI Hub / Foundry Local + genai caveat
+docs/MULTI_ENGINE.md      running NPU + GPU + CPU at once, and why bandwidth caps it
+docs/TYPED_ROUTER_BRIEF.md  self-contained handoff for the routing work in typed
+requirements.txt          onnxruntime-qnn, onnx, numpy (genai is separate/optional)
+requirements-dev.txt      pytest only; the server itself has NO pip dependencies
 ```
 
 ## Relationship to the llama.cpp QNN backend
