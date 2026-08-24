@@ -141,7 +141,7 @@ def test_streamed_usage_strips_think_like_the_non_streaming_path(
     gs.ENGINE = StubEngine(chunks=["<think>reasoning</think>", CALL])
     h = handler()
     h._stream("prompt", 100, "cid", 0, tools_active=True, include_usage=True)
-    usage = [f["usage"] for f in h.wfile.sse_frames() if f.get("usage")][0]
+    usage = next(f["usage"] for f in h.wfile.sse_frames() if f.get("usage"))
     assert usage["completion_tokens"] == expected_chars // 4
 
 
@@ -209,7 +209,7 @@ def test_anthropic_tool_use_block_shape(gs, handler):
     h._anthropic_complete("prompt", 100, "model", "mid", tools_active=True)
     body = json.loads(h.wfile.text())
     assert body["stop_reason"] == "tool_use"
-    block = [b for b in body["content"] if b["type"] == "tool_use"][0]
+    block = next(b for b in body["content"] if b["type"] == "tool_use")
     assert block["name"] == "read_file" and block["input"] == {"path": "a.py"}
     assert block["id"].startswith("toolu_")
 

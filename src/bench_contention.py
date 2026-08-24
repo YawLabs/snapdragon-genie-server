@@ -83,6 +83,7 @@ Pure stdlib. Needs both servers already up; it starts nothing.
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import threading
@@ -406,7 +407,7 @@ def paired_sweep(engines, a, make_load):
             solo = measure(base, model, a.depth, a.tokens, a.timeout,
                            "%s solo" % name, cool_floor=a.cool_floor)
 
-            other = [e for e in engines if e[0] != name][0]
+            other = next(e for e in engines if e[0] != name)
             gen = make_load(other)
             gen.start()
             try:
@@ -534,6 +535,8 @@ def main():
     ap.add_argument("--allow-loaded", action="store_true",
                     help="run anyway on a loaded box; stamps results LOADED")
     ap.add_argument("--json", help="also write the results to this file")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite --json if it already exists")
     a = ap.parse_args()
 
     free = free_physical_gb()
@@ -715,7 +718,16 @@ def main():
             print("  WARNING: %s" % w)
         print("!" * 64)
 
-    if a.json:
+    if a.json and os.path.exists(a.json) and not a.force:
+        # A run here costs 20+ minutes of a shared box, and some of these
+        # numbers have turned out to be unreproducible (the contention
+        # absolutes could not be obtained twice). Clobbering a previous
+        # result to save a flag is the wrong trade, so the file is kept and
+        # the fresh numbers are printed above either way.
+        print("\n  NOT writing %s: it already exists. The results above are "
+              "complete; re-run with --force to overwrite, or pass a different "
+              "--json path." % a.json)
+    elif a.json:
         with open(a.json, "w") as f:
             json.dump({"loaded": loaded, "free_gb": free, "depth": a.depth,
                        "tokens": a.tokens, "repeat": a.repeat,

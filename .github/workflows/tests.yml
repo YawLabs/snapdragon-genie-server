@@ -1,0 +1,38 @@
+name: tests
+
+# The whole suite is DEVICE-FREE by design -- no NPU, no Genie bundle, no
+# QAIRT SDK -- which is what makes CI possible at all for a repo whose target
+# hardware is a Snapdragon laptop. Keep it that way: a test that needs the
+# device belongs behind a hardware gate, not here, or this file stops running.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu proves the suite has no Windows assumptions; windows is what
+        # the code actually ships on. Both matter -- a Windows-only green would
+        # hide a hardcoded path separator, and a Linux-only green would hide
+        # the reverse.
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test dependencies
+        # NOT requirements.txt: onnxruntime-qnn is a win_arm64-only wheel and
+        # would fail to resolve on every runner here. The modules that need it
+        # stub it at import time.
+        run: python -m pip install -r requirements-dev.txt
+      - name: Lint
+        run: python -m ruff check src tests
+      - name: Tests
+        run: python -m pytest -q

@@ -16,11 +16,45 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 #     shallow decode (18.2 vs 18.7 t/s at 250 tokens), which matters because
 #     a realistic agent preamble already measured 626 tokens and source runs
 #     10-13 tokens per line.
+$DefaultBundle = "qwen3_4b-genie-w4a16-x-elite-ctx8192-multi"
 # Swap to ...qualcomm_snapdragon_x_elite (4096, also multi-length) for the
 # best decode at depth, or ...ctx16384 for the largest window -- but that one
 # is SINGLE-length and therefore slow at every depth.
-if (-not $env:GENIE_BUNDLE_DIR) { $env:GENIE_BUNDLE_DIR = "C:\Users\jeff\yaw\genie-npu\bundles\qwen3_4b-genie-w4a16-x-elite-ctx8192-multi" }
-if (-not $env:GENIE_SDK_DIR)    { $env:GENIE_SDK_DIR    = "C:\Users\jeff\yaw\genie-npu\qairt\2.45.0.260326" }
+# Resolved rather than hardcoded: a checked-in absolute path is one developer's
+# machine, and every other clone gets a "not found" naming a stranger's home
+# directory. Set GENIE_NPU_ROOT (or the two vars directly) to point elsewhere.
+if (-not $env:GENIE_NPU_ROOT) { $env:GENIE_NPU_ROOT = (Join-Path (Split-Path -Parent (Split-Path -Parent $here)) "genie-npu") }
+
+if (-not $env:GENIE_BUNDLE_DIR) {
+    $env:GENIE_BUNDLE_DIR = Join-Path $env:GENIE_NPU_ROOT "bundles\$DefaultBundle"
+}
+if (-not $env:GENIE_SDK_DIR) {
+    # Newest QAIRT under <root>/qairt, so a runtime upgrade does not need an
+    # edit here. Falls through to the error below if none is installed.
+    $qairt = Join-Path $env:GENIE_NPU_ROOT "qairt"
+    if (Test-Path $qairt) {
+        $newest = Get-ChildItem $qairt -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+        if ($newest) { $env:GENIE_SDK_DIR = $newest.FullName }
+    }
+}
+
+# Fail with something a stranger can act on, naming what to set and what was
+# actually tried -- the server's own check would otherwise report a path the
+# user never chose.
+foreach ($pair in @(@("GENIE_BUNDLE_DIR", $env:GENIE_BUNDLE_DIR),
+                    @("GENIE_SDK_DIR",    $env:GENIE_SDK_DIR))) {
+    if (-not $pair[1] -or -not (Test-Path $pair[1])) {
+        Write-Host ""
+        Write-Host ("[run] $($pair[0]) is not set to an existing directory.")
+        Write-Host ("      tried: " + $(if ($pair[1]) { $pair[1] } else { "(unset)" }))
+        Write-Host ("      The Genie bundle and the QAIRT runtime are large external")
+        Write-Host ("      artifacts and are deliberately NOT in this repo. Set either")
+        Write-Host ("        `$env:GENIE_NPU_ROOT = '<dir holding bundles\ and qairt\>'")
+        Write-Host ("      or $($pair[0]) directly. See docs/GENIE_SERVER.md.")
+        exit 1
+    }
+}
 if (-not $env:GENIE_HOST)  { $env:GENIE_HOST = "127.0.0.1" }
 if (-not $env:GENIE_PORT)  { $env:GENIE_PORT = "8123" }
 

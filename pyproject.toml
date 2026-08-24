@@ -1,0 +1,48 @@
+[tool.ruff]
+# The server is deliberately stdlib-only and reads like it: long explanatory
+# comments, and a few places where the clearer spelling loses to a rule.
+line-length = 100
+target-version = "py311"          # the oldest interpreter the README supports
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Deliberately not the whole catalogue. These are the checks that catch real
+# defects in this codebase's shape -- a stdlib-only server plus measurement
+# harnesses -- rather than the ones that would relitigate its comment style.
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes: undefined names, unused imports, shadowing
+    "B",        # bugbear: mutable defaults, except-pass, loop-variable capture
+    "C4",       # comprehension rewrites
+    "UP",       # pyupgrade
+    "RUF",      # ruff's own
+]
+ignore = [
+    "E501",     # line length: prose comments here carry the reasoning behind
+                # measurements, and rewrapping them to satisfy a linter would
+                # cost more than it buys.
+    "UP031",    # %-formatting: used consistently throughout, including in hot
+                # loops. A mechanical sweep to f-strings would touch nearly
+                # every file for no behavioural gain.
+    "B008",     # function call in default argument -- not a pattern here.
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach into privates on purpose: the pure logic under test (_plan,
+# _commit, _verdict, _probe_crosscheck) is private precisely because it is
+# internal, and testing it through the public surface would need a device.
+"tests/*" = [
+    "SLF001",   # see above
+    "RUF059",   # unused unpacked variable. Unpacking a function's FULL return
+                # tuple documents its contract at the call site even when one
+                # test only asserts on part of it -- `p, dropped, fits,
+                # overhead = build_windowed(...)` says what that function
+                # returns better than indexing would, and the next test in the
+                # file asserts on the fields this one ignores.
+]
+
+[tool.ruff.format]
+# Formatting is NOT enforced. The codebase predates any formatter and a
+# reflow would bury the history of files that are still being reasoned about
+# commit by commit. Lint catches defects; layout stays a human call.
+exclude = ["*"]

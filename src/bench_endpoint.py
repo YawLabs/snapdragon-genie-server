@@ -309,7 +309,8 @@ def resolve_depths(spec, limit, ctx, tokens):
     try:
         asked = [int(d) for d in spec.split(",") if d.strip()]
     except ValueError as e:
-        raise ValueError("--depths wants comma-separated integers (%s)" % e)
+        raise ValueError(
+            "--depths wants comma-separated integers (%s)" % e) from e
     depths = [d for d in asked if 0 < d < limit]
     dropped = [d for d in asked if d not in depths]
     if not depths:

@@ -116,7 +116,7 @@ def read_context_size(default=4096):
     if _CONTEXT_SIZE is not None:
         return _CONTEXT_SIZE
     try:
-        with open(os.path.join(BUNDLE_DIR, "genie_config.json"), "r",
+        with open(os.path.join(BUNDLE_DIR, "genie_config.json"),
                   encoding="utf-8") as f:
             cfg = json.load(f)
         size = int(cfg["dialog"]["context"]["size"])
@@ -844,7 +844,10 @@ def _anthropic_to_prompt(req, tools=None, max_tokens=0):
         content = m.get("content")
         blocks = content if isinstance(content, list) else None
         if blocks:
-            def _of(kind):
+            def _of(kind, blocks=blocks):
+                # blocks bound as a default: the closure is invoked in this
+                # iteration, but binding it means a later edit cannot silently
+                # make it read a rebound value.
                 return [x for x in blocks
                         if isinstance(x, dict) and x.get("type") == kind]
             text = "".join(x.get("text", "") for x in _of("text"))
@@ -973,7 +976,7 @@ archs above, or rebuild it for this device."""
 def load_chat_template():
     meta_path = os.path.join(BUNDLE_DIR, "metadata.json")
     if os.path.isfile(meta_path):
-        with open(meta_path, "r", encoding="utf-8") as f:
+        with open(meta_path, encoding="utf-8") as f:
             meta = json.load(f)
         tmpl = meta.get("genie", {}).get("chat_template")
         if tmpl:
@@ -998,7 +1001,7 @@ def probe_tool_support():
     """
     for fn in ("added_tokens.json", "tokenizer_config.json"):
         try:
-            with open(os.path.join(BUNDLE_DIR, fn), "r", encoding="utf-8") as f:
+            with open(os.path.join(BUNDLE_DIR, fn), encoding="utf-8") as f:
                 if "<tool_call>" in f.read():
                     return True
         except Exception:

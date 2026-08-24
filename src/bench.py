@@ -40,7 +40,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import qnn_ep  # noqa: E402
+import qnn_ep
 
 
 # --------------------------------------------------------------------------

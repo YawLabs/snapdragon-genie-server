@@ -130,6 +130,7 @@ def test_history_renders_the_way_it_was_generated(gs):
     # exactly those bytes and silently defeats KV reuse.
     first = [{"role": "user", "content": "hi"}]
     committed = gs.TEMPLATE.build(first, thinking=False) + "Hello."
-    second = first + [{"role": "assistant", "content": "Hello."},
-                      {"role": "user", "content": "again"}]
+    second = [*first,
+              {"role": "assistant", "content": "Hello."},
+              {"role": "user", "content": "again"}]
     assert gs.TEMPLATE.build(second, thinking=False).startswith(committed)

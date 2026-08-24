@@ -21,7 +21,8 @@ def post(path, body, stream=False):
     return urllib.request.urlopen(req, timeout=300)
 
 
-print("== GET /v1/models =="); print(get("/v1/models"))
+print("== GET /v1/models ==")
+print(get("/v1/models"))
 
 msgs = [{"role": "user", "content": "What is gravity? Answer in one short sentence."}]
 
@@ -34,7 +35,10 @@ print("content:", obj["choices"][0]["message"]["content"][:400])
 print("finish:", obj["choices"][0]["finish_reason"], "| wall %.1fs" % dt)
 
 print("\n== streaming ==")
-t0 = time.time(); first = None; n = 0; buf = []
+t0 = time.time()
+first = None
+n = 0
+buf = []
 r = post("/v1/chat/completions", {"model": "qwen3-4b-npu", "messages": msgs,
                                   "max_tokens": 200, "stream": True})
 for raw in r:
@@ -48,7 +52,8 @@ for raw in r:
     if "content" in d:
         if first is None:
             first = time.time() - t0
-        n += 1; buf.append(d["content"])
+        n += 1
+        buf.append(d["content"])
 print("streamed:", "".join(buf)[:400])
 print("chunks:", n, "| TTFT %.2fs" % (first or 0), "| wall %.1fs" % (time.time() - t0))
 print("\nOK")
