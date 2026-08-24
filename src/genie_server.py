@@ -215,6 +215,7 @@ For each function call, return a json object with function name and arguments wi
 </tool_call>"""
 
 _NL = chr(10)
+_SSE_GAP = (chr(10) * 2).encode("utf-8")   # blank line terminating an SSE frame
 
 # Straight from the bundle's Jinja: enable_thinking=false prefills a CLOSED,
 # empty think block so the model resumes after it instead of opening its own.
@@ -1029,11 +1030,29 @@ MAX_INFLIGHT = max(1, int(os.environ.get("GENIE_MAX_INFLIGHT", "2")))
 _INFLIGHT = threading.BoundedSemaphore(MAX_INFLIGHT)
 
 
+_TOK_CACHE = {}
+
+
 def _tok_count(text):
     """Exact token count if the Genie tokenizer is available, else a ~4-char
-    estimate. Never raises."""
+    estimate. Never raises.
+
+    Memoised on the exact text because the SAME large string is counted more
+    than once per request -- _fit encodes the fitted prompt to check the budget
+    and then usage encodes it again -- and each encode is a native call holding
+    the engine lock over a string that can be thousands of tokens. Token counts
+    are deterministic for identical text, so the cache cannot go stale; it is
+    cleared wholesale past a handful of entries because only the current
+    request's strings are ever reused.
+    """
+    if text in _TOK_CACHE:
+        return _TOK_CACHE[text]
     n = ENGINE.count_tokens(text) if ENGINE else None
-    return n if n is not None else max(0, len(text) // 4)
+    n = n if n is not None else max(0, len(text) // 4)
+    if len(_TOK_CACHE) > 8:
+        _TOK_CACHE.clear()
+    _TOK_CACHE[text] = n
+    return n
 
 
 def _overflow_msg(prompt, max_tokens):
@@ -1495,14 +1514,39 @@ class Handler(BaseHTTPRequestHandler):
             # So generate fully, then emit well-formed frames: still SSE (the
             # client asked for SSE), just not incremental. Buffering is the
             # honest trade; a partial tool call is not.
-            buf = []
-            try:
-                finish = ENGINE.query(prompt, buf.append, max_tokens=max_tokens,
-                                   stop=stop, sampler=sampler)
-            except Exception as e:
-                sse(frame({"content": "[error: %s]" % e}, finish="stop"))
-                done("".join(buf))
+            def probe():
+                """An SSE comment: ignored by every client, but a FAILED write
+                is the only way to learn the caller is gone while we are
+                buffering and therefore emitting nothing. Without it a client
+                that walks away from a tool turn leaves the generation running
+                to max_tokens, holding the single-flight NPU against everyone
+                else -- the exact hazard signal_abort exists to prevent on the
+                plain path."""
+                if gone["v"]:
+                    return
+                try:
+                    self.wfile.write(b": keep-alive" + _SSE_GAP)
+                    self.wfile.flush()
+                except (ConnectionError, OSError):
+                    gone["v"] = True
+                    ENGINE.signal_abort()
+
+            # query_stream (not query) so the generation runs on a worker
+            # thread and signal_abort can actually reach it.
+            buf, res = [], {}
+            for i, chunk in enumerate(ENGINE.query_stream(
+                    prompt, res, max_tokens=max_tokens, stop=stop,
+                    sampler=sampler)):
+                buf.append(chunk)
+                if i % 8 == 0:
+                    probe()
+                if gone["v"]:
+                    break
+            if res.get("error"):
+                sse(frame({"content": "[error: %s]" % res["error"]}, finish="stop"))
+                done(_maybe_strip_think("".join(buf)))
                 return
+            finish = res.get("finish", "stop")
             text, calls = parse_tool_calls(_maybe_strip_think("".join(buf)))
             if text:
                 sse(frame({"content": text}))
@@ -1514,7 +1558,10 @@ class Handler(BaseHTTPRequestHandler):
                     "function": {"name": c["name"],
                                  "arguments": json.dumps(c["arguments"])}}]}))
             sse(frame({}, finish="tool_calls" if calls else finish))
-            done("".join(buf))
+            # Strip <think> before counting, exactly as _complete does: the same
+            # turn must not report different completion_tokens purely because
+            # the client chose to stream.
+            done(_maybe_strip_think("".join(buf)))
             return
 
         res = {}
@@ -1626,15 +1673,28 @@ class Handler(BaseHTTPRequestHandler):
             # Same reasoning as the OpenAI stream: a tool_use block only means
             # something once complete, so buffer the generation and emit whole
             # blocks rather than a half-formed call the client must guess at.
-            buf = []
-            try:
-                finish = ENGINE.query(prompt, buf.append, max_tokens=max_tokens,
-                                   stop=stop, sampler=sampler)
-            except Exception as e:
+            # query_stream (not query) so signal_abort can reach the
+            # generation, and a periodic ping so a client that walks away is
+            # actually noticed -- while buffering we emit nothing, so without a
+            # probe the write callback never fires and the abandoned turn holds
+            # the single-flight NPU to max_tokens. `ping` is a real Anthropic
+            # event, so this needs no client-side tolerance.
+            buf, res = [], {}
+            for i, chunk in enumerate(ENGINE.query_stream(
+                    prompt, res, max_tokens=max_tokens, stop=stop,
+                    sampler=sampler)):
+                buf.append(chunk)
+                if i % 8 == 0:
+                    ev("ping", {"type": "ping"})
+                if gone["v"]:
+                    break
+            if res.get("error"):
                 ev("error", {"type": "error",
-                             "error": {"type": "api_error", "message": str(e)}})
+                             "error": {"type": "api_error",
+                                       "message": res["error"]}})
                 ev("message_stop", {"type": "message_stop"})
                 return
+            finish = res.get("finish", "stop")
             text, calls = parse_tool_calls(_maybe_strip_think("".join(buf)))
             idx = 0
             if text:

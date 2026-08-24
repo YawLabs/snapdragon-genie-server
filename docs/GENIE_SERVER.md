@@ -102,6 +102,15 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   back to plain eviction -- a summary is never allowed to break a request.
   `GENIE_SUMMARY_MAX_TOKENS` (default 192) bounds the note.
 
+- **A buffered tool stream is still abortable.** Tool responses are buffered
+  (a half-emitted `<tool_call>` is worse than a slower one), which means
+  nothing is written while the model generates -- so the usual
+  disconnect-detection-by-failed-write never fires. Both stream paths emit a
+  lightweight probe every 8 chunks (an SSE comment on the OpenAI side, a real
+  `ping` event on the Anthropic side) purely so a departed client is noticed.
+  Without it an abandoned tool turn runs to `max_tokens` holding the
+  single-flight NPU against every other caller.
+
 - **Streaming reports usage too.** OpenAI streams emit a final chunk with an
   empty `choices` list carrying `usage`, but only when the caller sets
   `stream_options.include_usage` -- clients that do not ask see a
