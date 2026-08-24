@@ -39,7 +39,7 @@ Same model, three backends, one shared 31.6 GB memory pool (no dedicated VRAM
 |---|---|---|---|---|
 | NPU (Hexagon) | Genie server | **855-938** | **18.55** | **single-flight**; ~4x the GPU's prefill, near-immune to host load |
 | GPU (Adreno) | `llama-bench` -- see note | **226.8** | **18.05** | ties the NPU on decode on a quiet box, **-64% on a busy one**; not reachable over HTTP today |
-| CPU (KleidiAI) | `llama-server` | fine | **~0.2** | **broken, unexplained** |
+| CPU (KleidiAI) | `llama-server` | fine | **22.6 @ d0, 13.2 @ d469** | NOT broken -- the 0.2 is retracted. Fastest at empty context, **slowest of the three at agent depth**; ~30% relative variance even on a quiet box |
 
 Both NPU figures are corrected upward from the 277 / ~13 this brief carried
 until 2026-08-24 -- see the correction note below. **Decode is a tie**: 18.55
@@ -92,16 +92,89 @@ in the table, 12.82 from the first contention run). The `poll` flag does not
 touch prefill and the loaded box did not touch decode -- two corrections, two
 causes. **Do not plan capacity against 277 / 13.2.**
 
-That also dissolves a question this brief raised. It read 18.0 t/s at
-near-empty context against 12.82 at d469 and concluded NPU decode must fall ~30%
-with depth on the 4096 export. It does not: 18.0 at d~0 against 18.55 at d469 is
-flat within noise, matching the 16384 bundle, which was flat all along. The
-apparent depth effect was the busy-wait. Keep recording the depth a rate was
-taken at -- the prebuilt bundle may genuinely vary, see the window section --
-but the self-exported bundles are flat.
+That also dissolves part of a question this brief raised -- but only part, and
+the remainder matters for routing. It read 18.0 t/s at near-empty context
+against 12.82 at d469, and concluded NPU decode falls ~30% with depth. At d469
+that conclusion is indeed dead: 18.0 at d~0 against 18.55 at d469 is flat within
+noise, and the busy-wait explains the gap.
 
-Do not plan around the CPU leg until its 0.2 t/s decode is explained. Treat
-this as a two-engine design today.
+**But d0 and d469 are both shallow, and the effect is not there -- it is
+deeper.** Swept across the whole window on the 4096 bundle with `poll: false`,
+and INTERLEAVED (250, 3300, 250, 3300, 250, 3300) so that drift over the run
+could not masquerade as depth:
+
+| depth | 250 | 600 | 1200 | 2200 | 2900 | 3700 |
+|---|---|---|---|---|---|---|
+| decode t/s | 18.5 | 17.2 | 15.0 | 14.9 | 12.7 | 11.5 |
+
+Interleaved, 250 gives 18.92 / 18.45 / 18.67 against 12.77 / 12.99 / 13.32 at
+3300 -- tracking depth, not elapsed time, with the deep samples if anything
+rising. The d469 readings (18.02 / 18.04 / 18.19) agree with the flat finding
+exactly; the decline simply starts past ~600 tokens.
+
+The distinction that actually predicts this is **prebuilt versus self-exported**,
+not which window. The 4096 bundle is Qualcomm's prebuilt and pays for the
+context in use; both self-exported bundles are genuinely flat across far wider
+spans (16384: 3.26 t/s at 469 against 3.27 at 10532), paying for their whole
+compiled window on every token. Why is unexplained -- see the window section.
+
+For a router: **a rate measured at d469 will overstate the 4096 endpoint by
+~40% on a long prompt.** Record the depth a rate was taken at, and do not
+extrapolate a shallow sample across the window.
+
+**The CPU leg is not broken -- but this is still a two-engine design, for a
+different reason.** The ~0.2 t/s this brief carried was retracted on 2026-08-24.
+It was never a property of the CPU backend, but the compound of a `poll: true`
+Genie server busy-waiting on 2.7 host cores, concurrent benchmarks from other
+sessions on this shared box, and a thread-count effect (all-cores default costs
+2-5x on this hardware; use about half the cores).
+
+What replaced it is not an endorsement. CPU is ~27% slower than the
+accelerators at agent depth, is much the noisiest leg, and is *predicted* --
+unmeasured -- to starve the GPU through the same host-core mechanism the
+busy-wait demonstrated at 60%. So CPU stays out of the default pair on
+evidence rather than on breakage. **CPU+NPU may well be fine**, since the NPU
+proved insensitive to host load; that is a live open question, not a closed
+exclusion.
+
+Re-measured on a verified-quiet box, `--device none -t 6`, r=5, Qwen3-4B-Q4_K_M:
+**22.57 +-6.74 t/s at d0** and **13.15 +-6.31 at d469**.
+
+**Route on the depth-qualified ranking, never on a single number.** The order
+inverts between an empty prompt and a realistic agent turn:
+
+| | CPU | GPU | NPU |
+|---|---|---|---|
+| d0 | **~22.6** | 19.7 | ~18.5 |
+| d469 | 13.2 | 18.05 | **18.55** |
+
+The load-bearing number is the fall-off, not either endpoint: **CPU loses 42%
+between d0 and d469 against the GPU's 8%.** That single comparison is why
+"fastest decoder" and "broken at 0.2" are both wrong. CPU is
+competitive-to-fastest on short prompts and the slowest of the three at the
+depth an agent actually runs at, so a router that picks CPU off a d0 benchmark
+picks wrong for real traffic.
+
+Two caveats a dispatcher must encode. CPU variance is ~30% relative even on a
+quiet box, far noisier than NPU or GPU, so a single sample is not a rate --
+take a median or treat CPU as a range. And CPU decode falls off with depth
+considerably harder than either accelerator, so any measured rate must carry
+the depth it was taken at.
+
+Provenance: measured independently by two sessions on this box on 2026-08-24.
+Canonical write-up is **ADR 019, `3c99a1af` on YawLabs/typed master**
+(`docs/adr/019-local-multi-engine-routing.md`). A second source recorded
+`t6 26.2 +-1.8, t12 11.9 +-5.2` at tg16 (d0), `30.2 / 6.2` at tg8, and
+`pp512 t12 115`, corroborating the shallow end.
+
+One caveat the ADR carries and this brief should not bury: the attribution of
+the concurrency flip (0.78x -> 1.45x) to the busy-wait rests on inference, not
+on a deliberate A/B of the contention benchmark itself. The NPU-solo half IS
+directly measured -- 11.6 vs 18.0 t/s decode, and 267.1% vs 0.0% idle CPU on a
+server that had answered nothing but `/health` -- and the GPU's solo rate is
+identical across both configurations, which is what makes the inference a
+strong one. Closing it properly means re-running the contention benchmark
+against a `poll: true` bundle.
 
 ## Concurrency measured: 1.45x (corrected 2026-08-24)
 
