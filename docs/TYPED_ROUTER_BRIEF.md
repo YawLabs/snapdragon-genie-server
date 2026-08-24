@@ -38,8 +38,28 @@ Same model, three backends, one shared 31.6 GB memory pool (no dedicated VRAM
 | engine | server | prefill t/s | decode t/s | status |
 |---|---|---|---|---|
 | NPU (Hexagon) | Genie server | **855-938** | **18.55** | **single-flight**; ~4x the GPU's prefill, near-immune to host load |
-| GPU (Adreno) | `llama-bench` -- see note | **226.8** | **18.05** | ties the NPU on decode on a quiet box, **-64% on a busy one**; not reachable over HTTP today |
+| GPU (Adreno) | `llama-server` (OpenCL) | **226.8** | **18.05** | ties the NPU on decode on a quiet box, **-64% on a busy one**; reachable over HTTP -- see the placement note |
 | CPU (KleidiAI) | `llama-server` | fine | **22.6 @ d0, 13.2 @ d469** | NOT broken -- the 0.2 is retracted. Fastest at empty context, **slowest of the three at agent depth**; ~30% relative variance even on a quiet box |
+
+**Corrected 2026-08-24: the GPU IS reachable over HTTP.** This brief said it
+was not. `llama-server --device GPUOpenCL -ngl 99` serves the Adreno normally
+-- confirmed two ways, neither of them a log line the tool writes about itself:
+`offloaded 37/37 layers to GPU` with a 2376 MiB OpenCL buffer allocation, and a
+Windows GPU **engine-utilisation** counter reading 97.5% against a 1.6% idle
+baseline. So the contention harness's `--gpu http://...` path is valid and needs
+no placement guard.
+
+**How to assert GPU placement, since four plausible signals failed here.** Use
+`\GPU Engine(*)\Utilization Percentage` filtered to the PID, and run
+`llama-bench` alongside as a KNOWN-GOOD control. The control is not ceremony:
+GPU *memory* counters read 0 MB even for `llama-bench`, which definitely reaches
+the Adreno, so a memory-based check fails closed on a working setup and only a
+positive control reveals the instrument is blind. Do not trust a `--device`
+flag, a `--list-devices` listing, an `offloaded N/N` line at default verbosity
+(it does not print), a free-memory figure
+(`ggml_backend_opencl_device_get_memory` returns `total - 1GiB`
+unconditionally), or a throughput number -- a CPU-vs-GPU pair landed 0.2% apart
+here.
 
 Both NPU figures are corrected upward from the 277 / ~13 this brief carried
 until 2026-08-24 -- see the correction note below. **Decode is a tie**: 18.55
