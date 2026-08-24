@@ -215,16 +215,29 @@ zero `+-` format specifiers, so it cannot have emitted `18.05 +-0.13`,
 stddev column. Checkable from the source in this repo without trusting anyone's
 account.
 
-*Still attested, and it is a narrower set than the argument above covers:* the
-bare figures -- NPU 18.55 / 13.35 and the retention percentages -- carry no
-stddev, and the harness's own vocabulary includes
-`pair: %.2f -> %.2f t/s (keeps %.1f%%)`. So the format fingerprint does NOT
-exclude it for those, and their provenance rests on the primary source's
-account rather than on artifacts. Nor is the gating itself checkable at all:
-the harness writes JSON only when asked and under a caller-chosen name, so no
+*Verified, for the bare NPU figures, by a second fingerprint:* every one was
+reported as `shallow median X t/s (n=3)`. That string occurs once in this repo
+(`bench_endpoint.py:244`), inside `_verdict()`, which has exactly one call site
+(`bench_endpoint.py:385`, inside `main()`). `bench_contention.py` imports the
+module but calls only `_post`, `chat`, `measure_decode`, `n_ctx` and
+`prompt_of` -- never `main()` or `_verdict()`. So it cannot emit that string,
+and those figures fingerprint to a standalone `bench_endpoint.py` run.
+
+*Verified, for the retention percentages, as derivations:* they were never read
+off a tool. Each is the quotient of two figures that each carry one of the
+fingerprints above, and the arithmetic reproduces the published values exactly
+-- 7.27/18.05 = 40%, 13.47/18.05 = 75%, 6.88/12.82 = 54%, 13.35/18.55 = 72%.
+Their resemblance to the harness's own `keeps %.1f%%` output is a coincidence
+of format, not of provenance.
+
+*Still attested, and it is the one thing no artifact can carry:* that a >=92%
+shell loop preceded each invocation. The fingerprints establish which TOOL
+produced a number; they say nothing about what ran before it was invoked. Two
+obvious checks are dead ends worth recording so nobody repeats them -- the
+harness writes JSON only when asked and under a caller-chosen name, so no
 output files existing is not evidence either way, and the Bash tool runs
-non-interactive shells that never write `~/.bash_history`, so its silence is
-another absence that proves nothing.
+non-interactive shells that never write `~/.bash_history`, so its silence
+proves nothing either.
 
 **The caveat that survives either account, and the one worth encoding:** a gate
 tests the clock *before* a sample and says nothing during it. A `llama-bench -r
