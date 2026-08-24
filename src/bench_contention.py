@@ -207,6 +207,7 @@ def wait_for_cool(floor, limit=300):
     """
     start = time.time()
     pct = None
+    first = None
     while time.time() - start < limit:
         pct = cpu_performance_pct()
         if pct is None:
@@ -215,8 +216,8 @@ def wait_for_cool(floor, limit=300):
             first = pct
         if pct >= floor:
             if time.time() - start > 5:
-                print("    (cooled to %.0f%% after %ds)"
-                      % (pct, int(time.time() - start)), flush=True)
+                print("    (cooled %.0f%% -> %.0f%% after %ds)"
+                      % (first, pct, int(time.time() - start)), flush=True)
             return pct
         time.sleep(10)
     print("    (WARNING: clock still %s%% after %ds, proceeding anyway -- "
@@ -343,8 +344,14 @@ def main():
                          "before each SOLO sample (0 disables). Sustained load "
                          "drops this box to 48.9%%, and an ungated sweep turns "
                          "that decay into a fake depth curve")
-    ap.add_argument("--min-free-gb", type=float, default=8.0,
-                    help="refuse to run below this much free physical RAM")
+    ap.add_argument("--min-free-gb", type=float, default=4.0,
+                    help="refuse below this much free physical RAM. This is "
+                         "HEADROOM BEYOND the engines under test, which are "
+                         "SUPPOSED to be resident: two ~3 GB models leave 6-7 "
+                         "GB free on a 31.6 GB box, and that is a healthy "
+                         "contention run rather than a loaded one. The old "
+                         "default of 8.0 refused the only experiment this "
+                         "harness exists to run")
     ap.add_argument("--allow-loaded", action="store_true",
                     help="run anyway on a loaded box; stamps results LOADED")
     ap.add_argument("--json", help="also write the results to this file")
@@ -357,9 +364,21 @@ def main():
     if loaded and not a.allow_loaded:
         print("\nREFUSING TO RUN on a box this loaded.", file=sys.stderr)
         print("Every retracted number on this hardware was measured in exactly "
-              "this state -- NPU prefill was understated 3.3x. Free the box, or "
-              "pass --allow-loaded to record explicitly-LOADED numbers.",
-              file=sys.stderr)
+              "this state -- NPU prefill was understated 3.3x.", file=sys.stderr)
+        # The trap this message used to set. --allow-loaded is the WRONG escape
+        # for a contention run: the two engines under test are ~3 GB each and
+        # are SUPPOSED to be resident, so a legitimate run sits at 6-7 GB free
+        # and trips this gate. Sending the operator to --allow-loaded then
+        # stamps LOADED on output whose only load is the experiment itself, and
+        # that stamp reads as untrustworthy for entirely the wrong reason.
+        # Reported by the session that hit it running the poll A/B.
+        print("\nIf the only things resident are the two engines under test, "
+              "that is a HEALTHY contention run and this gate is set too high "
+              "-- lower --min-free-gb (it measures headroom BEYOND the "
+              "engines) rather than reaching for --allow-loaded, which stamps "
+              "LOADED on results that do not deserve it.", file=sys.stderr)
+        print("Use --allow-loaded only when something OTHER than the engines "
+              "under test is holding the box.", file=sys.stderr)
         return 2
     if loaded:
         print("!! LOADED BOX -- these are NOT baselines and must not be quoted "
