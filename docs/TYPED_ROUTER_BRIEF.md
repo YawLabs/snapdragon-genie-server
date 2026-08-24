@@ -233,19 +233,36 @@ tokens plus ~61 generated are 1143 and 1668, and the prebuilt's boundaries are
 crossed. Two different phenomena that both present as "depth behaves oddly
 around 1K"; do not collapse them.
 
-One caveat on the poll finding, stated at the right size. The NPU-solo half is a
-deliberate, controlled experiment and is multi-sourced: a flip across all three
-windows gives 11.6 vs 18.0 t/s decode and 267.1% vs 0.0% idle CPU on a server
-that had answered nothing but `/health`, independently reproducing another
-session's 12.82 -> 18.55 and 2.8-core spin. What rests on inference is only the
-attribution of the CONCURRENCY flip (0.78x -> 1.45x) to the same cause -- the
-GPU's solo rate being identical across both configurations is what makes that
-inference a strong one, but it is not an A/B. Closing it means re-running the
-contention benchmark against a `poll: true` bundle at matched conditions (d469,
-n=3, Q4_K_M on the GPU leg via `llama-bench`, poll value recorded in the
-output, and clock-gated -- the harness gate was dead code until `f3cd053`, so
-that run should use the fixed version and additionally sample the clock DURING
-each measurement, not only at entry).
+**The poll attribution is now measured, not inferred.** Three interleaved pairs
+(legs ALTERNATING, so clock drift lands on both equally rather than separating
+them), d469, both engines hot. Run on battery, so every absolute below is
+depressed and void -- the ratios are the result:
+
+| poll=false / poll=true | pair1 | pair2 | pair3 | median |
+|---|---|---|---|---|
+| NPU solo | 1.45x | 1.35x | 1.52x | **1.45x** |
+| GPU solo | 1.47x | 1.32x | 1.32x | **1.32x** |
+| aggregate both hot | 1.27x | 1.07x | 1.22x | **1.22x** |
+
+The GPU row is the mechanism, measured directly: **an IDLE `genie_server` with
+`poll: true` costs the GPU 25-32% of its throughput**, because the OpenCL
+backend needs host cores per token and the busy-wait takes them. Aggregate
+throughput is 1.22x better with `poll: false`.
+
+**A trap in the headline metric, worth knowing before quoting it.** "Speedup vs
+best single engine" divides by a baseline that `poll` itself degrades, and in
+this configuration it inverts -- `poll: true` scored 1.57x / 1.55x / 1.79x
+against `poll: false`'s 1.37x / 1.23x / 1.43x, while delivering 20% LESS
+absolute throughput. The metric is only safe when the baseline is independent
+of the variable under test. Aggregate tokens/sec has no such problem; prefer it.
+
+**And "solo" is ambiguous in a contention harness.** `bench_contention.py`
+measures the solo leg with the OTHER engine's server RESIDENT but not
+generating -- the load generator starts only for the contended leg. So "GPU
+solo" is really "GPU with an idle Genie server", which is free at `poll: false`
+and costs 2.7 cores at `poll: true`. That is why a run measured against a
+genuinely clean GPU baseline and one measured against a both-resident baseline
+disagree, and both can be right. State which one a number is.
 
 ## Concurrency measured: 1.45x (corrected 2026-08-24)
 
