@@ -222,9 +222,18 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   Two consequences beyond throughput. Idle CPU is not free on a laptop, and
   more importantly **an idle NPU server was stealing 2.7 cores from anything
   else on the box**, which contaminates any concurrent benchmark of another
-  engine and quietly undermines the multi-engine plan in `MULTI_ENGINE.md`.
-  Every number in this file predating this finding was measured with
+  engine. Every number in this file predating this finding was measured with
   `poll: true` and is therefore pessimistic.
+
+  That second consequence has since been measured, and it is larger than the
+  single-engine gain above. `MULTI_ENGINE.md` reports NPU+GPU concurrency at
+  **0.78x -- a net loss -- with `poll: true`, against 1.45x with `poll: false`**,
+  because the OpenCL backend needs host cores per token to dispatch its kernels
+  and the busy-wait was taking them. The same run had earlier retired memory
+  bandwidth as the contention mechanism on the strength of the `poll: true`
+  numbers; with the spin removed, bandwidth predicts the result again. So this
+  one config line decides whether running two engines together is worth doing
+  at all.
 
 - **The compiled context window is a per-token tax, paid whether or not you
   use it.** A Genie bundle's KV tensors are graph INPUTS statically shaped to
