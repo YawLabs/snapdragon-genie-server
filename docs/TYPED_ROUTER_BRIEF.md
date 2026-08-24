@@ -224,6 +224,15 @@ something common to both paths. Unexplained. It is small enough not to change
 routing, but a rate sampled at exactly d1024 will understate the surrounding
 curve on either engine.
 
+**Graph selection does NOT explain this knee**, tempting as that is now that
+the multi-length mechanism is confirmed to be exactly that. Two independent
+reasons: it reproduces on the GPU, where llama.cpp does no graph selection at
+all; and on the NPU side both points sit INSIDE one graph -- 1082 and 1607
+tokens plus ~61 generated are 1143 and 1668, and the prebuilt's boundaries are
+512 / 1024 / 2048 / 3072 / 4096, so both fall in `cl2048`. No boundary is
+crossed. Two different phenomena that both present as "depth behaves oddly
+around 1K"; do not collapse them.
+
 One caveat on the poll finding, stated at the right size. The NPU-solo half is a
 deliberate, controlled experiment and is multi-sourced: a flip across all three
 windows gives 11.6 vs 18.0 t/s decode and 267.1% vs 0.0% idle CPU on a server
