@@ -232,11 +232,16 @@ a full model is **smaller** than the NPU-vs-ORT-CPU-EP ratios above.
   sits resident on the HTP behind `src/genie_server.py`, answering both the
   OpenAI and Anthropic APIs with streaming, tool calls, stop sequences and
   context eviction. See [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md).
-- **Full-model prefill and decode, measured.** ~970 tok/s prefill and ~13 tok/s
-  decode on the 4096-window bundle, via `src/bench_endpoint.py`. Decode is
-  bandwidth-bound and, on this engine, is set by the window the bundle was
-  COMPILED at rather than by how much context is in use -- a 16384 bundle of
-  the same model decodes ~4x slower at identical context.
+- **Full-model prefill and decode, measured** across three compiled windows via
+  `src/bench_endpoint.py`: **1157 / 458 / 176 tok/s prefill** and
+  **18.0 / 8.8 / 3.3 tok/s decode** at 4096 / 8192 / 16384. Decode is
+  bandwidth-bound and set by the window the bundle was COMPILED at rather than
+  by how much context is in use -- roughly inverse-linear to 8192 and worse
+  beyond, so 8192 is the sweet spot.
+- **`poll: false` belongs in every bundle config.** As shipped, `"poll": true`
+  busy-waits: a resident server burned 270% CPU (2.7 cores) while idle, and the
+  spinning threads slowed real work by up to 55%. Disabling it costs nothing
+  measured.
 - **Model conversion via Qualcomm AI Hub**, run end-to-end here: both bundles
   on this box came from `qai-hub-models export` (from WSL -- the Windows path
   dies on `fcntl`).

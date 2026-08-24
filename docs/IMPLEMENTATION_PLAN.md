@@ -323,15 +323,16 @@ Same box, same server, same prompts, minutes apart, quiet box. The two bundles a
 `precision`, `tool_versions`, `chipset_attributes`, `config.json`, chat template and every tokenizer file
 are byte-identical; the only difference in `metadata.json` is the KV shapes.
 
-| compiled n_ctx | HTP alloc | prefill (median) | decode (median) |
-|---|---|---|---|
-| 4096 | 328 MB | **971 t/s** (938-1016) | **13.0 t/s** (11.2-13.2) |
-| 16384 | 1195 MB | **171 t/s** (168-181) | **3.1 t/s** (3.0-3.2) |
+| compiled n_ctx | HTP alloc | prefill (median) | decode (median) | cost per doubling |
+|---|---|---|---|---|
+| 4096 | 328 MB | **1157 t/s** | **18.0 t/s** | -- |
+| 8192 | 647 MB | **458 t/s** | **8.8 t/s** | 2.05x decode, 2.54x prefill |
+| 16384 | 1195 MB | **176 t/s** | **3.3 t/s** | 2.69x decode, 2.59x prefill |
 
-Reproduce with `python src/bench_endpoint.py` against each bundle. Both curves are FLAT with depth,
-which is the tell -- the 16k bundle decoded at 3.13 t/s with 469 tokens of context and 3.02 t/s with
-10532, a spread of 0.15 t/s across a 22x change in context. A 10532-token prefill takes 63 seconds of
-wall time.
+All three measured with `poll: false` (see the poll finding below), quiet box, one harness
+(`python src/bench_endpoint.py`). Decode is FLAT with depth on both self-exported bundles -- the 16k
+decoded 3.26 t/s holding 469 tokens and 3.27 t/s holding 10532; the 8k, 8.77 versus 8.81. A
+10532-token prefill on the 16k bundle takes 60 seconds.
 
 Three consequences:
 1. **A bigger bundle is a capability tier, not an upgrade.** It buys window that 4096 cannot hold at
@@ -347,12 +348,30 @@ Three consequences:
 Also corrected by the same measurement: KV is `uint8` at **~72 KB/token**, not the fp16-assumed 144 --
 36 x 2 x 8 x 128 x 1 byte = 73,728 B/token, against a measured allocator delta of 73,983 B/token.
 
-Open: nobody has measured an intermediate window. The two points give decode ~= 13.0 at 4096 and ~= 3.1
-at 16384, so if the tax is roughly inverse-linear in the window an 8192 bundle should land near 6-7 t/s
--- possibly the real sweet spot for the agent workload, since it doubles the usable context for about
-half the penalty. Two points cannot distinguish inverse-linear from anything else, which is exactly why
-the third is worth having. **That export is the highest-value next experiment**, and it should be
-batched with the SSD/Eaglet recompile since both need the same multi-hour export run.
+### RESOLVED -- the 8192 point, and what it says about the curve
+
+Predicted 6-7 t/s decode on an inverse-linear reading of the two known points. **Measured 7.9 t/s**
+under the same `poll: true` config the prediction was based on, and **8.8 t/s** with `poll: false`.
+
+Against the corrected 4096 baseline (18.0 t/s), 8192's 8.8 t/s is almost exactly half -- so decode IS
+approximately inverse-linear over that first doubling (2.05x cost for 2x window), and then gets worse:
+8192 -> 16384 costs 2.69x. Prefill is consistently ~2.55x per doubling, worse than inverse-linear
+throughout.
+
+A caution about an intermediate conclusion that did NOT survive. Measured under `poll: true`, 8192 (7.9)
+looked disproportionately CHEAP next to 4096 (11.6) -- suggesting a sublinear tax and a bargain window.
+That was an artifact: the poll busy-wait penalises a small window far more than a large one (+55% at
+4096, +2% at 16384), so it compressed the top of the curve and flattered 8192. With the artifact removed
+the exchange rate is ordinary. **8192 is still the right default** -- 2x context for ~half the decode
+rate is a fair trade where 16384's 4x context for under a fifth is not -- but it is a fair price, not a
+free lunch.
+
+Still open: whether a MULTI-length export (`--context-lengths 512,1024,...,8192`) recovers
+shallow-prompt speed at a deep window. The 4096 prebuilt is the only bundle here that is not flat with
+depth (18.0 t/s at 469 tokens, 12.5 at 2657) and the only one whose metadata advertises several
+context_lengths, which hints that a prebuilt carries several graphs and picks the smallest that fits.
+One observation, not a measurement. Batch it with the SSD/Eaglet recompile -- all of them need the same
+multi-hour export.
 
 ### Phase 4 -- optional llama.cpp bridge [ ]
 Only if you want llama.cpp's ecosystem (GGUF, samplers, grammar) on the NPU:
@@ -443,6 +462,16 @@ and record tg uplift + acceptance rate per model.
   a stopgap -- it is cheaper than a bigger window, so it is the primary strategy.
 - 2026-08-23: KV on this bundle is `uint8` (~72 KB/token), read from `metadata.json` and confirmed against
   the HTP allocator. Earlier docs assumed fp16 and were 2x high; memory-planning numbers were corrected.
+- 2026-08-24: **set `poll: false` in every bundle's `genie_config.json`.** The shipped `"poll": true`
+  busy-waits: a resident server burned 270% CPU (2.7 cores) while completely idle, and the spinning
+  threads competed with real work -- decode +55% at 4096, +11% at 8192, +2% at 16384 once disabled, with
+  prefill up and run-to-run noise down. Nothing measured got worse. Beyond the throughput, an idle NPU
+  server stealing 2.7 cores contaminates any concurrent measurement of another engine, which matters
+  directly for the multi-engine work. Every measurement in the repo predating this is pessimistic.
+- 2026-08-24: **8192 is the default window to target.** Measured 8.8 t/s decode (poll false) against
+  18.0 at 4096 and 3.3 at 16384: 2x the context for ~half the decode rate, where 16384 gives 4x the
+  context for under a fifth. The earlier hope that 8192 might be *disproportionately* cheap was a
+  `poll: true` artifact -- see above.
 
 ## Open questions / risks
 - ~~Does a prebuilt Genie model exist for a Qwen3 / Llama size that fits 32GB?~~ ANSWERED 2026-08-23:

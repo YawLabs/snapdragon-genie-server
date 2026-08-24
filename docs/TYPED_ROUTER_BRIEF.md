@@ -37,7 +37,7 @@ Same model, three backends, one shared 31.6 GB memory pool (no dedicated VRAM
 
 | engine | server | prefill t/s | decode t/s | status |
 |---|---|---|---|---|
-| NPU (Hexagon) | Genie server | 277* | 13.2 | best; **single-flight** |
+| NPU (Hexagon) | Genie server | 277* | 18.0* | best; **single-flight** |
 | GPU (Adreno) | `llama-server` | 117 | 6.0 | works |
 | CPU (KleidiAI) | `llama-server` | fine | **~0.2** | **broken, unexplained** |
 
@@ -48,10 +48,13 @@ bandwidth is.** Decode streams the whole model per token and all engines share o
 so concurrent instances divide throughput rather than multiplying it. Budget
 for **1.5-2x aggregate, not 3x**.
 
-\* The NPU prefill figure is understated -- a re-measurement on a quiet box
-gave a median **971 t/s** on the same 4096 bundle (decode agreed, 13.0). The
-original sweep looks to have been taken while the box was loaded. Do not plan
-capacity against 277.
+\* Both NPU figures are understated. Re-measured on a quiet box with
+`poll: false`, the same 4096 bundle gives a median **1157 t/s** prefill and
+**18.0 t/s** decode. The original sweep looks to have been taken on a loaded
+box, and everything before 2026-08-24 additionally paid the `poll: true`
+busy-wait penalty. Do not plan capacity against 277 / 13.2. The GPU and CPU
+rows were taken in the same conditions AND while a spinning NPU server was
+stealing ~2.7 cores, so they need re-measuring too.
 
 Do not plan around the CPU leg until its 0.2 t/s decode is explained. Treat
 this as a two-engine design today.
@@ -96,19 +99,23 @@ These are properties of the NPU endpoint that a router must not assume away:
 
   | compiled n_ctx | prefill t/s (median) | decode t/s (median) |
   |---|---|---|
-  | 4096 | **971** (938-1016) | **13.0** (11.2-13.2) |
-  | 16384 | **171** (168-181) | **3.1** (3.0-3.2) |
+  | 4096 | **1157** | **18.0** |
+  | 8192 | **458** | **8.8** |
+  | 16384 | **176** | **3.3** |
 
-  Both are FLAT with depth -- the 16k bundle decodes at 3.13 t/s with 469
-  tokens of context and 3.02 t/s with 10532, so the ~4x penalty applies to
-  short requests too. A 10532-token prefill takes **63 seconds**.
+  Decode is FLAT with depth on both self-exported bundles -- the 16k decodes at
+  3.26 t/s with 469 tokens of context and 3.27 t/s with 10532 -- so the penalty
+  applies to short requests too. A 10532-token prefill takes **60 seconds**.
+  (All measured with `poll: false` in the bundle config; as shipped,
+  `poll: true` busy-waits and costs up to 55% of decode plus 2.7 idle cores.)
 
   **Routing rule that falls out of this: send a request to the smallest window
-  that fits it.** Do not treat a larger `n_ctx` as strictly better when
-  ranking endpoints -- on this engine it is a latency class. The 16k endpoint
-  earns its cost only for requests that genuinely cannot fit in 4096, and even
-  then the 4k endpoint plus server-side eviction/summarisation is usually the
-  faster answer.
+  that fits it.** Do not treat a larger `n_ctx` as strictly better when ranking
+  endpoints -- on this engine it is a latency class. Decode is roughly
+  inverse-linear in the window to 8192 and worse beyond, so 8192 is the
+  sensible default tier and 16384 earns its cost only for requests that
+  genuinely cannot fit in 8192 -- and even then, a smaller endpoint plus
+  server-side eviction/summarisation is often the faster answer.
 - **Tool calling works.** Verified end-to-end on both APIs. If a bundle cannot
   do tools, the server returns a `400` naming the limitation rather than
   accepting `tools` and ignoring them -- so a 4xx on a tools probe means

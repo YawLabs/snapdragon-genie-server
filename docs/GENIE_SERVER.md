@@ -63,6 +63,7 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 | `GENIE_SDK_DIR` | scratchpad 2.45 SDK | QAIRT 2.45 root (lib/aarch64-windows-msvc, lib/hexagon-v*) |
 | `GENIE_HEXAGON_ARCH` | unset | pin one skel arch (`v81`); default offers all |
 | `GENIE_SUMMARIZE_EVICTED` | 1 | 0 disables summarising evicted turns (plain drop) |
+| (not an env var) | -- | **`poll: false` in the bundle's `genie_config.json`** -- see the poll note below. Worth up to +55% decode and frees 2.7 idle cores. |
 | `GENIE_SUMMARY_MAX_TOKENS` | 192 | cap on the retained note. Clamped at runtime to `n_ctx / 8` (floor 32) so the note cannot crowd out the window on a small-context bundle; the server logs the clamp when it bites. |
 | `GENIE_WINDOW_MARGIN` | 64 | headroom left between prompt and n_ctx |
 | `GENIE_MAX_INFLIGHT` | 2 | requests admitted at once (1 running + queue). Floored at 1 -- it cannot be disabled, since the NPU is single-flight and an unbounded setting only parks threads on the engine lock. Set 1 to protect KV reuse: two interleaved conversations share one resident KV and reset each other's prefix. |
@@ -191,6 +192,32 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   block whose payload does not parse is left VISIBLE in the content rather than
   silently dropped, so a malformed call is debuggable instead of invisible.
 
+- **Set `poll: false` in the bundle's `genie_config.json`. It is the single
+  biggest free win here.** The QnnHtp backend block ships `"poll": true`, which
+  busy-waits. Measured on this box: a resident server with `poll: true` burns
+  **270% CPU (2.7 cores) while completely idle**, no requests in flight -- and
+  the spinning threads compete with the work, so it is slower as well as
+  wasteful:
+
+  | compiled n_ctx | decode, `poll: true` | decode, `poll: false` | idle CPU |
+  |---|---|---|---|
+  | 4096 | 11.6 t/s | **18.0 t/s** (+55%) | 270% -> 0% |
+  | 8192 | 7.9 t/s | **8.8 t/s** (+11%) | 270% -> 0% |
+  | 16384 | 3.2 t/s | **3.3 t/s** (+2%) | 270% -> 0% |
+
+  Prefill improves too (4096: 629 -> 1157 t/s median) and run-to-run noise
+  drops sharply (1.85 -> 0.23 t/s at 4096). Nothing measured got worse. The
+  penalty shrinks as the window grows because the NPU work per token grows
+  while the CPU spin stays constant, so a small-window bundle -- the fast,
+  latency-sensitive case -- is hurt most.
+
+  Two consequences beyond throughput. Idle CPU is not free on a laptop, and
+  more importantly **an idle NPU server was stealing 2.7 cores from anything
+  else on the box**, which contaminates any concurrent benchmark of another
+  engine and quietly undermines the multi-engine plan in `MULTI_ENGINE.md`.
+  Every number in this file predating this finding was measured with
+  `poll: true` and is therefore pessimistic.
+
 - **The compiled context window is a per-token tax, paid whether or not you
   use it.** A Genie bundle's KV tensors are graph INPUTS statically shaped to
   the compiled window -- `past_key_0_in: [8, 1, 128, n_ctx-1]`, `uint8` -- so
@@ -198,34 +225,50 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   positions are filled. Cost therefore tracks the window the bundle was BUILT
   at, not the context actually in play.
 
-  Measured on this box, same server, same prompts, minutes apart, quiet box
-  (11.9 GB free). The two bundles are the same model: `precision`,
-  `tool_versions`, `chipset_attributes`, `config.json`, the chat template and
-  every tokenizer file are byte-identical, and the ONLY difference in
-  `metadata.json` is the KV shapes.
+  Three windows, same model, `poll: false`, quiet box, one harness
+  (`python src/bench_endpoint.py`). The 8192 and 16384 bundles came from
+  `qai-hub-models export` and are the same model as the 4096 prebuilt:
+  `precision`, `tool_versions`, `chipset_attributes`, `config.json`, the chat
+  template and every tokenizer file are byte-identical, and the only
+  `metadata.json` difference is the KV shapes.
 
-  | compiled n_ctx | HTP alloc | prefill (median) | decode (median) |
-  |---|---|---|---|
-  | 4096 | 328 MB | **971 t/s** (938-1016) | **13.0 t/s** (11.2-13.2) |
-  | 16384 | 1195 MB | **171 t/s** (168-181) | **3.1 t/s** (3.0-3.2) |
+  | compiled n_ctx | HTP alloc | prefill (median) | decode (median) | cost per doubling |
+  |---|---|---|---|---|
+  | 4096 | 328 MB | **1157 t/s** | **18.0 t/s** | -- |
+  | 8192 | 647 MB | **458 t/s** | **8.8 t/s** | 2.05x decode, 2.54x prefill |
+  | 16384 | 1195 MB | **176 t/s** | **3.3 t/s** | 2.69x decode, 2.59x prefill |
 
-  Reproduce with `python src/bench_endpoint.py` against each bundle. Decode is
-  measured as the delta between an N-token and a 1-token run at the same depth,
-  so prefill is subtracted out rather than folded into the rate; prefill has one
-  decode step removed for the same reason, since a 1-token cap still generates a
-  token and leaving it in understates prefill by ~16% at shallow depths.
+  So **decode is roughly inverse-linear in the window up to 8192 and worse
+  beyond it**: the first doubling costs 2.05x (almost exactly the 2x a fixed
+  per-token tax predicts), the second 2.69x. Prefill is consistently worse than
+  inverse-linear, ~2.55x per doubling. HTP allocation is exactly linear at
+  73,983 bytes per token of window, which doubles as a check that a bundle is
+  the window it claims -- the 8192 bundle allocated 646,971,904 bytes against a
+  646,971,904 prediction.
 
-  Both curves are FLAT with depth, which is the tell. The 16k bundle prefilled
-  at 181 / 171 / 172 / 168 / 169 t/s across 469 / 1344 / 2657 / 6157 / 10532
-  prompt tokens, and decoded at 3.13 t/s with 469 tokens of context versus 3.02
-  t/s with 10532 -- 0.15 t/s over a 22x change in context. So the 4x window
-  costs ~4x on decode and ~5.7x on prefill *at an almost empty context*. A
-  10532-token prefill takes **63 seconds** of wall time.
+  Decode is FLAT with depth on both self-exported bundles, which is the tell:
+  the 16384 bundle decoded 3.26 t/s holding 469 tokens and 3.27 t/s holding
+  10532, and the 8192 bundle 8.77 versus 8.81. Cost is set by the compiled
+  window, not by how much of it is live. A 10532-token prefill on the 16k
+  bundle takes **60 seconds** of wall time.
 
-  (The 4096 bundle does show a mild real depth effect on top of the fixed tax --
-  13.2 t/s shallow falling to 11.2 t/s at 2657 tokens. It is small next to the
-  4x difference between bundles, and the 16k bundle's near-total flatness is
-  what says the dominant term is the compiled window, not the fill.)
+  **The 4096 prebuilt is the exception and it is worth knowing why.** It is NOT
+  flat -- 18.0 t/s at 469 tokens falling to 12.5 t/s at 2657 -- while both
+  self-exported bundles are. The likely reason is that its `metadata.json`
+  advertises `genie.context_lengths = [512, 1024, 2048, 3072, 4096]` where the
+  exports advertise a single value: a prebuilt may carry SEVERAL graphs and
+  select the smallest that fits the prompt, which would make short prompts
+  genuinely cheaper. If that is right, exporting with several
+  `--context-lengths` values buys back the shallow-prompt speed without giving
+  up the deep window, and would be the best of both. **Untested** -- it is a
+  hypothesis with one supporting observation, not a measurement.
+
+  Practical upshot: **8192 is the sweet spot for the agent workload.** It buys
+  2x the context of 4096 for about half the decode rate, which is the fair
+  exchange rate; 16384 buys 4x the context for less than a fifth. Prefer the
+  smallest window the workload needs, and prefer eviction + summarisation over
+  a bigger bundle when the history compresses -- which is what this server is
+  built around.
 
   So a bigger bundle is a **capability tier, not an upgrade**: it buys window
   that 4096 cannot hold at all, and charges for it on every request including
@@ -250,9 +293,10 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   the two bundles works out to 73,983 B/token, 0.3% off. Any fp16 estimate of
   KV size for this bundle is 2x too high.
 
-- **Throughput is bandwidth-bound.** Decode is ~13 t/s on a quiet box for
-  the 4096 bundle (the figure belongs to the bundle's window, not to the
-  server -- see the table above); it drops
+- **Throughput is bandwidth-bound.** Decode is ~18 t/s on a quiet box for the
+  4096 bundle with `poll: false` (~12 t/s as the bundle ships). The figure
+  belongs to the bundle's window and its poll setting, not to the server -- see
+  the tables above. It drops
   sharply under memory pressure (the X Elite's 32 GB LPDDR5x is shared by CPU/GPU/NPU),
   so a large resident model elsewhere (e.g. a 26 GB llama-server) will slow it.
 - **`finish_reason`** reports `length` only on context-limit; a `max_tokens` cap

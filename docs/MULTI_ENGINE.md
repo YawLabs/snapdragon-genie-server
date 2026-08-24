@@ -37,11 +37,37 @@ window, 0.3% off the uint8 prediction.
 
 **And that KV is allocated for the whole COMPILED window up front, not as the
 context fills**, because the KV tensors are statically-shaped graph inputs.
-That makes window size a throughput knob, not just a memory one -- the 16k
-bundle decodes at ~3.1 t/s versus ~13.0 t/s for the 4k one *at identical,
-nearly empty context*. See the window-tax note in `GENIE_SERVER.md`; it is the single
+That makes window size a throughput knob, not just a memory one. Three windows
+of the same model, measured with `poll: false` on a quiet box: **18.0 t/s at
+4096, 8.8 at 8192, 3.3 at 16384** -- at identical, nearly empty context. Decode
+is about inverse-linear in the window to 8192 (2.05x cost per doubling) and
+worse past it (2.69x), so 8192 is the sweet spot and 16384 is a specialist
+tier. See the window-tax note in `GENIE_SERVER.md`; it is the single
 most important number for sizing a multi-engine deployment, because a bigger
 window costs every request rather than only the long ones.
+
+## An idle NPU server was stealing 2.7 cores
+
+Measured 2026-08-24, and it lands squarely on this document's premise. The
+Genie bundle's QnnHtp block ships `"poll": true`, which busy-waits: a resident
+`genie_server` with no requests in flight burned **270% CPU -- 2.7 cores --
+doing nothing**. Setting `poll: false` in `genie_config.json` takes that to
+**0%** and makes the NPU *faster* (decode +55% at a 4096 window, +11% at 8192,
++2% at 16384; prefill up; run-to-run noise down 8x). Nothing measured got worse.
+
+Three consequences for the multi-engine design here:
+
+- **The CPU and GPU legs were competing with a spinning NPU server.** Any
+  measurement of another engine taken while the NPU server was resident is
+  pessimistic by up to 2.7 cores of stolen CPU. That includes the baselines
+  below.
+- **The 0.2 t/s CPU anomaly needs re-testing before anything is concluded from
+  it.** It is the highest-leverage unknown on this page and it was measured in
+  exactly the conditions this finding invalidates. It may simply be this.
+- **Contention is not purely a memory-bandwidth story.** This page argues that
+  engines divide one memory bus, which is true, but a busy-wait backend
+  contends for CPU as well -- and that part is fixable by config rather than
+  physics.
 
 ## The actual constraint is bandwidth
 
@@ -64,9 +90,9 @@ Measured single-engine baselines (prefill / decode, tokens/sec):
 
 The NPU prefill figure above is **understated and should be re-measured**. A
 re-run on a quiet box against the same 4096 bundle, via the committed
-`src/bench_endpoint.py`, measured a median **971 t/s** prefill (938-1016) and
-**13.0 t/s** decode (11.2-13.2). Decode agrees with the recorded 13.2; prefill
-is over 3x the recorded 277. The likeliest explanation is the warning at the
+`src/bench_endpoint.py`, measured a median **1157 t/s** prefill and **18.0 t/s**
+decode on the same 4096 bundle with `poll: false` -- prefill over 4x the
+recorded 277 and decode a third above the recorded 13.2. The likeliest explanation is the warning at the
 bottom of this file -- the original sweep was taken while something large was
 resident. Treat 277 as a loaded-box number, not the NPU's prefill ceiling. The
 GPU and CPU rows were measured in that same window and carry the same doubt;
