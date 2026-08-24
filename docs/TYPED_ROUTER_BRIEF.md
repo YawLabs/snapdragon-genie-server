@@ -167,13 +167,42 @@ Canonical write-up is **ADR 019, `17da11da` on YawLabs/typed master**
 source recorded `t6 26.2 +-1.8, t12 11.9 +-5.2` at tg16 (d0), `30.2 / 6.2` at
 tg8, and `pp512 t12 115`, corroborating the shallow end.
 
-**The deep ranking is not measured, and should not be inferred from the table
-above.** Past roughly 600 tokens BOTH accelerators fall, not just the CPU -- the
-NPU from 18.5 to 12.8 by d2657-3300, and the GPU by an unknown amount, because
-the only GPU sweep reaching d1024/d2048 was thermally confounded. So the d469
-row is the deepest point with a clean measurement behind every engine. Routing
-policy for long prompts is currently an extrapolation; treat it as one until
-somebody sweeps all three deep on a clock-gated run.
+**The deep ranking is now measured, and it does NOT flip -- so depth is not a
+routing input for the decoder choice.** Both accelerators fall past ~600 tokens
+and they fall together. GPU, 3 passes x 5 depths, r=1 per point, every point
+gated to >=95% of base; NPU, interleaved, `poll: false`, 4096 bundle:
+
+| depth | GPU | NPU |
+|---|---|---|
+| d0 / d250 | 19.41 | 18.7 |
+| d469 | 18.06 | ~18.0 |
+| d1024 | 15.30 | -- |
+| d2048 | 15.72 | -- |
+| d3300 | 14.43 | 13.0 |
+
+Near-parallel: **GPU -26% from shallow to d3300, NPU -30%**, with the GPU a few
+percent ahead throughout. It does not hold near 18 and pull away; it tracks the
+NPU down. So the durable differentiators stay what they already were --
+**prefill (NPU ~4x) and host-load sensitivity (NPU -1.2%, GPU -64%)** -- and a
+router does not need a separate long-prompt case for choosing between them.
+
+Two caveats on that table, both worth carrying:
+
+*The two series were gated at different thresholds* -- the GPU sweep at >=95% of
+base, the earlier figures at >=92%. On hardware that swings 1.64x on box state
+those are not interchangeable, so the thresholds travel with the numbers rather
+than being flattened into one table's worth of authority.
+
+*There is a real non-monotonic knee around d1024-d1600, seen INDEPENDENTLY on
+both engines.* The GPU reads 15.30 at d1024 against 15.72 at d2048 -- deeper is
+faster, and the sample ranges do not overlap (15.14-15.37 vs 15.63-16.30). The
+NPU shows the same inversion in the same band: 14.95 at d1082 (14.61-15.29)
+against 15.40 at d1607 (15.39-15.41), also non-overlapping. Two engines, two
+harnesses, different prompt content, same direction -- which argues against the
+OpenCL-batching explanation that the GPU result alone would suggest, and for
+something common to both paths. Unexplained. It is small enough not to change
+routing, but a rate sampled at exactly d1024 will understate the surrounding
+curve on either engine.
 
 One caveat on the poll finding, stated at the right size. The NPU-solo half is a
 deliberate, controlled experiment and is multi-sourced: a flip across all three
