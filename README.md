@@ -272,7 +272,7 @@ tests/                    78 device-free tests (no NPU, no bundle, no SDK needed
 docs/GENIE_SERVER.md      the server: endpoints, env vars, and its measured limits
 docs/IMPLEMENTATION_PLAN.md  living plan + decision log; start here for the why
 docs/MODEL_CONVERSION.md  full-LLM path: Olive / AI Hub / Foundry Local + genai caveat
-docs/MULTI_ENGINE.md      running NPU + GPU + CPU at once, and why bandwidth caps it
+docs/MULTI_ENGINE.md      running NPU + GPU + CPU at once -- 1.45x measured, and why
 docs/TYPED_ROUTER_BRIEF.md  self-contained handoff for the routing work in typed
 requirements.txt          onnxruntime-qnn, onnx, numpy (genai is separate/optional)
 requirements-dev.txt      pytest only; the server itself has NO pip dependencies

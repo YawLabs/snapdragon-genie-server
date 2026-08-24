@@ -37,15 +37,23 @@ Same model, three backends, one shared 31.6 GB memory pool (no dedicated VRAM
 
 | engine | server | prefill t/s | decode t/s | status |
 |---|---|---|---|---|
-| NPU (Hexagon) | Genie server | 277* | 18.0* | **single-flight**; best prefill, near-immune to host load |
-| GPU (Adreno) | `llama-bench` -- see note | **226.8** | **18.05** | fastest decode on an idle box, **-64% on a busy one**; not reachable over HTTP today |
+| NPU (Hexagon) | Genie server | **855-938** | **18.55** | **single-flight**; ~4x the GPU's prefill, near-immune to host load |
+| GPU (Adreno) | `llama-bench` -- see note | **226.8** | **18.05** | ties the NPU on decode on a quiet box, **-64% on a busy one**; not reachable over HTTP today |
 | CPU (KleidiAI) | `llama-server` | fine | **~0.2** | **broken, unexplained** |
+
+Both NPU figures are corrected upward from the 277 / ~13 this brief carried
+until 2026-08-24 -- see the correction note below. **Decode is a tie**: 18.55
+against 18.05 is not a gap worth routing on. The two engines separate on prefill
+and on host-load sensitivity, not on decode speed, and any ranking that calls
+one of them "the faster decoder" is wrong in whichever direction it points.
 
 Resident cost is ~3.3 GB per instance at 4k context, ~4.2 GB at 16k (KV is
 `uint8`, ~72 KB/token, allocated for the whole compiled window at load) -- so
-three instances fit in ~10-13 GB. **Capacity is not the constraint. Neither is
-memory bandwidth** -- this brief said it was until 2026-08-23, and the
-measurement below falsifies it.
+three instances fit in ~10-13 GB. **Capacity is not the constraint. Memory
+bandwidth is.** This brief asserted that, retracted it on 2026-08-23 on the
+strength of a measurement that turned out to have been taken on a misconfigured
+bundle, and reinstates it here with numbers behind it -- see the concurrency
+section.
 
 **`llama-server` cannot drive the Adreno.** The build in
 `llama-qnn-fork/build-3way` silently loads on CPU (`kleidiai`, `n_threads=12`,
@@ -73,68 +81,119 @@ kernel, not of moving more bytes. `GGML_OPENCL_SOA_Q` and
 `GGML_OPENCL_USE_ADRENO_KERNELS` target Q4, so Q8_0 pays twice. **Do not offer
 Q8_0 as a "higher quality" GPU tier on this backend.**
 
-\* Both NPU figures are understated. Re-measured on a quiet box with
-`poll: false`, the same 4096 bundle gives a median **1157 t/s** prefill and
-**18.0 t/s** decode. The original sweep looks to have been taken on a loaded
-box, and everything before 2026-08-24 additionally paid the `poll: true`
-busy-wait penalty. Do not plan capacity against 277 / 13.2. The 2026-08-23
-contention run independently put the NPU at 855-938 t/s prefill and **12.82 t/s
-decode at depth 469** -- confirming the old 13.2, and saying the 18.0 is a
-near-empty-context number, since it was taken at d~0. That shape resembles the
-prebuilt bundle's depth curve rather than a self-export's (see the window
-section below), so record which bundle a rate came from as well as at what
-depth. **Quote NPU decode with its depth.**
+**Where the NPU figures come from, and why both of them moved.** Corrected
+2026-08-24; the old 277 / ~13 pair was wrong for two unrelated reasons.
+**Prefill** was measured on a loaded box: on a quiet one the same 4096 bundle
+gives **855-938 t/s** at d469, and a near-empty-context sweep gives a median
+1157. **Decode** was measured against a bundle shipping `"poll": true`, whose
+idle busy-wait burns 2.7 host cores; with `poll: false` the same bundle decodes
+**18.55 t/s at d469**, against every ~13 t/s figure this brief has carried (13.2
+in the table, 12.82 from the first contention run). The `poll` flag does not
+touch prefill and the loaded box did not touch decode -- two corrections, two
+causes. **Do not plan capacity against 277 / 13.2.**
+
+That also dissolves a question this brief raised. It read 18.0 t/s at
+near-empty context against 12.82 at d469 and concluded NPU decode must fall ~30%
+with depth on the 4096 export. It does not: 18.0 at d~0 against 18.55 at d469 is
+flat within noise, matching the 16384 bundle, which was flat all along. The
+apparent depth effect was the busy-wait. Keep recording the depth a rate was
+taken at -- the prebuilt bundle may genuinely vary, see the window section --
+but the self-exported bundles are flat.
 
 Do not plan around the CPU leg until its 0.2 t/s decode is explained. Treat
 this as a two-engine design today.
 
-## Concurrency measured: it is a net loss (2026-08-23)
+## Concurrency measured: 1.45x (corrected 2026-08-24)
 
-Both engines hot, same model on each leg, decode at d469, every sample gated to
->=92% of base clock:
+**This section reported 0.78x and "it is a net loss" until 2026-08-24.** That
+measurement was taken against bundles shipping `"poll": true`, where an idle
+Genie server busy-waits on 2.7 host cores -- cores the OpenCL backend needs to
+dispatch a kernel every token. It was measuring CPU starvation, not contention.
+With `poll: false` the pair is a **1.45x gain**. Both configurations are below,
+because the losing one is what a bundle does out of the box.
+
+Both engines hot, same model on each leg, decode at d469, n=3, every sample
+gated to >=92% of base clock.
+
+**`poll: false` -- correct configuration:**
 
 | | solo | contended | retains |
 |---|---|---|---|
-| GPU | **18.05** t/s | **7.27** +-0.72 | 40% |
-| NPU | **12.82** t/s | **6.88** | 54% |
+| NPU | **18.55** t/s | **13.35** | 72% |
+| GPU | **18.05** t/s | **13.47** +-0.21 | 75% |
 
-Aggregate while both are hot is **14.15 t/s**, against **18.05** for the best
-single engine. That is **0.78x -- routing to a second hot engine makes the box
-slower**, at 46% of the additive ideal (30.87). The old "budget for 1.5-2x
-aggregate" line in this brief was derived from the bandwidth model, not from a
-measurement, and it does not survive one.
+Aggregate **26.82 t/s** against **18.55** for the best single engine: **1.45x**,
+and **73% of the additive ideal** (36.60).
 
-**And it is not the bus.** Both engines together drew **32.7 GB/s, 24% of the
-135.2 GB/s peak**, while each lost more than half its throughput; the additive
-solo case would have been 71.4 GB/s (53%), and this silicon streams ~110-115
-GB/s in practice. A bus at a quarter of capacity is not the constraint.
+**`poll: true` -- the shipped default:**
 
-**A resident NPU server costs the GPU 15% while doing nothing at all.** A/B from
-a cooled start: GPU decodes **17.94** t/s with the NPU server stopped, **15.26**
-with it loaded and idle, **7.27** with it serving. The idle penalty is paid by a
-process running zero inference, moving zero inference bytes, and measurably
-**0.00 CPU cores** -- so neither bandwidth nor CPU contention explains it. The
-surviving hypothesis is a **shared package power budget** (the bundle pins
-`perf_profile: "burst"` with `rpc_control_latency: 100`), which fits the
-zero-core penalty and the variance jump, but **has not been measured**. Treat
-"it is power" as untested; treat "it is not bandwidth and not CPU" as
-established.
+| | solo | contended | retains |
+|---|---|---|---|
+| NPU | 12.82 t/s | 6.88 | 54% |
+| GPU | 18.05 t/s | 7.27 +-0.72 | 40% |
 
-**Host load hits the two engines completely differently.** Measured under an
-unrelated ~20% CPU job versus a cooled box: NPU 12.67 vs 12.82 (**-1.2%**), GPU
-11.04 vs 18.05 (**-64%**). Hexagon has its own clock domain; the OpenCL path is
-host-dispatch-bound per token. typed's local tier runs on a developer machine
-that is usually compiling or running tests, so **a router should not rank these
-engines off idle-box numbers** -- the GPU's 18.05 is a best case that a build
-running in another window erases, while the NPU's rate barely moves.
+Aggregate 14.15 t/s against 18.05: **0.78x, a net loss**, at 46% of that run's
+additive ideal (30.87). The GPU's solo rate is identical in both tables --
+nothing about the GPU changed. The busy-wait costs about half the pair's
+throughput and inverts the verdict.
+
+**And it is the bus.** This brief retired the bandwidth premise on 2026-08-23;
+restore it. With `poll: false` the additive demand is **84.5 GB/s** and the pair
+actually draws **62.0 GB/s** -- 63% and 46% of the 135.2 GB/s theoretical peak.
+But peak is the wrong yardstick: this silicon streams ~105-115 GB/s in practice,
+so 84.5 is roughly **75-80% of the achievable ceiling**, and giving up 27%
+against additive at that loading is ordinary bus contention rather than
+something needing a new mechanism. (The `poll: true` run drew 71.4 additive /
+32.7 actual, and *that* is what made bandwidth look refuted: losing more than
+half your throughput at a quarter of peak is not a bandwidth story, and it was
+not one.) Worth noting because it is the only prediction here that preceded its
+measurement: a bandwidth model gave **1.48x** for this pair before these numbers
+existed, and the measurement came back **1.45x**.
+
+**There is no idle-residency penalty under `poll: false`, and the power
+hypothesis is withdrawn.** This brief reported that an NPU server merely loaded
+and idle cost the GPU 15% (17.94 -> 15.26 t/s), said neither bandwidth nor CPU
+could explain a penalty from a zero-core process, and floated a shared package
+power budget (`perf_profile: "burst"`, `rpc_control_latency: 100`). Re-measured
+2026-08-24 against a server verified clean -- it bound the port itself, served
+real inference, `poll: false` in its config, 0.00 idle cores over 15 s -- the
+GPU at d469 decodes **18.03 +-0.08** t/s with the NPU server resident and idle,
+against 17.94 / 18.05 / 18.10 across three cooled runs with it stopped. **That
+is inside the noise: a hot spare costs nothing.** The old 15%, and an earlier
+31% (18.05 -> 11.57), were both `poll: true`-era, where "idle" meant 2.7
+spinning cores against a GPU that gives up 64% of its rate to host load. **Do
+not carry the power story forward.**
+
+**Host load hits the two engines completely differently.** Under an unrelated
+~20% CPU job versus a cooled box: NPU **-1.2%**, GPU **-64%**. Hexagon has its
+own clock domain; the OpenCL path is host-dispatch-bound per token. typed's
+local tier runs on a developer machine that is usually compiling or running
+tests, so **a router should not rank these engines off idle-box numbers** -- the
+GPU's 18.05 is a best case that a build running in another window erases, while
+the NPU's rate barely moves. (The absolute pair behind that -1.2%, 12.67 against
+12.82, is `poll: true`-era; the ratio is the finding and its mechanism does not
+depend on the flag.)
+
+**Caveat: the poll comparison was not a controlled experiment.** The value was
+changed on disk, by a third party, at 2026-08-24 02:23 -- between the two halves
+of this measurement. Which half a given sample belongs to is inferred from that
+file mtime and from server start times, not from a variable held under control.
+Confirming it deliberately is about fifteen minutes (the `.orig` bundle configs
+still carry the shipped `true`: flip, run, flip back, run) and **has not been
+done**. Weight the result accordingly: the direction is not in doubt, the
+attribution to `poll` is well-supported but inferred.
 
 Three rules fall out for the router:
 
-1. **Never fan a single workload across both engines for speed.** It is 0.78x.
-2. **Route to a second engine for concurrency and failover only** -- a queued
-   request served slowly still beats one waiting behind the single-flight lock.
-3. **Stop an idle engine rather than parking it hot.** A quarter of the GPU's
-   loss is the mere residency of an unused NPU server.
+1. **Check `poll` before trusting any local concurrency number, including
+   these.** `"poll": true` is the shipped default and it turns 1.45x into 0.78x.
+2. **Fanning across both engines is worth ~1.45x, not 2x.** Bandwidth is the
+   ceiling and the pair already draws three-quarters of what this memory system
+   delivers, so plan for diminishing returns and do not assume a third engine
+   adds a third.
+3. **Route to a second engine for concurrency and failover as well as for
+   speed** -- a queued request served at 72-75% of solo rate beats one waiting
+   behind the single-flight lock.
 
 Reproduce any of this with `src/bench_contention.py` in `snapdragon-npu-llm`
 (`--npu` / `--gpu` base URLs, `--depth`, `--repeat`; it refuses to run on a
@@ -145,10 +204,12 @@ Note that it expects both legs over HTTP, so the GPU leg needs the
 ## Why route at all
 
 **The NPU serves exactly one request at a time.** Concurrent Hexagon access
-wedges the device, so the server serializes behind a lock. A second engine
-gives you concurrency, plus somewhere to go when the HTP throws its transient
-`Code 1003` device fault. What it does **not** give you is throughput -- see the
-0.78x measurement above.
+wedges the device, so the server serializes behind a lock. A second engine gives
+you concurrency, somewhere to go when the HTP throws its transient `Code 1003`
+device fault, and -- corrected 2026-08-24 -- **throughput as well**: 1.45x for
+the pair, bounded by memory bandwidth rather than by either engine. The "what it
+does not give you is throughput" line this section carried was measured on a
+misconfigured bundle and is withdrawn.
 
 ## What to build
 
@@ -164,11 +225,21 @@ gives you concurrency, plus somewhere to go when the HTP throws its transient
 4. **Health checks that survive the wedge.** `/health` answering is **not**
    proof the device will execute -- the `1003` fault happens at execute time,
    not at load. A real check needs a tiny generation, not a liveness ping.
-5. **Engine lifecycle, not just engine selection.** A loaded-but-idle NPU
-   server costs the GPU 15% of its decode rate, so "keep every engine warm so
-   dispatch is instant" is the wrong default here: start the engine the route
-   picks and stop the one it does not, and weigh the load time against the
-   residency tax rather than assuming a hot spare is free.
+5. **Engine configuration, not just engine selection.** One setting dominates
+   everything else on this hardware: `"poll": false` in the bundle's
+   `genie_config.json`. Shipped as `true` it busy-waits on 2.7 cores while idle,
+   costs up to 55% of NPU decode, and turns concurrent GPU + NPU serving from a
+   1.45x gain into a 0.78x loss. If typed ever manages these bundles, assert the
+   flag rather than trusting the vendor default.
+6. **Engine lifecycle -- and a hot spare is free.** This brief recommended
+   stopping an idle engine rather than parking it hot, on the strength of a 15%
+   penalty a merely-resident NPU server imposed on the GPU. That penalty was
+   the busy-wait. Measured under `poll: false`, an idle resident NPU server
+   costs the GPU nothing -- 18.03 t/s against ~18.0 stopped -- so **parking an
+   idle engine hot is fine.** Keep it warm and spend the load time only when
+   you have another reason to. The old advice ("start the engine the route
+   picks and stop the one it does not") described a misconfigured bundle and is
+   withdrawn.
 
 ## Capability limits worth encoding
 
@@ -199,11 +270,14 @@ These are properties of the NPU endpoint that a router must not assume away:
   `poll: true` busy-waits and costs up to 55% of decode plus 2.7 idle cores.)
 
   One caveat for a router that measures its own endpoints: the 4096 PREBUILT
-  behaves differently from the self-exported bundles -- its decode falls ~30%
-  from 18.9 t/s at 250 tokens of context to 13.0 at 3300, where the exports are
-  flat. So a single decode-rate number per endpoint is only safe for a
-  single-length export. Sample at a depth representative of the traffic, or
-  record a rate per depth band.
+  bundle appears to behave differently from the self-exported ones -- its decode
+  fell ~30%, from 18.9 t/s at 250 tokens of context to 13.0 at 3300, where the
+  exports are flat. **Treat that as unconfirmed.** The same shape turned up on a
+  self-export (18.0 at d~0 against 12.82 at d469) and proved to be the
+  `poll: true` busy-wait rather than depth; the prebuilt sweep was taken in the
+  same era and has not been repeated. Until it is, sample at a depth
+  representative of the traffic or record a rate per depth band -- sound advice
+  whether or not the falloff is real.
 
   **Routing rule that falls out of this: send a request to the smallest window
   that fits it.** Do not treat a larger `n_ctx` as strictly better when ranking
@@ -240,17 +314,24 @@ These are properties of the NPU endpoint that a router must not assume away:
 
 ## Measure before designing around it
 
-- ~~Concurrent GPU + NPU contention has **not** been measured.~~ **Answered
-  2026-08-23: 0.78x, and the cause is not the memory bus.** Numbers and caveats
-  in the contention section above -- one pair of engines, one model, one depth,
+- ~~Concurrent GPU + NPU contention has **not** been measured.~~ ~~Answered
+  2026-08-23: 0.78x, and the cause is not the memory bus.~~ **Answered
+  2026-08-24: 1.45x, and the cause is the memory bus.** Numbers and caveats in
+  the concurrency section above -- one pair of engines, one model, one depth,
   n=3, the GPU leg driven by `llama-bench` because `llama-server` cannot reach
   the Adreno.
-- **Does `perf_profile` explain the 15% idle-residency penalty?** It is the one
-  question the contention run leaves open, and it is one config edit away:
-  lower `perf_profile` from `"burst"` in `htp_backend_ext_config.json` and
-  re-run `bench_contention.py`. If burst power is the cause, a lower profile may
-  return most of that 15% for some latency. Nobody has run it, so do not assume
-  the penalty is fixed cost -- or that it is avoidable.
+- **Confirm the `poll` A/B deliberately.** The whole reversal above rests on a
+  flag a third party changed on disk between the two halves of the measurement,
+  not on a controlled experiment. It is ~15 minutes -- flip it back, re-run
+  `bench_contention.py`, flip it forward, re-run -- and nobody has done it.
+  Until then the 1.45x is well-supported but its attribution is inferred.
+  **When you do it, verify the server you launched is the one answering.** The
+  launcher refuses a port something else already holds, so a readiness check
+  that merely curls the port can pass against the PREVIOUS process and hand you
+  samples labelled with a config they were never served under. That is exactly
+  how this brief came to believe in a 15% idle penalty and a package power
+  budget. Check the launcher exit status and the PID owning the port, not just
+  that something answers.
 - Whether a second resident model raises the NPU's `1003` rate is unknown.
 - Benchmark on a quiet box, and on a **cool** one. Thermals alone move the GPU
   leg **1.64x**: the same d469 measurement gave 11.04 with an unrelated export
