@@ -325,12 +325,13 @@ are byte-identical; the only difference in `metadata.json` is the KV shapes.
 
 | compiled n_ctx | HTP alloc | prefill (median) | decode (median) |
 |---|---|---|---|
-| 4096 | 328 MB | **914 t/s** (845-960) | **13.0 t/s** (11.2-13.2) |
-| 16384 | 1195 MB | **167 t/s** (160-169) | **3.1 t/s** (3.0-3.2) |
+| 4096 | 328 MB | **971 t/s** (938-1016) | **13.0 t/s** (11.2-13.2) |
+| 16384 | 1195 MB | **171 t/s** (168-181) | **3.1 t/s** (3.0-3.2) |
 
 Reproduce with `python src/bench_endpoint.py` against each bundle. Both curves are FLAT with depth,
 which is the tell -- the 16k bundle decoded at 3.13 t/s with 469 tokens of context and 3.02 t/s with
-10532, a spread of 0.15 t/s across a 22x change in context. A 10532-token prefill takes 63 seconds.
+10532, a spread of 0.15 t/s across a 22x change in context. A 10532-token prefill takes 63 seconds of
+wall time.
 
 Three consequences:
 1. **A bigger bundle is a capability tier, not an upgrade.** It buys window that 4096 cannot hold at

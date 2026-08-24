@@ -193,19 +193,21 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 
   | compiled n_ctx | HTP alloc | prefill (median) | decode (median) |
   |---|---|---|---|
-  | 4096 | 328 MB | **914 t/s** (845-960) | **13.0 t/s** (11.2-13.2) |
-  | 16384 | 1195 MB | **167 t/s** (160-169) | **3.1 t/s** (3.0-3.2) |
+  | 4096 | 328 MB | **971 t/s** (938-1016) | **13.0 t/s** (11.2-13.2) |
+  | 16384 | 1195 MB | **171 t/s** (168-181) | **3.1 t/s** (3.0-3.2) |
 
-  Reproduce with `python src/bench_endpoint.py` against each bundle; decode is
+  Reproduce with `python src/bench_endpoint.py` against each bundle. Decode is
   measured as the delta between an N-token and a 1-token run at the same depth,
-  so prefill is subtracted out rather than folded into the rate.
+  so prefill is subtracted out rather than folded into the rate; prefill has one
+  decode step removed for the same reason, since a 1-token cap still generates a
+  token and leaving it in understates prefill by ~16% at shallow depths.
 
   Both curves are FLAT with depth, which is the tell. The 16k bundle prefilled
-  at 161 / 164 / 169 / 167 / 168 t/s across 469 / 1344 / 2657 / 6157 / 10532
+  at 181 / 171 / 172 / 168 / 169 t/s across 469 / 1344 / 2657 / 6157 / 10532
   prompt tokens, and decoded at 3.13 t/s with 469 tokens of context versus 3.02
-  t/s with 10532 -- a spread of 0.15 t/s over a 22x change in context. So the 4x
-  window costs ~4x on decode and ~5.5x on prefill *at an almost empty context*.
-  A 10532-token prefill takes **63 seconds**.
+  t/s with 10532 -- 0.15 t/s over a 22x change in context. So the 4x window
+  costs ~4x on decode and ~5.7x on prefill *at an almost empty context*. A
+  10532-token prefill takes **63 seconds** of wall time.
 
   (The 4096 bundle does show a mild real depth effect on top of the fixed tax --
   13.2 t/s shallow falling to 11.2 t/s at 2657 tokens. It is small next to the

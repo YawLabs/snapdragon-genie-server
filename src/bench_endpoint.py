@@ -23,15 +23,26 @@ Method, and its limits:
   * DECODE is timed as the delta between two otherwise identical requests, one
     capped at 1 token and one at N. Subtracting cancels prefill, connection
     setup and template rendering, which a naive total/tokens figure folds into
-    the rate and understates decode by a lot on short runs.
-  * PREFILL is a request capped at 1 token, so wall time is prefill plus one
-    decode step. At 500+ prompt tokens that single step is in the noise.
+    the rate and understates decode by a lot on short runs. (Both requests
+    really do pay full prefill: the server reuses its KV only when a prompt
+    EXTENDS what the dialog holds, and the second request's prompt is a strict
+    prefix of the first result, so it resets. If that ever changes, this
+    subtraction quietly becomes wrong.)
+  * PREFILL is a request capped at 1 token, so raw wall time is prefill PLUS
+    one decode step. That step is not negligible at shallow depths -- on a
+    slow-decoding bundle it was ~11% of a 469-token measurement -- so a cheap
+    decode probe runs first and its per-step cost is subtracted. The probe's
+    own figure and the raw wall are both printed, so the correction is visible
+    rather than taken on trust.
   * Thinking is disabled. A <think> block is real generated output but its
     length swings run to run, which makes it a variance source rather than a
     signal when what you want is tokens/sec.
   * Every measurement is preceded by a warmup request, because the first query
     against a freshly loaded dialog pays page-in costs that are not
     representative of steady state.
+  * A failed request (429 backpressure, a 400, a dropped connection) skips that
+    data point and the sweep carries on. Losing a twenty-minute run to one
+    transient 429 would be worse than a gap in the table.
 
 Read the results next to `docs/GENIE_SERVER.md`: on this engine throughput is
 set by the window the BUNDLE WAS COMPILED AT, so a run is only comparable to
@@ -43,6 +54,7 @@ import json
 import statistics
 import sys
 import time
+import urllib.error
 import urllib.request
 
 # Roughly 4 characters per token for ordinary English prose. Only used to hit a
@@ -52,13 +64,34 @@ CHARS_PER_TOKEN = 4
 FILLER = "The quick brown fox jumps over the lazy dog near the riverbank. "
 
 
+def _describe(err):
+    """A one-line reason from a failed request, including the server's message.
+
+    The server explains itself in the body ("server busy; NPU is single-flight",
+    or a 400 naming the token counts). Printing only the status code throws that
+    away at exactly the moment the reader needs it.
+    """
+    if isinstance(err, urllib.error.HTTPError):
+        detail = ""
+        try:
+            detail = (json.loads(err.read()).get("error") or {}).get("message") or ""
+        except Exception:
+            pass
+        return "HTTP %s%s" % (err.code, " -- %s" % detail if detail else "")
+    return "%s: %s" % (type(err).__name__, err)
+
+
 def _post(base, path, payload, timeout):
+    """POST and time it. Returns (body, wall), or (None, reason) on failure."""
     req = urllib.request.Request(
         base + path, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"})
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        body = json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = json.loads(r.read())
+    except Exception as e:
+        return None, _describe(e)
     return body, time.time() - t0
 
 
@@ -82,6 +115,7 @@ def n_ctx(base):
 
 
 def chat(base, model, prompt, max_tokens, timeout):
+    """One completion. Returns a dict, or None after printing why it failed."""
     body, wall = _post(base, "/v1/chat/completions", {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -91,6 +125,9 @@ def chat(base, model, prompt, max_tokens, timeout):
         "chat_template_kwargs": {"enable_thinking": False},
         "reasoning_effort": "none",
     }, timeout)
+    if body is None:
+        print("  request failed (%s) -- skipping this point" % wall, flush=True)
+        return None
     usage = body.get("usage") or {}
     return {
         "prompt_tokens": usage.get("prompt_tokens", 0),
@@ -106,32 +143,97 @@ def prompt_of(target_tokens):
     return (FILLER * reps)[:n] + "\n\nSummarise the text above."
 
 
-def measure_prefill(base, model, target, timeout):
+def _delta_run(base, model, prompt, extra, timeout):
+    """(one, many, steps, seconds) for `extra` more decode steps at this depth.
+
+    Runs the same prompt capped at 1 token and at 1+extra. Everything that is
+    not decode -- prefill, connection setup, template rendering -- occurs in
+    both and cancels in the difference. Returns None if either request failed;
+    steps==0 means the model hit EOS before the cap, so there is no window.
+    """
+    one = chat(base, model, prompt, 1, timeout)
+    if one is None:
+        return None
+    many = chat(base, model, prompt, 1 + extra, timeout)
+    if many is None:
+        return None
+    steps = many["completion_tokens"] - one["completion_tokens"]
+    secs = many["wall"] - one["wall"]
+    if steps <= 0 or secs <= 0:
+        return (one, many, 0, 0.0)
+    return (one, many, steps, secs)
+
+
+def decode_probe(base, model, timeout, depth=500, steps=8):
+    """Seconds per decode step, used to correct the prefill measurements.
+
+    Cheap on purpose (a handful of tokens at a shallow depth). Decode on this
+    engine is close to flat with depth, so one figure corrects the whole prefill
+    sweep; where it is not flat the correction is small anyway, and the raw wall
+    time is printed alongside so nothing is hidden.
+    """
+    r = _delta_run(base, model, prompt_of(depth), steps, timeout)
+    if r is None or r[2] <= 0:
+        return None
+    return r[3] / r[2]
+
+
+def measure_prefill(base, model, target, timeout, per_step=0.0):
     r = chat(base, model, prompt_of(target), 1, timeout)
-    rate = r["prompt_tokens"] / r["wall"] if r["wall"] else 0.0
-    print("  prefill   prompt=%-6d wall=%7.2fs   %8.1f tok/s"
-          % (r["prompt_tokens"], r["wall"], rate), flush=True)
+    if r is None:
+        return None
+    # The 1-token cap still generates one token; remove it so this reports
+    # prefill rather than prefill-plus-a-step.
+    wall = max(1e-9, r["wall"] - per_step)
+    rate = r["prompt_tokens"] / wall
+    print("  prefill   prompt=%-6d wall=%7.2fs (raw %6.2fs)  %8.1f tok/s"
+          % (r["prompt_tokens"], wall, r["wall"], rate), flush=True)
     return rate
 
 
 def measure_decode(base, model, target, tokens, timeout):
     """Decode rate at a given context depth, prefill subtracted out."""
-    p = prompt_of(target)
-    short = chat(base, model, p, 1, timeout)
-    long_ = chat(base, model, p, tokens + 1, timeout)
-    steps = long_["completion_tokens"] - short["completion_tokens"]
-    delta = long_["wall"] - short["wall"]
-    if steps <= 0 or delta <= 0:
+    r = _delta_run(base, model, prompt_of(target), tokens, timeout)
+    if r is None:
+        return None
+    _, many, steps, secs = r
+    if steps <= 0:
         # The model stopped early (hit EOS before the cap), so there is no
         # clean decode window to measure. Say so rather than printing a rate
         # derived from one or two tokens.
-        print("  decode    depth=%-6d SKIPPED (model stopped after %d token(s))"
-              % (long_["prompt_tokens"], max(0, steps)), flush=True)
+        print("  decode    depth=%-6d SKIPPED (model stopped before the cap)"
+              % many["prompt_tokens"], flush=True)
         return None
-    rate = steps / delta
+    rate = steps / secs
     print("  decode    depth=%-6d %3d tokens in %6.2fs   %8.2f tok/s"
-          % (long_["prompt_tokens"], steps, delta, rate), flush=True)
+          % (many["prompt_tokens"], steps, secs, rate), flush=True)
     return rate
+
+
+def _verdict(shallow, deep):
+    """Compare decode at two depths, keeping same-depth noise out of the claim.
+
+    The point of this line is whether cost tracks the COMPILED window or the
+    context actually in use -- a statement about the difference BETWEEN depths.
+    Pooling both groups and taking max-minus-min folds run-to-run noise at one
+    depth into that difference, which is enough to flip the verdict on a noisy
+    box while the depths genuinely agree. So compare medians, and report the
+    noise as its own number instead of letting it masquerade as a depth effect.
+    """
+    if not shallow or not deep:
+        return
+    ms, md = statistics.median(shallow), statistics.median(deep)
+    delta = abs(ms - md)
+    noise = max(max(shallow) - min(shallow), max(deep) - min(deep))
+    print("  shallow median %.2f t/s (n=%d)   deep median %.2f t/s (n=%d)"
+          % (ms, len(shallow), md, len(deep)), flush=True)
+    print("  cross-depth delta %.2f t/s, same-depth noise %.2f t/s -- %s"
+          % (delta, noise,
+             "flat, so cost tracks the COMPILED window, not the used context"
+             if delta < 0.25 * min(ms, md)
+             else "varies with depth on this engine"), flush=True)
+    if len(deep) == 1:
+        print("  (deep depth sampled once -- --repeat-deep raises that)", flush=True)
 
 
 def main():
@@ -144,6 +246,9 @@ def main():
                     help="tokens to generate per decode measurement")
     ap.add_argument("--repeat", type=int, default=3,
                     help="decode repetitions at the shallow depth")
+    ap.add_argument("--repeat-deep", type=int, default=1,
+                    help="decode repetitions at the deep depth; each costs two "
+                         "full deep prefills, hence the lower default")
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--prefill-only", action="store_true")
     ap.add_argument("--decode-only", action="store_true")
@@ -153,7 +258,8 @@ def main():
     try:
         _get(base, "/health")
     except Exception as e:
-        sys.exit("no server at %s (%s) -- start genie_server.py first" % (base, e))
+        sys.exit("no server at %s (%s) -- start genie_server.py first"
+                 % (base, _describe(e)))
 
     ctx = n_ctx(base)
     print("endpoint %s   model=%s   n_ctx=%s"
@@ -168,40 +274,49 @@ def main():
     # whole signature of a statically-shaped KV, so two clustered depths would
     # hide the finding rather than reveal it.
     limit = (ctx or 4096) - args.tokens - 256
-    depths = [d for d in (500, 1500, 3000, 7000, 12000) if d < limit] or [min(500, max(1, limit))]
+    if limit < 1:
+        sys.exit("--tokens %d leaves no room in an n_ctx=%s window -- lower it"
+                 % (args.tokens, ctx))
+    depths = [d for d in (500, 1500, 3000, 7000, 12000) if d < limit] or [min(500, limit)]
 
     print("\nwarmup", flush=True)
     chat(base, args.model, "Count from 1 to 5.", 24, args.timeout)
 
     if not args.decode_only:
-        print("\nPREFILL (1-token cap; wall is prefill + one decode step)", flush=True)
+        per_step = decode_probe(base, args.model, args.timeout,
+                                depth=min(500, depths[0]))
+        if per_step:
+            print("\ndecode probe: %.3f s/token (%.2f t/s), subtracted from each "
+                  "prefill below" % (per_step, 1.0 / per_step), flush=True)
+        else:
+            per_step = 0.0
+            print("\ndecode probe failed; prefill figures still include one "
+                  "decode step and therefore read LOW", flush=True)
+        print("\nPREFILL (one decode step removed; raw wall also shown)", flush=True)
         for d in depths:
-            measure_prefill(base, args.model, d, args.timeout)
+            measure_prefill(base, args.model, d, args.timeout, per_step)
 
     if not args.prefill_only:
         print("\nDECODE (delta of N-token vs 1-token run at the same depth)", flush=True)
-        rates = []
+        shallow, deep = [], []
         for _ in range(max(1, args.repeat)):
             r = measure_decode(base, args.model, depths[0], args.tokens, args.timeout)
             if r:
-                rates.append(r)
+                shallow.append(r)
         if len(depths) > 1:
             # The deep sample is the point: if decode here matches decode at the
             # shallow depth, cost is set by the compiled window rather than by
             # how much context is actually resident.
-            r = measure_decode(base, args.model, depths[-1], args.tokens, args.timeout)
-            if r:
-                rates.append(r)
-        if rates:
+            for _ in range(max(1, args.repeat_deep)):
+                r = measure_decode(base, args.model, depths[-1], args.tokens,
+                                   args.timeout)
+                if r:
+                    deep.append(r)
+        allr = shallow + deep
+        if allr:
             print("\n  decode median %.2f t/s over %d run(s)"
-                  % (statistics.median(rates), len(rates)), flush=True)
-            if len(depths) > 1 and len(rates) >= 2:
-                spread = max(rates) - min(rates)
-                print("  spread across depths %.2f t/s -- %s"
-                      % (spread,
-                         "flat, so cost tracks the COMPILED window, not the used context"
-                         if spread < 0.25 * statistics.median(rates)
-                         else "varies with depth on this engine"), flush=True)
+                  % (statistics.median(allr), len(allr)), flush=True)
+        _verdict(shallow, deep)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ so concurrent instances divide throughput rather than multiplying it. Budget
 for **1.5-2x aggregate, not 3x**.
 
 \* The NPU prefill figure is understated -- a re-measurement on a quiet box
-gave a median **914 t/s** on the same 4096 bundle (decode agreed, 13.0). The
+gave a median **971 t/s** on the same 4096 bundle (decode agreed, 13.0). The
 original sweep looks to have been taken while the box was loaded. Do not plan
 capacity against 277.
 
@@ -96,8 +96,8 @@ These are properties of the NPU endpoint that a router must not assume away:
 
   | compiled n_ctx | prefill t/s (median) | decode t/s (median) |
   |---|---|---|
-  | 4096 | **914** (845-960) | **13.0** (11.2-13.2) |
-  | 16384 | **167** (160-169) | **3.1** (3.0-3.2) |
+  | 4096 | **971** (938-1016) | **13.0** (11.2-13.2) |
+  | 16384 | **171** (168-181) | **3.1** (3.0-3.2) |
 
   Both are FLAT with depth -- the 16k bundle decodes at 3.13 t/s with 469
   tokens of context and 3.02 t/s with 10532, so the ~4x penalty applies to

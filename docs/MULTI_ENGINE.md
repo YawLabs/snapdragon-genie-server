@@ -64,7 +64,7 @@ Measured single-engine baselines (prefill / decode, tokens/sec):
 
 The NPU prefill figure above is **understated and should be re-measured**. A
 re-run on a quiet box against the same 4096 bundle, via the committed
-`src/bench_endpoint.py`, measured a median **914 t/s** prefill (845-960) and
+`src/bench_endpoint.py`, measured a median **971 t/s** prefill (938-1016) and
 **13.0 t/s** decode (11.2-13.2). Decode agrees with the recorded 13.2; prefill
 is over 3x the recorded 277. The likeliest explanation is the warning at the
 bottom of this file -- the original sweep was taken while something large was

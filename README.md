@@ -111,10 +111,12 @@ python src\bench_endpoint.py                          # prefill + decode sweep
 python src\bench_endpoint.py --base http://127.0.0.1:8080 --decode-only
 ```
 
-It reports prefill and decode in tokens/sec at several context depths, with
-prefill subtracted out of the decode figure (timing an N-token run against a
-1-token run at the same depth) so decode is not understated by folding prefill
-into the rate. Because it speaks plain OpenAI HTTP, the same command benchmarks
+It reports prefill and decode in tokens/sec at several context depths. Decode
+is measured as the delta between an N-token and a 1-token run at the same depth,
+so prefill cancels instead of being folded into the rate; prefill in turn has
+one decode step removed, since a 1-token cap still generates a token and leaving
+it in understates prefill by ~16% at shallow depths. Failed requests (a 429, a
+400) skip that point rather than killing a twenty-minute sweep. Because it speaks plain OpenAI HTTP, the same command benchmarks
 a `llama-server` GPU or CPU leg -- which is the only way to get a cross-engine
 comparison on identical prompts.
 
@@ -230,7 +232,7 @@ a full model is **smaller** than the NPU-vs-ORT-CPU-EP ratios above.
   sits resident on the HTP behind `src/genie_server.py`, answering both the
   OpenAI and Anthropic APIs with streaming, tool calls, stop sequences and
   context eviction. See [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md).
-- **Full-model prefill and decode, measured.** ~900 tok/s prefill and ~13 tok/s
+- **Full-model prefill and decode, measured.** ~970 tok/s prefill and ~13 tok/s
   decode on the 4096-window bundle, via `src/bench_endpoint.py`. Decode is
   bandwidth-bound and, on this engine, is set by the window the bundle was
   COMPILED at rather than by how much context is in use -- a 16384 bundle of
