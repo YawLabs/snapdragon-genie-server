@@ -13,5 +13,5 @@ ruff>=0.16          # lint gate, configured in pyproject.toml
 numpy>=1.26         # NOT a server dependency. tests/test_bench.py imports
                     # src/bench.py, which needs numpy for real; onnx and
                     # onnxruntime are stubbed there because they are
-                    # win_arm64-only, but numpy resolves everywhere and
+                    # win_arm64-only wheels. numpy is not stubbed because
                     # stubbing it would mean testing against a fake array.
