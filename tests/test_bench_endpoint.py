@@ -165,3 +165,52 @@ def test_describe_handles_a_bodyless_error(be):
 def test_prompt_of_is_about_the_requested_size(be):
     p = be.prompt_of(500)
     assert 500 * be.CHARS_PER_TOKEN <= len(p) <= 500 * be.CHARS_PER_TOKEN + 60
+
+
+# --- the --prefill-only probe cross-check ---------------------------------
+# With --prefill-only there is no decode phase to check the probe against, and
+# the probe is the ONLY thing shaping the reported numbers. One taken during a
+# blip corrupts every figure silently, so the sweep is bracketed by two probes.
+# This is a WARNING, and a warning that quietly stops firing is worse than
+# none: the run then looks clean precisely when it is not.
+
+def test_crosscheck_accepts_a_box_that_held(be):
+    msg = be._probe_crosscheck(0.055, 0.056)
+    assert "consistent" in msg
+    assert "WARNING" not in msg
+
+
+def test_crosscheck_warns_when_the_box_drifted(be):
+    # 0.055 -> 0.12 s/step is 18.2 vs 8.3 t/s: the corrections above it were
+    # computed from a rate the box no longer had.
+    msg = be._probe_crosscheck(0.055, 0.12)
+    assert "WARNING" in msg
+    assert "did not hold" in msg
+    assert "Re-run quiet" in msg, "must say what to do about it"
+
+
+def test_crosscheck_reports_both_rates_so_the_reader_can_judge(be):
+    msg = be._probe_crosscheck(0.05, 0.20)
+    assert "20.00" in msg and "5.00" in msg
+
+
+def test_crosscheck_is_symmetric(be):
+    # A box that got FASTER mid-sweep is equally disqualifying: it means the
+    # opening probe was the contended one, so the corrections were too large.
+    slow_then_fast = be._probe_crosscheck(0.20, 0.05)
+    fast_then_slow = be._probe_crosscheck(0.05, 0.20)
+    assert "WARNING" in slow_then_fast and "WARNING" in fast_then_slow
+
+
+def test_crosscheck_says_so_when_the_closing_probe_failed(be):
+    # Distinct from "checked and fine" -- an unchecked run must not read as a
+    # verified one.
+    msg = be._probe_crosscheck(0.055, None)
+    assert "could not be cross-checked" in msg
+    assert "consistent" not in msg
+
+
+def test_crosscheck_tolerance_is_not_hair_trigger(be):
+    # Decode on this engine swings run to run; a threshold that fires on
+    # ordinary noise would train the reader to ignore it.
+    assert "WARNING" not in be._probe_crosscheck(0.055, 0.075)

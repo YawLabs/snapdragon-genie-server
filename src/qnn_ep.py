@@ -138,6 +138,19 @@ def build_session(
     -------
     (session, info) where info = {"providers", "htp_verified", "log"}.
     """
+    if use_npu and verify and log_severity > 3:
+        # The markers only exist in the log at severity <= 3, so a quieter
+        # session cannot produce them even on a perfectly placed graph --
+        # htp_verified would be False for a reason that has nothing to do with
+        # placement, and this function would raise PlacementError on a correct
+        # HTP run. A check whose negative result carries no information is
+        # worse than no check, so refuse the combination rather than return a
+        # verdict that cannot discriminate.
+        raise ValueError(
+            "log_severity=%d cannot be verified: the HTP compile markers are "
+            "only emitted at severity <= 3, so verification would fail on a "
+            "correctly placed graph. Pass log_severity <= 3, or verify=False "
+            "to skip placement checking deliberately." % log_severity)
     register()
     so = ort.SessionOptions()
     so.log_severity_level = log_severity

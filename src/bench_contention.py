@@ -224,39 +224,13 @@ def power_source():
     return "battery" if v.lower() != "true" else "ac"
 
 
-def on_battery():
-    """True if running on battery, False on AC, None if undeterminable.
-
-    Because a low clock has two causes that look identical in a results table
-    and take two seconds to tell apart live: THERMAL limiting (waiting fixes
-    it) and POWER-SOURCE limiting (waiting never fixes it). On 2026-08-24 this
-    box sat at 998 MHz of a 3417 MHz base -- 31.6% -- with the CPU at 11%,
-    which is the power-source fingerprint: a thermally-limited box is BUSY.
-    A run that blocks for a cooling recovery on battery blocks forever.
-    """
-    if sys.platform != "win32":
-        return None
-    import subprocess
-    try:
-        out = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command",
-             "(Get-CimInstance -Namespace root\\wmi -ClassName BatteryStatus "
-             "-ErrorAction SilentlyContinue | Select-Object -First 1)"
-             ".PowerOnline"],
-            capture_output=True, text=True, timeout=30)
-        v = out.stdout.strip()
-        if v == "":
-            return None          # no battery (desktop) or query unavailable
-        return v.lower() != "true"
-    except Exception:
-        return None
-
-
 def _power_online_raw():
     """Raw PowerOnline string, "" if the class reports nothing, None on error.
 
-    Split out so power_source() can tell "no battery" from "query failed"; the
-    two are indistinguishable through on_battery()'s tri-state return.
+    Kept separate from power_source() so that "no battery" and "query failed"
+    stay distinguishable. They were not: the predecessor returned None for
+    both, so a transient PowerShell failure silently downgraded a definitive
+    check to a heuristic on a laptop that could have answered.
     """
     if sys.platform != "win32":
         return None
@@ -435,14 +409,20 @@ def paired_sweep(engines, a, make_load):
             other = [e for e in engines if e[0] != name][0]
             gen = make_load(other)
             gen.start()
-            time.sleep(a.ramp)
-            # Deliberately NOT cooled: the other engine is already hot by
-            # design, so waiting for clock recovery here would either never
-            # return or would measure a half-loaded box. The gate belongs on
-            # the SOLO leg, which is the baseline every ratio divides by.
-            cont = measure(base, model, a.depth, a.tokens, a.timeout,
-                           "%s vs %s busy" % (name, other[0]))
-            gen.stop()
+            try:
+                time.sleep(a.ramp)
+                # Deliberately NOT cooled: the other engine is already hot by
+                # design, so waiting for clock recovery here would either never
+                # return or would measure a half-loaded box. The gate belongs on
+                # the SOLO leg, which is the baseline every ratio divides by.
+                cont = measure(base, model, a.depth, a.tokens, a.timeout,
+                               "%s vs %s busy" % (name, other[0]))
+            finally:
+                # try/finally because the generator is a live load on a SHARED
+                # box. An interrupt here used to skip stop() and leave a thread
+                # hammering the peer endpoint while main() wrote its results --
+                # load that then lands on whatever the next session starts.
+                gen.stop()
 
             rec = per_engine[name]
             rec["shed"] += gen.busy
@@ -457,6 +437,40 @@ def paired_sweep(engines, a, make_load):
                       % (solo, cont, 100 * cont / solo), flush=True)
 
     return per_engine, clocks
+
+
+def shed_note(name, shed, served):
+    """(message, suspect) about a contended leg's load generator.
+
+    `shed` counts requests the load generator did not get a completion for.
+    That number cannot tell backpressure from a dead endpoint: `_post` returns
+    None for a 429 AND for connection-refused, so a peer server that never
+    started looks exactly like one too busy to answer. The difference decides
+    whether the experiment happened at all -- if nothing connected, the
+    "contended" leg measured an idle box and the ratio comes out near 1.0,
+    which reads as "no contention effect" rather than as "no contention".
+
+    `served == 0` is the discriminator, and it is the one the counting site
+    cannot apply because it only sees one request at a time. A genuinely
+    backpressured engine still completes SOME requests between rejections; one
+    that completed none across an entire run was most likely never reachable.
+    """
+    if not shed:
+        return None, False
+    if served == 0:
+        return ("SUSPECT: while %s was measured, the load generator got %d "
+                "failure(s) and ZERO completions. A 429 and a refused "
+                "connection are indistinguishable here, so this is either a "
+                "fully-queued engine or one that was never up -- and if it "
+                "was never up, the contended leg measured an IDLE box and any "
+                "ratio near 1.0 means 'no load', not 'no contention'. Check "
+                "that the peer endpoint was serving before believing this run."
+                % (name, shed)), True
+    return ("note: while %s was measured, the other engine shed %d request(s) "
+            "and served %d. On the single-flight NPU that is expected "
+            "backpressure; a shed count near 100%% means it was queued rather "
+            "than contending, which UNDERSTATES contention."
+            % (name, shed, served)), False
 
 
 def drift_note(values, what):
@@ -689,12 +703,11 @@ def main():
 
     for name, _b, _m in engines:
         r = per_engine[name]
-        if r["shed"]:
-            print("\n  note: while %s was measured, the other engine shed %d "
-                  "request(s) and served %d. On the single-flight NPU that is "
-                  "expected backpressure; a shed count near 100%% means it was "
-                  "queued rather than contending, which UNDERSTATES contention."
-                  % (name, r["shed"], r["served"]))
+        note, suspect = shed_note(name, r["shed"], r["served"])
+        if note:
+            print("\n  %s" % note)
+        if suspect:
+            warnings.append(note)
 
     if warnings:
         print("\n%s" % ("!" * 64))

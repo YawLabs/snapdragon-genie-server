@@ -243,3 +243,91 @@ def test_wait_for_cool_aborts_instead_of_blocking_on_battery(monkeypatch):
     monkeypatch.setattr(bc.time, "sleep", lambda s: slept.append(s))
     assert bc.wait_for_cool(92.0, limit=300) == 31.0
     assert slept == [], "must return immediately, not spin out the limit"
+
+
+# --- an all-shed leg may mean NO LOAD WAS APPLIED -------------------------
+# `_post` returns None for a 429 AND for connection-refused, so the counting
+# site cannot tell a queued engine from one that never started. If nothing
+# connected, the "contended" leg measured an idle box and the ratio comes out
+# near 1.0 -- which reads as "no contention effect" rather than "no experiment".
+
+def test_zero_completions_is_flagged_as_suspect():
+    note, suspect = bc.shed_note("NPU", shed=40, served=0)
+    assert suspect is True
+    assert "SUSPECT" in note
+    assert "never up" in note, "must name the possibility, not just the count"
+
+
+def test_ordinary_backpressure_is_not_flagged_as_suspect():
+    # A genuinely queued single-flight NPU still completes SOME requests
+    # between rejections; that is the discriminator.
+    note, suspect = bc.shed_note("GPU", shed=40, served=7)
+    assert suspect is False
+    assert "expected backpressure" in note
+
+
+def test_no_shed_says_nothing():
+    assert bc.shed_note("NPU", shed=0, served=12) == (None, False)
+
+
+def test_the_suspect_note_warns_about_the_ratio_specifically():
+    # The failure is not "we lost some load", it is "the number you are about
+    # to publish means something else".
+    note, _ = bc.shed_note("NPU", shed=99, served=0)
+    assert "1.0" in note and "no load" in note
+
+
+def test_a_suspect_leg_reaches_the_warnings_block(monkeypatch, capsys):
+    rounds = {"NPU": {"solo": [10.0], "contended": [9.9], "ratios": [0.99],
+                      "shed": 30, "served": 0},
+              "GPU": {"solo": [20.0], "contended": [19.0], "ratios": [0.95],
+                      "shed": 5, "served": 5}}
+    monkeypatch.setattr(bc, "paired_sweep", lambda e, a, m: (rounds, [99.0]))
+    monkeypatch.setattr(bc, "free_physical_gb", lambda: 32.0)
+    monkeypatch.setattr(bc.be, "n_ctx", lambda b: 4096)
+    monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(sys, "argv",
+                        ["bench_contention.py", "--repeat", "1", "--cool-floor", "0",
+                         "--npu-weights-gb", "2.3", "--gpu-weights-gb", "2.32",
+                         "--peak-bw-gbs", "135.2"])
+    assert bc.main() == 0
+    out = capsys.readouterr().out
+    assert "SUSPECT" in out
+    # Not merely printed somewhere: it must survive into the warnings block,
+    # which is what a reader skimming the tail of a long run actually sees.
+    assert out.index("SUSPECT") < len(out)
+    assert "!" * 10 in out, "the warnings banner must fire"
+
+
+# --- the load generator must never outlive the leg ------------------------
+
+def test_the_load_generator_is_stopped_even_when_the_leg_raises(monkeypatch):
+    """It is a live load on a SHARED box; an interrupt used to skip stop()."""
+    stopped = {"n": 0}
+
+    class FakeLoad:
+        busy = 0
+        completed = 0
+
+        def start(self):
+            pass
+
+        def stop(self):
+            stopped["n"] += 1
+
+    calls = {"n": 0}
+
+    def boom(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:          # the CONTENDED leg, generator running
+            raise KeyboardInterrupt
+        return 10.0
+
+    monkeypatch.setattr(bc, "measure", boom)
+    monkeypatch.setattr(bc.time, "sleep", lambda s: None)
+    args = types.SimpleNamespace(repeat=1, depth=250, tokens=40, timeout=60,
+                                 ramp=0, cool_floor=None)
+    engines = [("NPU", "http://a", "m"), ("GPU", "http://b", "m")]
+    with pytest.raises(KeyboardInterrupt):
+        bc.paired_sweep(engines, args, lambda o: FakeLoad())
+    assert stopped["n"] == 1, "the generator was left hammering the peer"

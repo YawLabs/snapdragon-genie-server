@@ -202,6 +202,26 @@ def decode_probe(base, model, timeout, depth=500, steps=8):
 PROBE_MAX_SHARE = 0.5
 
 
+def _probe_crosscheck(before, after, tol=1.5):
+    """What the opening and closing decode probes say about the box holding.
+
+    Split out of main() so it can be tested: it is a WARNING, and a warning
+    that silently stops firing is worse than none -- the run then looks clean
+    precisely when it is not. Both arguments are seconds per step; `after` is
+    falsy when the closing probe failed.
+    """
+    if not after:
+        return ("NOTE: the closing probe failed, so the corrections above "
+                "could not be cross-checked.")
+    a, b = 1.0 / before, 1.0 / after
+    if max(a, b) / min(a, b) > tol:
+        return ("WARNING: the decode probe read %.2f t/s before the sweep and "
+                "%.2f t/s after it -- the box did not hold, so the corrections "
+                "above are unreliable. Re-run quiet." % (a, b))
+    return ("probe before/after: %.2f / %.2f t/s -- consistent, so the "
+            "corrections above stand." % (a, b))
+
+
 def measure_prefill(base, model, target, timeout, per_step=0.0):
     r = chat(base, model, prompt_of(target), 1, timeout)
     if r is None:
@@ -388,19 +408,7 @@ def main():
             # means the box held throughout it.
             again = decode_probe(base, args.model, args.timeout,
                                  depth=min(500, depths[0]))
-            if again:
-                a, b = 1.0 / per_step, 1.0 / again
-                if max(a, b) / min(a, b) > 1.5:
-                    print("\n  WARNING: the decode probe read %.2f t/s before the "
-                          "sweep and %.2f t/s after it -- the box did not hold, so "
-                          "the corrections above are unreliable. Re-run quiet."
-                          % (a, b), flush=True)
-                else:
-                    print("\n  probe before/after: %.2f / %.2f t/s -- consistent, "
-                          "so the corrections above stand." % (a, b), flush=True)
-            else:
-                print("\n  NOTE: the closing probe failed, so the corrections "
-                      "above could not be cross-checked.", flush=True)
+            print("\n  %s" % _probe_crosscheck(per_step, again), flush=True)
 
     if not args.prefill_only:
         print("\nDECODE (delta of N-token vs 1-token run at the same depth)", flush=True)

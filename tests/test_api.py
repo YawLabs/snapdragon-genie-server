@@ -6,6 +6,7 @@ real mid-generation client disconnect is far harder than simulating a write
 that fails.
 """
 
+import io
 import json
 import os
 import socket
@@ -267,3 +268,186 @@ def test_port_in_use_probes_loopback_for_a_wildcard_host(gs):
         assert gs.port_in_use("", port) is True
     finally:
         srv.close()
+
+
+# --- /props is the field a client actually plans against ------------------
+# Getting it wrong is not cosmetic: typed sizes its per-turn token budget and
+# its compaction threshold from n_ctx, so a wrong window means it never
+# suggests /compact and overruns the model instead. This repo has already had
+# /props report 4096 while the HTP had allocated 8192 (two servers, one port),
+# and a whole table of measurements was filed against the wrong bundle.
+
+def _get(gs, path):
+    h = object.__new__(gs.Handler)
+    h.path = path
+    h.wfile = Wire()
+    sent = {}
+    h.send_response = lambda code: sent.setdefault("code", code)
+    h.send_header = lambda *a, **k: None
+    h.end_headers = lambda: None
+    h.do_GET()
+    return sent.get("code"), json.loads(h.wfile.text())
+
+
+def test_props_reports_the_window_the_bundle_was_compiled_with(gs):
+    gs._CONTEXT_SIZE = 8192
+    code, body = _get(gs, "/props")
+    assert code == 200
+    assert body["default_generation_settings"]["n_ctx"] == 8192
+
+
+def test_props_omits_model_path(gs):
+    # typed checks model_path FIRST, so emitting it would take precedence and
+    # display the bundle directory -- disagreeing with the name /health and
+    # /v1/models already report. One name everywhere beats a detailed one in
+    # a single place.
+    _code, body = _get(gs, "/props")
+    assert "model_path" not in body
+
+
+def test_props_claims_no_modality_it_does_not_have(gs):
+    # Absence reads as text-only, which is the truth for this bundle.
+    _code, body = _get(gs, "/props")
+    assert "modality" not in body
+
+
+def test_props_names_the_same_model_as_the_other_endpoints(gs):
+    _code, props = _get(gs, "/props")
+    _code, health = _get(gs, "/health")
+    _code, models = _get(gs, "/v1/models")
+    assert props["model_alias"] == health["model"] == models["data"][0]["id"]
+
+
+def test_an_unknown_path_404s_rather_than_guessing(gs):
+    code, body = _get(gs, "/v1/completions")
+    assert code == 404
+    assert body["error"]["type"] == "invalid_request_error"
+
+
+# --- the stream's disconnect latch ----------------------------------------
+# Once a write raises, every later write must be skipped. Re-raising on a dead
+# socket is what handle_one_request exists to suppress, and the usage frame and
+# [DONE] are written from a different code path than the token frames.
+
+def test_a_dead_stream_stops_writing_entirely(gs, handler):
+    """Counts write ATTEMPTS, not resulting frames.
+
+    Asserting on sse_frames() cannot see this: a write to a dead Wire raises
+    and produces no frame whether the latch suppressed it or it was attempted
+    and failed. Both look identical in the output, so that assertion passes
+    even with the latch removed -- a check whose negative result carries no
+    information, which is the exact failure this suite keeps finding
+    elsewhere. `writes` is the signal that CAN discriminate: once the client
+    is gone the count must stop climbing.
+    """
+    gs.ENGINE = StubEngine(chunks=["tok"] * 50)
+    h = handler(fail_after=1)
+    h._stream("prompt", 100, "cid", 0, include_usage=True)
+    # One successful write, one that raised and set the latch, nothing after.
+    assert h.wfile.writes == 2, (
+        "wrote %d times to a socket known to be gone -- the latch is not "
+        "holding" % h.wfile.writes)
+
+
+def test_a_healthy_stream_writes_every_frame(gs, handler):
+    # The counterpart: the latch must not suppress on a LIVE connection.
+    gs.ENGINE = StubEngine(chunks=["a", "b", "c"])
+    h = handler()
+    h._stream("prompt", 100, "cid", 0, include_usage=True)
+    assert h.wfile.writes >= 7, "role + 3 tokens + finish + usage + [DONE]"
+
+
+def test_a_dead_stream_emits_no_usage_frame(gs, handler):
+    gs.ENGINE = StubEngine(chunks=["a", "b", "c"])
+    h = handler(fail_after=1)
+    h._stream("prompt", 100, "cid", 0, include_usage=True)
+    assert not [f for f in h.wfile.sse_frames() if f.get("usage")], \
+        "usage was written to a socket already known to be gone"
+
+
+def test_a_dead_stream_emits_no_done_sentinel(gs, handler):
+    gs.ENGINE = StubEngine(chunks=["a", "b", "c"])
+    h = handler(fail_after=1)
+    h._stream("prompt", 100, "cid", 0, include_usage=True)
+    assert "[DONE]" not in h.wfile.text()
+
+
+def test_a_live_stream_still_gets_both(gs, handler):
+    # The latch must not be so eager that it fires on a healthy stream.
+    gs.ENGINE = StubEngine(chunks=["a", "b"])
+    h = handler()
+    h._stream("prompt", 100, "cid", 0, include_usage=True)
+    assert [f for f in h.wfile.sse_frames() if f.get("usage")]
+    assert "[DONE]" in h.wfile.text()
+
+
+def test_a_healthy_stream_that_was_not_asked_for_usage_gets_none(gs, handler):
+    # Clients that did not opt in must see a byte-identical stream to before.
+    gs.ENGINE = StubEngine(chunks=["a", "b"])
+    h = handler()
+    h._stream("prompt", 100, "cid", 0, include_usage=False)
+    assert not [f for f in h.wfile.sse_frames() if f.get("usage")]
+    assert "[DONE]" in h.wfile.text()
+
+
+# --- the single-flight permit must always come back -----------------------
+# A leaked permit is unrecoverable without a restart: the server answers 429
+# forever while completely idle, which reads externally as "the NPU is busy"
+# and would send the next investigator hunting a contention problem that does
+# not exist.
+
+def _post(gs, handler_factory, payload, path="/v1/chat/completions"):
+    h = handler_factory()
+    h.path = path
+    body = json.dumps(payload).encode()
+    h.headers = {"Content-Length": str(len(body))}
+    h.rfile = io.BytesIO(body)
+    h.do_POST()
+    return h
+
+
+def test_the_inflight_permit_is_released_when_the_generator_raises(gs, handler):
+    def boom(req):
+        raise RuntimeError("engine exploded mid-turn")
+
+    gs.Handler._openai_chat = lambda self, req: boom(req)
+    before = gs._INFLIGHT._value
+    with pytest.raises(RuntimeError):
+        _post(gs, handler, {"messages": [{"role": "user", "content": "hi"}]})
+    assert gs._INFLIGHT._value == before, \
+        "a leaked permit means 429-forever on an idle server"
+
+
+def test_the_permit_is_released_on_the_ordinary_path(gs, handler):
+    gs.Handler._openai_chat = lambda self, req: None
+    before = gs._INFLIGHT._value
+    _post(gs, handler, {"messages": [{"role": "user", "content": "hi"}]})
+    assert gs._INFLIGHT._value == before
+
+
+def test_a_shed_request_does_not_release_a_permit_it_never_took(gs, handler):
+    # Over-releasing a BoundedSemaphore raises ValueError and would take the
+    # server down on the first burst of backpressure.
+    gs.Handler._openai_chat = lambda self, req: None
+    for _ in range(gs.MAX_INFLIGHT):
+        gs._INFLIGHT.acquire()
+    h = _post(gs, handler, {"messages": [{"role": "user", "content": "hi"}]})
+    assert json.loads(h.wfile.text())["error"]["type"] == "overloaded_error"
+    for _ in range(gs.MAX_INFLIGHT):
+        gs._INFLIGHT.release()          # must not raise
+
+
+def test_a_refused_tool_request_never_queues_behind_a_generation(gs, handler):
+    # Refusing costs no NPU time, so it is checked BEFORE the lock.
+    gs.TOOLS_OK = False
+    for _ in range(gs.MAX_INFLIGHT):
+        gs._INFLIGHT.acquire()
+    try:
+        h = _post(gs, handler, {"messages": [{"role": "user", "content": "hi"}],
+                                "tools": [{"type": "function"}]})
+        body = json.loads(h.wfile.text())
+        assert "tool calling is not supported" in body["error"]["message"], \
+            "a full queue must not turn a 400 into a 429"
+    finally:
+        for _ in range(gs.MAX_INFLIGHT):
+            gs._INFLIGHT.release()
