@@ -29,7 +29,7 @@ The Genie bundle and the QAIRT 2.45 runtime are large external artifacts and are
 extracted them (edit the defaults in `run-genie-server.ps1`, or set the env vars).
 
 ```powershell
-$env:GENIE_BUNDLE_DIR = "...\qwen3_4b-genie-w4a16-qualcomm_snapdragon_x_elite"
+$env:GENIE_BUNDLE_DIR = "...\qwen3_4b-genie-w4a16-x-elite-ctx8192-multi"
 $env:GENIE_SDK_DIR    = "...\qairt\2.45.0.260326"
 $env:GENIE_PORT       = "8123"    # 8080 often collides with a llama-server
 python src\genie_server.py
@@ -59,7 +59,7 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 
 | var | default | meaning |
 |---|---|---|
-| `GENIE_BUNDLE_DIR` | scratchpad 4B bundle | dir with genie_config.json + part*_of_*.bin + tokenizer.json |
+| `GENIE_BUNDLE_DIR` | the 8192 multi-length bundle | dir with genie_config.json + part*_of_*.bin + tokenizer.json. **Prefer a MULTI-length bundle** -- check `genie.context_lengths` in its metadata.json; a single-length one is 2-3x slower on short prompts. |
 | `GENIE_SDK_DIR` | scratchpad 2.45 SDK | QAIRT 2.45 root (lib/aarch64-windows-msvc, lib/hexagon-v*) |
 | `GENIE_HEXAGON_ARCH` | unset | pin one skel arch (`v81`); default offers all |
 | `GENIE_SUMMARIZE_EVICTED` | 1 | 0 disables summarising evicted turns (plain drop) |
@@ -308,16 +308,40 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   36-44 MB each. Extra compiled graphs, only where context-dependent attention
   lives, sharing one copy of the weights.
 
-  **A mechanism was refuted here and I over-extended the refutation.** The
-  obvious reading -- several graphs, smallest-that-fits, switching at the
-  advertised boundaries -- predicts step changes. A targeted sweep either side
-  of the 512 boundary (requested depths 440 / 470 / 490 / 510 / 540, where the
-  switch would have to land between 490 and 510) shows a smooth
-  -2.2% / -1.7% / -2.1% / -4.1% slide with no step. That correctly kills
-  discrete step-switching. It does NOT license the conclusion this file drew
-  from it, that multi-length export buys nothing -- the cost is fill-
-  proportional and smooth, not stepped, and it is worth 2-3x at shallow depth.
-  How it is smooth remains unexplained.
+  **MECHANISM, read off the artifact rather than inferred from timings.**
+  `qnn-context-binary-utility --context_binary <part>.bin` dumps the graphs
+  compiled into a context binary, and it is exactly smallest-that-fits graph
+  selection:
+
+  | bundle | graphs in part2 | compiled context lengths |
+  |---|---|---|
+  | single-length 8192 | 2 | `[8192]` |
+  | multi-length 8192 | 10 | `[512, 1024, 2048, 4096, 8192]` |
+  | 4096 prebuilt | 10 | `[512, 1024, 2048, 3072, 4096]` |
+
+  Named `prompt_ar128_cl<N>` and `token_ar1_cl<N>` -- one prefill and one
+  decode graph per compiled length. A single-length bundle has one pair and so
+  runs every token against its full window; a multi-length bundle has five and
+  runs against the smallest that fits. That is the whole effect, and it is why
+  `metadata.json` cannot show it: both bundles declare the SAME 28 inputs, 25
+  outputs and 8191 KV shape, identical byte for byte apart from
+  `genie.context_lengths`. The extra graphs are inside the binary.
+
+  **I refuted this mechanism earlier and the refutation was wrong.** A targeted
+  sweep either side of the 512 boundary showed a smooth slide with no step, and
+  I read that as killing graph selection. The sweep was mis-targeted: the graph
+  must hold prompt AND generated tokens, so with `--tokens 60` the points at
+  requested depths 440 / 470 / 490 / 510 / 540 landed at 496 / 525 / 545 / 565
+  / 595 total -- four of the five inside ONE graph (cl1024). It measured within
+  a plateau and found it flat, which is what a plateau is. The single crossing
+  it did contain, 440 to 470, showed -2.2% against an expected -7.9%, inside a
+  run whose noise was 0.53 t/s.
+
+  The general lesson is worth more than the finding: **a boundary test has to
+  account for everything that moves the boundary.** I placed the depths against
+  the prompt length and forgot the generation, so the experiment I ran was not
+  the experiment I designed -- and it returned a clean, confident, wrong
+  answer.
 
   Practical upshot, revised: **always export with several `--context-lengths`,
   and then 8192 is the sweet spot.** The window tax as measured above is a

@@ -384,11 +384,22 @@ no KV) +0.2 MB, parts 2-4 +36-44 MB each.
 
 So the "window tax" is a property of SINGLE-LENGTH exports, not of Genie or the HTP.
 
-A mechanism was refuted on the way and the refutation was over-extended, which is worth recording
-because the conclusion sat in three docs for several hours. Discrete smallest-that-fits graph switching
-predicts steps; a targeted sweep across the 512 boundary showed a smooth slide with none, correctly
-killing that mechanism. It does not follow that multi-length export buys nothing -- the cost is
-fill-proportional and smooth rather than stepped. Refuting a mechanism is not refuting an effect.
+**Mechanism settled from the artifact, 2026-08-24:** it IS smallest-that-fits graph selection.
+`qnn-context-binary-utility --context_binary part2_of_4.bin` shows the single-length 8192 bundle
+carrying 2 graphs (`prompt_ar128_cl8192`, `token_ar1_cl8192`) and the multi-length one carrying 10
+(`prompt_ar128_cl{512,1024,2048,4096,8192}` plus the matching `token_ar1_cl*`). The 4096 prebuilt
+likewise carries 10. One prefill and one decode graph per compiled length; a single-length bundle runs
+every token against its full window.
+
+`metadata.json` cannot reveal this -- the two 8192 bundles are byte-identical there apart from
+`genie.context_lengths`, both declaring 28 inputs, 25 outputs and an 8191 KV shape.
+
+I refuted this mechanism earlier on a mis-targeted experiment, and the way it failed is the durable
+part. A graph must hold prompt AND generated tokens; my boundary sweep placed its depths against the
+prompt alone, so with `--tokens 60` the points at requested 440/470/490/510/540 landed at 496/525/545/
+565/595 total -- four of five inside ONE graph. It measured within a plateau, found it flat, and
+returned a clean confident wrong answer. **A boundary test must account for everything that moves the
+boundary.**
 
 Methodological note worth keeping: both of the sweeps that produced the false plateau ran
 shallow-to-deep IN ORDER, which makes any downward drift over the run indistinguishable from a depth
