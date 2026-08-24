@@ -264,6 +264,27 @@ zero `+-` format specifiers, so it cannot have emitted `18.05 +-0.13`,
 stddev column. Checkable from the source in this repo without trusting anyone's
 account.
 
+**Bundle build note that changes the NPU's numbers, 2026-08-24.** Every NPU
+figure in this brief came from a bundle exported with a SINGLE
+`--context-lengths` value, and that turns out to be the slow way to build one.
+A multi-length 8192 bundle (`--context-lengths 512,1024,2048,4096,8192`)
+measured against the single-length 8192 bundle, same model and tooling,
+interleaved over three passes:
+
+| | single-length | multi-length | ratio |
+|---|---|---|---|
+| prefill @469 | 463 t/s | **1382 t/s** | 2.98x |
+| decode @250 | 8.8 t/s | **18.2 t/s** | 2.07x |
+| decode @3300 | 8.8 | **11.5** | 1.31x |
+| decode @6000 | 8.8 | 8.1 | 0.92x |
+
+A single-length bundle pays for its whole compiled window on every token; a
+multi-length one pays for the context in use. Cost is +3.8% bundle size and
+zero extra HTP memory. **A router should therefore not assume a deep-window NPU
+endpoint is slow on short prompts** -- that depends on how the bundle was built,
+which `/props` does not expose. If it matters, measure the endpoint at two
+depths rather than inferring from `n_ctx`.
+
 *Verified, for the bare NPU figures, by a second fingerprint:* every one was
 reported as `shallow median X t/s (n=3)`. That string occurs once in this repo
 (`bench_endpoint.py:244`), inside `_verdict()`, which has exactly one call site

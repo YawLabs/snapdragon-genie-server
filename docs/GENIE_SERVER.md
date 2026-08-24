@@ -281,23 +281,53 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   is a meaningful artifact-quality difference and worth chasing, because it is
   the difference between 18.9 and 8.8 t/s on a short prompt.
 
-  **A tempting explanation was tested and REFUTED.** The prebuilt advertises
-  `genie.context_lengths = [512, 1024, 2048, 3072, 4096]` where the exports
-  advertise one value, which suggested it carries several graphs and picks the
-  smallest that fits -- and a coarse sweep did look like plateaus stepping down
-  at those boundaries. It was an artifact of the bin edges. A targeted sweep
-  either side of the 512-graph boundary (requested depths 440 / 470 / 490 /
-  510 / 540, where the switch would have to fall between 490 and 510) shows a
-  smooth -2.2% / -1.7% / -2.1% / -4.1% slide with no step at all. Discrete
-  graph selection would have produced roughly flat readings then one sharp
-  drop. Whatever the prebuilt does differently, it is not that, and exporting
-  with several `--context-lengths` values is NOT known to buy it back.
+  **ANSWERED: export with SEVERAL `--context-lengths`. It is the difference.**
+  The prebuilt advertises `genie.context_lengths = [512, 1024, 2048, 3072,
+  4096]` where a single-length export advertises one value. Building an 8192
+  bundle with `--context-lengths 512,1024,2048,4096,8192` and measuring it
+  against the single-length 8192 bundle -- same model, same tooling, same
+  window, same `poll: false`, interleaved depths over three passes:
 
-  Practical upshot: **8192 is the sweet spot for the agent workload.** It buys
-  2x the context of 4096 for about half the decode rate, which is the fair
-  exchange rate; 16384 buys 4x the context for less than a fifth. Prefer the
-  smallest window the workload needs, and prefer eviction + summarisation over
-  a bigger bundle when the history compresses -- which is what this server is
+  | | single-length 8192 | multi-length 8192 | ratio |
+  |---|---|---|---|
+  | prefill @469 | 463 t/s | **1382 t/s** | 2.98x |
+  | prefill @2657 | 461 | **997** | 2.17x |
+  | prefill @6157 | 456 | **636** | 1.40x |
+  | decode @250 | 8.8 t/s | **18.2 t/s** | 2.07x |
+  | decode @3300 | 8.8 | **11.5** | 1.31x |
+  | decode @6000 | 8.8 | 8.1 | 0.92x |
+
+  The single-length bundle is flat -- it pays for its whole compiled window on
+  every token. The multi-length bundle pays for the context actually in use,
+  matching the 4096 prebuilt at shallow depth (18.2 against 18.7) while holding
+  twice its window. **It costs +3.8% bundle size (116 MB) and ZERO extra HTP
+  memory** -- both 8192 bundles allocate exactly 646,971,904 bytes.
+
+  The size delta says where it goes: part1, the embedding lookup with no
+  attention and no KV, grows 0.2 MB; parts 2-4, the transformer layers, grow
+  36-44 MB each. Extra compiled graphs, only where context-dependent attention
+  lives, sharing one copy of the weights.
+
+  **A mechanism was refuted here and I over-extended the refutation.** The
+  obvious reading -- several graphs, smallest-that-fits, switching at the
+  advertised boundaries -- predicts step changes. A targeted sweep either side
+  of the 512 boundary (requested depths 440 / 470 / 490 / 510 / 540, where the
+  switch would have to land between 490 and 510) shows a smooth
+  -2.2% / -1.7% / -2.1% / -4.1% slide with no step. That correctly kills
+  discrete step-switching. It does NOT license the conclusion this file drew
+  from it, that multi-length export buys nothing -- the cost is fill-
+  proportional and smooth, not stepped, and it is worth 2-3x at shallow depth.
+  How it is smooth remains unexplained.
+
+  Practical upshot, revised: **always export with several `--context-lengths`,
+  and then 8192 is the sweet spot.** The window tax as measured above is a
+  property of SINGLE-LENGTH exports, not of Genie or the HTP -- a multi-length
+  bundle of the same window is 2-3x faster on short prompts for 3.8% more disk
+  and no extra HTP memory. Given that, 8192 buys 2x the context of 4096 at
+  near-parity on shallow prompts; 16384 still buys 4x the context for a large
+  decode penalty. Prefer the smallest window the workload needs, prefer a
+  multi-length build at that window, and prefer eviction + summarisation over a
+  bigger bundle when the history compresses -- which is what this server is
   built around.
 
   So a bigger bundle is a **capability tier, not an upgrade**: it buys window

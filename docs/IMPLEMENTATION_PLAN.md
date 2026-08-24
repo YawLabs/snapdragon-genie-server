@@ -373,13 +373,22 @@ tokens against 12.8 / 13.0 / 13.3 at 3300 -- a real ~30% decline tracking depth,
 self-exported bundles are flat across far wider spans. On a short prompt that is the difference between
 18.9 and 8.8 t/s, so it is worth understanding.
 
-The obvious explanation was tested and REFUTED. The prebuilt advertises five `genie.context_lengths`
-where the exports advertise one, suggesting several graphs with the smallest-that-fits selected; a
-coarse sweep even looked like plateaus stepping at those boundaries. A targeted sweep straddling the
-512-graph boundary (the switch would have to land between requested depths 490 and 510) instead showed
-a smooth -2.2% / -1.7% / -2.1% / -4.1% slide with no step. The plateaus were an artifact of where the
-bins were drawn. So a multi-length export is NOT known to recover shallow-prompt speed, and should not
-be planned around until something explains the difference.
+**ANSWERED 2026-08-24: it is the `--context-lengths` list, and a multi-length export recovers the
+speed.** An 8192 bundle built with `--context-lengths 512,1024,2048,4096,8192`, measured against the
+single-length 8192 bundle (same model, tooling, window and `poll: false`, depths interleaved over three
+passes): prefill 1382 vs 463 t/s at d469 (2.98x), decode 18.2 vs 8.8 t/s at d250 (2.07x), converging to
+parity by d6000. It matches the 4096 prebuilt at shallow depth (18.2 vs 18.7) while holding twice the
+window, for +3.8% bundle size and ZERO extra HTP memory -- both 8192 bundles allocate exactly
+646,971,904 bytes. The size delta lands only where context-dependent attention lives: part1 (embedding,
+no KV) +0.2 MB, parts 2-4 +36-44 MB each.
+
+So the "window tax" is a property of SINGLE-LENGTH exports, not of Genie or the HTP.
+
+A mechanism was refuted on the way and the refutation was over-extended, which is worth recording
+because the conclusion sat in three docs for several hours. Discrete smallest-that-fits graph switching
+predicts steps; a targeted sweep across the 512 boundary showed a smooth slide with none, correctly
+killing that mechanism. It does not follow that multi-length export buys nothing -- the cost is
+fill-proportional and smooth rather than stepped. Refuting a mechanism is not refuting an effect.
 
 Methodological note worth keeping: both of the sweeps that produced the false plateau ran
 shallow-to-deep IN ORDER, which makes any downward drift over the run indistinguishable from a depth
@@ -490,6 +499,10 @@ and record tg uplift + acceptance rate per model.
   record its wall-clock window, and two sessions measuring different engines can invalidate each other
   invisibly in BOTH directions (a resident `poll: true` genie_server cost a concurrent llama.cpp
   investigation ~2.7 cores it could not see).
+- 2026-08-24: **always pass several `--context-lengths` when exporting.** A multi-length 8192 bundle is
+  2-3x faster than a single-length one of the same window on short prompts (prefill 1382 vs 463 t/s at
+  d469; decode 18.2 vs 8.8 at d250), converging to parity deep, for +3.8% disk and no extra HTP memory.
+  The flat, window-priced behaviour documented earlier is a property of single-length exports only.
 - 2026-08-24: **8192 is the default window to target.** Measured 8.8 t/s decode (poll false) against
   18.0 at 4096 and 3.3 at 16384: 2x the context for ~half the decode rate, where 16384 gives 4x the
   context for under a fifth. The earlier hope that 8192 might be *disproportionately* cheap was a
