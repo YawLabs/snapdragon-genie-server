@@ -185,9 +185,9 @@ GPU's solo rate being identical across both configurations is what makes that
 inference a strong one, but it is not an A/B. Closing it means re-running the
 contention benchmark against a `poll: true` bundle at matched conditions (d469,
 n=3, Q4_K_M on the GPU leg via `llama-bench`, poll value recorded in the
-output, and clock-gated -- noting that the gate is currently dead code in
-`bench_contention.py` and a fix is in flight, so that run must wait for it
-rather than inherit the same thermal exposure).
+output, and clock-gated -- the harness gate was dead code until `f3cd053`, so
+that run should use the fixed version and additionally sample the clock DURING
+each measurement, not only at entry).
 
 ## Concurrency measured: 1.45x (corrected 2026-08-24)
 
@@ -200,24 +200,36 @@ because the losing one is what a bundle does out of the box.
 
 Both engines hot, same model on each leg, decode at d469, n=3.
 
-**RETRACTED 2026-08-24: these samples were NOT clock-gated.** This paragraph
-claimed every sample was gated to >=92% of base clock. The harness cannot do
-that -- `bench_contention.py` defines `wait_for_cool()` and a `cool_floor`
-parameter, but neither `measure()` call site passes it and no CLI flag can set
-it, so the gate has never executed. Verified by reading the two call sites.
+**Provenance correction 2026-08-24, stated at the size the evidence supports.**
+This paragraph credited `bench_contention.py` with gating every sample to >=92%
+of base clock. Two things are now clear and they point in different directions.
 
-That is worse than never claiming it, because a reader inherits the thermal
-artifact while believing the numbers are protected from it -- and sustained
-load drops this box to 48.9% of base clock, which is the same decay that
-manufactured a fake monotonic depth curve for two of us today.
+*Verified:* the harness cannot gate anything. It defines `wait_for_cool()` and a
+`cool_floor` parameter, but neither `measure()` call site passes it and no CLI
+flag can set it, so the gate has never executed. Confirmed by reading both call
+sites. That is a real defect for whoever runs it next -- fixed in `f3cd053`.
 
-**What it does and does not undermine.** The 1.45x-vs-0.78x comparison is a
-between-configuration difference measured the same way on both sides, and the
-GPU's solo rate is identical across them, so a shared thermal bias largely
-cancels. The absolute retention percentages below are the exposed part: they
-are single-round figures with no protection against decay within the round.
-Treat the ratio as sound and the absolutes as provisional until a gated re-run
-lands. A fix is in flight from the session that owns the harness.
+*Attested but not independently verifiable:* the session that took these numbers
+reports that the harness produced none of them -- they came from `llama-bench`
+and `bench_endpoint.py` driven by hand, each preceded by a manual shell loop
+gating on the same >=92% threshold. That is plausible and is the primary
+source's own account of its method, but it cannot be confirmed from artifacts:
+the harness writes JSON only when asked and under a caller-chosen name, so the
+absence of output files is not evidence either way, and no gating loop survives
+in shell history.
+
+**The caveat that survives either account, and the one worth encoding:** a gate
+tests the clock *before* a sample and says nothing during it. A `llama-bench -r
+3` run takes one to two minutes, and sustained load takes this box to 48.9% of
+base, so a figure can be gated at entry and still decay through its own
+measurement. That applies equally to gated and ungated runs, and equally to the
+numbers elsewhere in this brief -- the window-tax measurements were taken on a
+verified-quiet box but were never clock-gated at all.
+
+So: treat the 1.45x-vs-0.78x ratio as sound (a between-configuration difference
+measured the same way on both sides, with the GPU's solo rate identical across
+them), and treat every absolute rate here -- retention percentages included --
+as gated at entry at best and unmonitored throughout. Not wrong; bounded.
 
 **`poll: false` -- correct configuration:**
 
