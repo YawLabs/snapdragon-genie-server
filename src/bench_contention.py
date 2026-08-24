@@ -331,6 +331,15 @@ def measure(base, model, depth, tokens, timeout, label, cool_floor=None):
 def paired_sweep(engines, a, make_load):
     """Interleave solo and contended samples, and report the PAIRED ratios.
 
+    WHAT "SOLO" MEANS HERE, because it is narrower than the word suggests: the
+    other engine's SERVER is still resident, it is merely not generating -- the
+    load generator starts for the contended leg only. So this measures
+    engine-with-an-idle-peer, not engine-alone. That distinction is not
+    academic: an idle genie_server with poll:true was measured costing the GPU
+    25-32% of its throughput while answering nothing, so "solo" and "alone" can
+    differ by a third. Stopping the peer entirely is a different baseline and
+    has to be measured deliberately, not inferred from this one.
+
     The ordering is the whole point. Measuring every solo first and every
     contended second puts all of any thermal decay into the contended half,
     where it is indistinguishable from contention and biases the result the
@@ -585,7 +594,19 @@ def main():
               % total_solo)
         print("  efficiency vs additive     %7.1f%%" % (100 * agg / total_solo))
         print("  best single engine solo    %7.2f t/s" % best_solo)
-        print("  speedup vs best engine     %7.2fx" % (agg / best_solo))
+        # RATIO WITH A CONDITION, and the condition is easy to violate.
+        # Dividing by best_solo is only meaningful when the baseline is
+        # INDEPENDENT of whatever is being varied between runs. Measured
+        # 2026-08-24: comparing poll:true against poll:false, poll:true scored
+        # HIGHER on this line in all three pairs (1.57 / 1.55 / 1.79) while
+        # delivering ~20% less absolute throughput -- because poll:true also
+        # degrades the single-engine baseline it is divided by, and a smaller
+        # denominator flatters the quotient. Aggregate t/s has no such
+        # dependence, which is why it is printed first and above.
+        print("  speedup vs best engine     %7.2fx  <- compare across runs ONLY"
+              % (agg / best_solo))
+        print("     if the baseline is independent of what changed between them;")
+        print("     otherwise compare aggregate t/s, which has no denominator.")
         if agg < best_solo:
             print("\n  VERDICT: running both is SLOWER than the best engine alone.")
             print("  Route to a second engine for concurrency and failover only,")
