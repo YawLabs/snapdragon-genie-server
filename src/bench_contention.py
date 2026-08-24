@@ -59,6 +59,21 @@ refuses to run when free physical memory is below --min-free-gb rather than
 printing a caveat nobody reads. Override with --allow-loaded, which stamps
 every result LOADED so the output cannot later be mistaken for a baseline.
 
+THE GPU LEG'S -c IS A MEMORY-GATE VARIABLE, NOT ONLY A CAPACITY ONE
+
+Start llama-server with `-c 4096` and its OpenCL KV allocation is **5.76 GB**;
+at `-c 1024` the same allocation is **144 MiB**. So the window chosen for the
+GPU leg decides whether the pair fits under --min-free-gb at all -- an operator
+who picks a window for capacity reasons can find the run refused for memory
+reasons, and reach for --allow-loaded to escape a gate that was never really
+about a loaded box.
+
+Size the GPU window to the DEPTH being measured, not to the largest prompt the
+model could take: a d469 measurement with 120 decode steps fits `-c 1024` with
+room to spare. What matters is that the window is IDENTICAL across the legs
+being compared -- a contention ratio taken at two different windows is not a
+contention ratio.
+
   python src/bench_contention.py
   python src/bench_contention.py --npu http://127.0.0.1:8123 --gpu http://127.0.0.1:8080
   python src/bench_contention.py --json out.json
