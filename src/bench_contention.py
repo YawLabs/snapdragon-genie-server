@@ -113,6 +113,10 @@ def free_physical_gb():
     return None
 
 
+# Per-request cap for the background load generator (see Load.__init__).
+LOAD_REQUEST_TIMEOUT_S = 180
+
+
 class Load:
     """Saturates an endpoint in a loop until stopped.
 
@@ -124,7 +128,14 @@ class Load:
 
     def __init__(self, base, model, depth, tokens, timeout):
         self.base, self.model = base, model
-        self.depth, self.tokens, self.timeout = depth, tokens, timeout
+        self.depth, self.tokens = depth, tokens
+        # The generator does NOT inherit the measurement timeout. Its worker
+        # only tests the stop flag between requests, so a long per-request
+        # timeout makes stop() block for that long -- 1800s by default, which
+        # on the single-flight NPU is a real wait behind a queued request, not
+        # a theoretical one. It only has to produce load, so a request that
+        # overruns this is worth abandoning.
+        self.timeout = min(timeout, LOAD_REQUEST_TIMEOUT_S)
         self._stop = threading.Event()
         self._thread = None
         self.completed = 0
@@ -195,7 +206,7 @@ def wait_for_cool(floor, limit=300):
     common case, the detector catches what the gate misses.
     """
     start = time.time()
-    first = None
+    pct = None
     while time.time() - start < limit:
         pct = cpu_performance_pct()
         if pct is None:
@@ -208,8 +219,9 @@ def wait_for_cool(floor, limit=300):
                       % (pct, int(time.time() - start)), flush=True)
             return pct
         time.sleep(10)
-    print("    (WARNING: clock still %.0f%% after %ds, proceeding anyway -- "
-          "this sample is thermally suspect)" % (pct or -1, limit), flush=True)
+    print("    (WARNING: clock still %s%% after %ds, proceeding anyway -- "
+          "this sample is thermally suspect)"
+          % ("%.0f" % pct if pct is not None else "?", limit), flush=True)
     return pct
 
 
@@ -247,13 +259,21 @@ def paired_sweep(engines, a, make_load):
             print("  cpu clock %.1f%% of base" % pct, flush=True)
 
         for name, base, model in engines:
+            # cool_floor is threaded through explicitly. It used to default to
+            # None here, which silently disabled the gate this harness's whole
+            # method depends on -- the samples were taken across exactly the
+            # thermal decay wait_for_cool exists to prevent.
             solo = measure(base, model, a.depth, a.tokens, a.timeout,
-                           "%s solo" % name)
+                           "%s solo" % name, cool_floor=a.cool_floor)
 
             other = [e for e in engines if e[0] != name][0]
             gen = make_load(other)
             gen.start()
             time.sleep(a.ramp)
+            # Deliberately NOT cooled: the other engine is already hot by
+            # design, so waiting for clock recovery here would either never
+            # return or would measure a half-loaded box. The gate belongs on
+            # the SOLO leg, which is the baseline every ratio divides by.
             cont = measure(base, model, a.depth, a.tokens, a.timeout,
                            "%s vs %s busy" % (name, other[0]))
             gen.stop()
@@ -318,6 +338,11 @@ def main():
     ap.add_argument("--peak-bw-gbs", type=float, default=None,
                     help="theoretical bus bandwidth, GB/s, to compare demand "
                          "against (X1E80100 LPDDR5x-8448 x 128-bit = 135)")
+    ap.add_argument("--cool-floor", type=float, default=92.0,
+                    help="wait for the clock to recover to this %% of base "
+                         "before each SOLO sample (0 disables). Sustained load "
+                         "drops this box to 48.9%%, and an ungated sweep turns "
+                         "that decay into a fake depth curve")
     ap.add_argument("--min-free-gb", type=float, default=8.0,
                     help="refuse to run below this much free physical RAM")
     ap.add_argument("--allow-loaded", action="store_true",
@@ -408,7 +433,7 @@ def main():
         weights = {"NPU": a.npu_weights_gb, "GPU": a.gpu_weights_gb}
         for name in ("NPU", "GPU"):
             g = weights.get(name)
-            if g and name in solo:
+            if g and name in solo and name in contended:
                 bw[name] = {"solo_gbs": solo[name] * g,
                             "contended_gbs": contended[name] * g}
                 print("    %-4s %6.1f GB/s solo   %6.1f GB/s contended  "
@@ -424,7 +449,8 @@ def main():
                 print("    bus peak          %6.1f GB/s -- actual combined is "
                       "%.0f%% of peak" % (a.peak_bw_gbs,
                                           100 * tot_cont / a.peak_bw_gbs))
-                if tot_cont < 0.5 * a.peak_bw_gbs and min(ratios.values()) < 0.8:
+                if (ratios and tot_cont < 0.5 * a.peak_bw_gbs
+                        and min(ratios.values()) < 0.8):
                     warnings.append(
                         "engines lost >20%% throughput while together using only "
                         "%.0f%% of peak bandwidth -- the bottleneck is NOT the "
