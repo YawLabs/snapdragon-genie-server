@@ -213,6 +213,73 @@ base, the earlier figures at >=92%. On hardware that swings 1.64x on box state
 those are not interchangeable, so the thresholds travel with the numbers rather
 than being flattened into one table's worth of authority.
 
+*RETRACTED: the "knee at d1024 on both engines" was one thin measurement.*
+This brief claimed a non-monotonic knee seen INDEPENDENTLY on the NPU and the
+GPU, and treated the agreement as evidence against any engine-specific cause.
+The NPU half does not survive re-measurement.
+
+At n=2 it read 14.95 t/s at d1082 (14.61-15.29) against 15.40 at d1607
+(15.39-15.41) -- non-overlapping, deeper faster by 0.45 t/s. Re-run with FOUR
+interleaved passes at each depth:
+
+| depth | n | median | range | spread |
+|---|---|---|---|---|
+| d1082 | 4 | 14.96 | 14.44-15.27 | 0.83 |
+| d1607 | 4 | 14.85 | 14.44-14.95 | 0.51 |
+
+Difference **-0.11 t/s**, ranges overlapping almost entirely. There is no NPU
+knee. The original reading was one low sample at d1082 with n=2 either side.
+
+There was a prediction available before the re-run, and it was right: decode
+inside a single graph is FLAT -- the single-length 8192 bundle holds 8.77 t/s
+at d469 and 8.81 at d6157 across a 13x change in fill -- and both knee points
+sit inside `cl2048`. Within-graph flatness left the NPU no mechanism to produce
+a knee there. The structural result should have been allowed to outvote the
+thin measurement at the time.
+
+**What survives:** the GPU observation, alone, at n=3 (d1024 15.14/15.30/15.37
+against d2048 15.63/15.72/16.30), a +0.26 t/s gap on a box that swings 1.64x on
+state. Single-engine and unconfirmed. With the cross-engine agreement gone, an
+OpenCL-path explanation is back on the table rather than ruled out, and nothing
+here should be read as a property of the hardware.
+
+**The lesson is the sampling, not the knee.** "Non-overlapping ranges" with no
+n and no spread beside it is how two thin measurements come to read as a robust
+finding. Both of us wrote it that way; both figures are now stated with n and
+spread inline.
+
+Provenance: measured independently by two sessions on this box on 2026-08-24.
+Canonical write-up is **ADR 019, `17da11da` on YawLabs/typed master**
+(`docs/adr/019-local-multi-engine-routing.md`; supersedes `3c99a1af`). A second
+source recorded `t6 26.2 +-1.8, t12 11.9 +-5.2` at tg16 (d0), `30.2 / 6.2` at
+tg8, and `pp512 t12 115`, corroborating the shallow end.
+
+**The deep ranking is now measured, and it does NOT flip -- so depth is not a
+routing input for the decoder choice.** Both accelerators fall past ~600 tokens
+and they fall together. GPU, 3 passes x 5 depths, r=1 per point, every point
+gated to >=95% of base; NPU, interleaved, `poll: false`, 4096 bundle:
+
+| depth | GPU | NPU |
+|---|---|---|
+| d0 / d250 | 19.41 | 18.7 |
+| d469 | 18.06 | ~18.0 |
+| d1024 | 15.30 | -- |
+| d2048 | 15.72 | -- |
+| d3300 | 14.43 | 13.0 |
+
+Near-parallel: **GPU -26% from shallow to d3300, NPU -30%**, with the GPU a few
+percent ahead throughout. It does not hold near 18 and pull away; it tracks the
+NPU down. So the durable differentiators stay what they already were --
+**prefill (NPU ~4x) and host-load sensitivity (NPU -1.2%, GPU -64%)** -- and a
+router does not need a separate long-prompt case for choosing between them.
+
+Two caveats on that table, both worth carrying:
+
+*The two series were gated at different thresholds* -- the GPU sweep at >=95% of
+base, the earlier figures at >=92%. On hardware that swings 1.64x on box state
+those are not interchangeable, so the thresholds travel with the numbers rather
+than being flattened into one table's worth of authority.
+
 *There is a real non-monotonic knee around d1024-d1600, seen INDEPENDENTLY on
 both engines.* The GPU reads 15.30 at d1024 against 15.72 at d2048 -- deeper is
 faster, and the sample ranges do not overlap (15.14-15.37 vs 15.63-16.30). The
@@ -224,14 +291,10 @@ something common to both paths. Unexplained. It is small enough not to change
 routing, but a rate sampled at exactly d1024 will understate the surrounding
 curve on either engine.
 
-**Graph selection does NOT explain this knee**, tempting as that is now that
-the multi-length mechanism is confirmed to be exactly that. Two independent
-reasons: it reproduces on the GPU, where llama.cpp does no graph selection at
-all; and on the NPU side both points sit INSIDE one graph -- 1082 and 1607
-tokens plus ~61 generated are 1143 and 1668, and the prebuilt's boundaries are
-512 / 1024 / 2048 / 3072 / 4096, so both fall in `cl2048`. No boundary is
-crossed. Two different phenomena that both present as "depth behaves oddly
-around 1K"; do not collapse them.
+One note on the surviving GPU observation: **it cannot be graph selection**,
+tempting as that is now that the multi-length mechanism is confirmed to be
+exactly that. llama.cpp does no graph selection at all. Whatever it is, if it
+is anything, it is not the mechanism this brief documents for Genie bundles.
 
 **The poll attribution is now measured, not inferred.** Three interleaved pairs
 (legs ALTERNATING, so clock drift lands on both equally rather than separating
