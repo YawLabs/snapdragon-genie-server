@@ -194,16 +194,34 @@ def decode_probe(base, model, timeout, depth=500, steps=8):
     return r[3] / r[2]
 
 
+# A decode step legitimately costs 10-20% of the shortest prefill measurement
+# here. Anything at or past half the sample is not a plausible correction, it is
+# a probe that was taken while something else had the box -- and subtracting it
+# silently inflates the result. Measured case: a probe of 1.546 s/token against
+# a true 0.127 turned a real ~206 tok/s into a reported 549.
+PROBE_MAX_SHARE = 0.5
+
+
 def measure_prefill(base, model, target, timeout, per_step=0.0):
     r = chat(base, model, prompt_of(target), 1, timeout)
     if r is None:
         return None
-    # The 1-token cap still generates one token; remove it so this reports
-    # prefill rather than prefill-plus-a-step.
-    wall = max(1e-9, r["wall"] - per_step)
+    raw = r["wall"]
+    # The 1-token cap still generates one token, so raw wall is prefill plus a
+    # step. Removing it is right -- but only when the step is credible against
+    # THIS sample. Refusing loudly beats dividing by a floor: with per_step >=
+    # raw the old code produced 4.69e+11 tok/s, which is not a number anyone
+    # would notice was wrong in a table.
+    if per_step and per_step >= PROBE_MAX_SHARE * raw:
+        print("  prefill   prompt=%-6d wall=%7.2fs (RAW, uncorrected)  %8.1f tok/s"
+              "   <- probe %.3f s/tok is >=%.0f%% of this sample; not subtracted"
+              % (r["prompt_tokens"], raw, r["prompt_tokens"] / raw,
+                 per_step, PROBE_MAX_SHARE * 100), flush=True)
+        return r["prompt_tokens"] / raw
+    wall = raw - per_step if per_step else raw
     rate = r["prompt_tokens"] / wall
     print("  prefill   prompt=%-6d wall=%7.2fs (raw %6.2fs)  %8.1f tok/s"
-          % (r["prompt_tokens"], wall, r["wall"], rate), flush=True)
+          % (r["prompt_tokens"], wall, raw, rate), flush=True)
     return rate
 
 
@@ -250,6 +268,39 @@ def _verdict(shallow, deep):
              else "varies with depth on this engine"), flush=True)
     if len(deep) == 1:
         print("  (deep depth sampled once -- --repeat-deep raises that)", flush=True)
+
+
+DEFAULT_DEPTHS = (500, 1500, 3000, 7000, 12000)
+
+
+def resolve_depths(spec, limit, ctx, tokens):
+    """Depths to probe, given the caller's --depths and the token budget.
+
+    Lifted out of main() so it can be tested without standing up a server: the
+    health check runs first, so a bad --depths was previously unreachable from
+    any test and only discoverable by a user hitting a traceback.
+
+    Raises ValueError with a message fit to show a user; returns (depths, note)
+    where note is a line to print or None. Depths past the budget are DROPPED
+    and named -- a silently shortened sweep reads as "measured everything".
+    """
+    if not spec:
+        return ([d for d in DEFAULT_DEPTHS if d < limit] or [min(500, limit)]), None
+    try:
+        asked = [int(d) for d in spec.split(",") if d.strip()]
+    except ValueError as e:
+        raise ValueError("--depths wants comma-separated integers (%s)" % e)
+    depths = [d for d in asked if 0 < d < limit]
+    dropped = [d for d in asked if d not in depths]
+    if not depths:
+        raise ValueError("every requested depth exceeds the budget of %d tokens"
+                         % limit)
+    note = None
+    if dropped:
+        note = ("  note: dropped depth(s) %s -- past the %d-token budget "
+                "(n_ctx %s minus --tokens %d minus margin)"
+                % (", ".join(str(d) for d in dropped), limit, ctx, tokens))
+    return depths, note
 
 
 def main():
@@ -304,28 +355,21 @@ def main():
     if limit < 1:
         sys.exit("--tokens %d leaves no room in an n_ctx=%s window -- lower it"
                  % (args.tokens, ctx))
-    if args.depths:
-        asked = [int(d) for d in args.depths.split(",") if d.strip()]
-        depths = [d for d in asked if 0 < d < limit]
-        dropped = [d for d in asked if d not in depths]
-        if dropped:
-            # Named explicitly by the caller, so say what was dropped -- a
-            # silently shortened sweep reads as "measured everything".
-            print("  note: dropped depth(s) %s -- past the %d-token budget "
-                  "(n_ctx %s minus --tokens %d minus margin)"
-                  % (", ".join(str(d) for d in dropped), limit, ctx, args.tokens),
-                  flush=True)
-        if not depths:
-            sys.exit("every requested depth exceeds the budget of %d tokens" % limit)
-    else:
-        depths = [d for d in (500, 1500, 3000, 7000, 12000) if d < limit] or [min(500, limit)]
+    try:
+        depths, note = resolve_depths(args.depths, limit, ctx, args.tokens)
+    except ValueError as e:
+        sys.exit(str(e))
+    if note:
+        print(note, flush=True)
 
     print("\nwarmup", flush=True)
     chat(base, args.model, "Count from 1 to 5.", 24, args.timeout)
 
+    probe_rate = None
     if not args.decode_only:
         per_step = decode_probe(base, args.model, args.timeout,
                                 depth=min(500, depths[0]))
+        probe_rate = (1.0 / per_step) if per_step else None
         if per_step:
             print("\ndecode probe: %.3f s/token (%.2f t/s), subtracted from each "
                   "prefill below" % (per_step, 1.0 / per_step), flush=True)
@@ -364,6 +408,18 @@ def main():
         if allr:
             print("\n  decode median %.2f t/s over %d run(s)"
                   % (statistics.median(allr), len(allr)), flush=True)
+            # The prefill figures above were corrected using the probe's
+            # per-step cost. Now that real decode rates exist, say whether the
+            # probe agreed with them -- a probe taken during a blip corrupts
+            # every prefill number in the run, and nothing else would reveal it.
+            if probe_rate:
+                med = statistics.median(allr)
+                if med and (med / probe_rate > 2 or probe_rate / med > 2):
+                    print("  WARNING: the decode probe read %.2f t/s but decode "
+                          "measured %.2f t/s -- the probe was not representative, "
+                          "so treat the corrected prefill figures above as "
+                          "unreliable and re-run on a quiet box."
+                          % (probe_rate, med), flush=True)
         if args.decode_every and len([1 for _, rs in per_depth if rs]) > 2:
             print("\n  per-depth medians (look for PLATEAUS, not a smooth slope):",
                   flush=True)

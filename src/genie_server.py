@@ -1033,9 +1033,18 @@ def port_in_use(host, port, timeout=0.5):
     Checked BEFORE the model loads. The bind itself would catch this on POSIX,
     but only after 30-50s of loading a 3 GB bundle onto the HTP -- and on
     Windows it would not catch it at all.
+
+    A wildcard bind address is not a connectable one. GENIE_HOST=0.0.0.0 is the
+    documented way to expose this server beyond loopback, and connecting to
+    0.0.0.0 does not reach a listener on 127.0.0.1 -- so the check returned
+    False against a live server in exactly the configuration where the server
+    is shared. Probe loopback instead; a wildcard listener accepts there too.
     """
+    probe = host
+    if not host or host in ("0.0.0.0", "::", "*"):
+        probe = "127.0.0.1"
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        with socket.create_connection((probe, port), timeout=timeout):
             return True
     except OSError:
         return False

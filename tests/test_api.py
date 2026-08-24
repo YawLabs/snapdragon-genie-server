@@ -248,3 +248,22 @@ def test_server_does_not_share_a_live_port_on_windows(gs):
     # hijack, so the class must not set it. On POSIX it stays on, because there
     # it only means "rebind TIME_WAIT" and turning it off makes restarts fail.
     assert gs.Server.allow_reuse_address == (os.name != "nt")
+
+
+def test_port_in_use_probes_loopback_for_a_wildcard_host(gs):
+    # GENIE_HOST=0.0.0.0 is the documented way to expose this server. A
+    # wildcard address is not connectable, so checking it directly returned
+    # False against a live listener -- exactly in the configuration where the
+    # port is most likely to be contended.
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    # Backlog > 1: each probe connects and is never accepted, so a backlog of
+    # one is filled by the first check and the second gets refused -- which
+    # looks exactly like the bug under test.
+    srv.listen(8)
+    _, port = srv.getsockname()
+    try:
+        assert gs.port_in_use("0.0.0.0", port) is True
+        assert gs.port_in_use("", port) is True
+    finally:
+        srv.close()
