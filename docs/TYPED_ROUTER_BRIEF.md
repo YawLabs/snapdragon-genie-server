@@ -264,9 +264,26 @@ zero `+-` format specifiers, so it cannot have emitted `18.05 +-0.13`,
 stddev column. Checkable from the source in this repo without trusting anyone's
 account.
 
-**Bundle build note that changes the NPU's numbers, 2026-08-24.** Every NPU
-figure in this brief came from a bundle exported with a SINGLE
-`--context-lengths` value, and that turns out to be the slow way to build one.
+**Bundle build note, 2026-08-24: how a bundle was BUILT changes its numbers by
+2-3x, and `/props` does not expose it.** A Genie bundle carries
+`genie.context_lengths` in its `metadata.json`. Built with several values it
+pays for the context actually in USE; built with one it pays for its whole
+compiled window on every token. Provenance of every bundle here, since the
+distinction is invisible from the endpoint:
+
+| bundle | n_ctx | `genie.context_lengths` | |
+|---|---|---|---|
+| `...qualcomm_snapdragon_x_elite` | 4096 | `[512,1024,2048,3072,4096]` | MULTI |
+| `...x-elite-ctx8192-multi` | 8192 | `[512,1024,2048,4096,8192]` | MULTI |
+| `...x-elite-ctx8192` | 8192 | `[8192]` | single |
+| `...x-elite-ctx16384` | 16384 | `[16384]` | single |
+
+**The NPU figures in the engine table above came from the 4096 prebuilt, which
+is MULTI-length**, so they are already context-in-use numbers and are not
+understated by this. (I first told the ADR author their figures were a floor;
+that was wrong, and their bundle's own metadata says so.) The single-length
+16384 and 8192 bundles are the slow ones.
+
 A multi-length 8192 bundle (`--context-lengths 512,1024,2048,4096,8192`)
 measured against the single-length 8192 bundle, same model and tooling,
 interleaved over three passes:
