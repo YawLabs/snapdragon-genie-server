@@ -162,19 +162,30 @@ considerably harder than either accelerator, so any measured rate must carry
 the depth it was taken at.
 
 Provenance: measured independently by two sessions on this box on 2026-08-24.
-Canonical write-up is **ADR 019, `3c99a1af` on YawLabs/typed master**
-(`docs/adr/019-local-multi-engine-routing.md`). A second source recorded
-`t6 26.2 +-1.8, t12 11.9 +-5.2` at tg16 (d0), `30.2 / 6.2` at tg8, and
-`pp512 t12 115`, corroborating the shallow end.
+Canonical write-up is **ADR 019, `17da11da` on YawLabs/typed master**
+(`docs/adr/019-local-multi-engine-routing.md`; supersedes `3c99a1af`). A second
+source recorded `t6 26.2 +-1.8, t12 11.9 +-5.2` at tg16 (d0), `30.2 / 6.2` at
+tg8, and `pp512 t12 115`, corroborating the shallow end.
 
-One caveat the ADR carries and this brief should not bury: the attribution of
-the concurrency flip (0.78x -> 1.45x) to the busy-wait rests on inference, not
-on a deliberate A/B of the contention benchmark itself. The NPU-solo half IS
-directly measured -- 11.6 vs 18.0 t/s decode, and 267.1% vs 0.0% idle CPU on a
-server that had answered nothing but `/health` -- and the GPU's solo rate is
-identical across both configurations, which is what makes the inference a
-strong one. Closing it properly means re-running the contention benchmark
-against a `poll: true` bundle.
+**The deep ranking is not measured, and should not be inferred from the table
+above.** Past roughly 600 tokens BOTH accelerators fall, not just the CPU -- the
+NPU from 18.5 to 12.8 by d2657-3300, and the GPU by an unknown amount, because
+the only GPU sweep reaching d1024/d2048 was thermally confounded. So the d469
+row is the deepest point with a clean measurement behind every engine. Routing
+policy for long prompts is currently an extrapolation; treat it as one until
+somebody sweeps all three deep on a clock-gated run.
+
+One caveat on the poll finding, stated at the right size. The NPU-solo half is a
+deliberate, controlled experiment and is multi-sourced: a flip across all three
+windows gives 11.6 vs 18.0 t/s decode and 267.1% vs 0.0% idle CPU on a server
+that had answered nothing but `/health`, independently reproducing another
+session's 12.82 -> 18.55 and 2.8-core spin. What rests on inference is only the
+attribution of the CONCURRENCY flip (0.78x -> 1.45x) to the same cause -- the
+GPU's solo rate being identical across both configurations is what makes that
+inference a strong one, but it is not an A/B. Closing it means re-running the
+contention benchmark against a `poll: true` bundle at matched conditions (d469,
+n=3, Q4_K_M on the GPU leg via `llama-bench`, clock-gated, poll value recorded
+in the output).
 
 ## Concurrency measured: 1.45x (corrected 2026-08-24)
 
