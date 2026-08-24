@@ -209,14 +209,22 @@ of base clock. Two things are now clear and they point in different directions.
 flag can set it, so the gate has never executed. Confirmed by reading both call
 sites. That is a real defect for whoever runs it next -- fixed in `f3cd053`.
 
-*Attested but not independently verifiable:* the session that took these numbers
-reports that the harness produced none of them -- they came from `llama-bench`
-and `bench_endpoint.py` driven by hand, each preceded by a manual shell loop
-gating on the same >=92% threshold. That is plausible and is the primary
-source's own account of its method, but it cannot be confirmed from artifacts:
-the harness writes JSON only when asked and under a caller-chosen name, so the
-absence of output files is not evidence either way, and no gating loop survives
-in shell history.
+*Verified, for the figures carrying a stddev:* `bench_contention.py` contains
+zero `+-` format specifiers, so it cannot have emitted `18.05 +-0.13`,
+`13.47 +-0.21`, `7.27 +-0.72` or `22.57 +-6.74`. Those are `llama-bench`'s
+stddev column. Checkable from the source in this repo without trusting anyone's
+account.
+
+*Still attested, and it is a narrower set than the argument above covers:* the
+bare figures -- NPU 18.55 / 13.35 and the retention percentages -- carry no
+stddev, and the harness's own vocabulary includes
+`pair: %.2f -> %.2f t/s (keeps %.1f%%)`. So the format fingerprint does NOT
+exclude it for those, and their provenance rests on the primary source's
+account rather than on artifacts. Nor is the gating itself checkable at all:
+the harness writes JSON only when asked and under a caller-chosen name, so no
+output files existing is not evidence either way, and the Bash tool runs
+non-interactive shells that never write `~/.bash_history`, so its silence is
+another absence that proves nothing.
 
 **The caveat that survives either account, and the one worth encoding:** a gate
 tests the clock *before* a sample and says nothing during it. A `llama-bench -r
