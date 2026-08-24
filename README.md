@@ -101,6 +101,24 @@ session (placement-verified) and a CPU-EP session for each, times both, and
 prints ms/run, GOP/s, and the NPU-vs-CPU speedup. `--no-verify` downgrades the
 placement check from hard-fail to a flag in the output.
 
+## Tests
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+78 tests, ~4s, and **none of them need the NPU, a Genie bundle, or the QAIRT
+SDK** -- they drive the handlers with a fake socket and a stub engine, so they
+run anywhere.
+
+The Genie C API is deliberately NOT mocked. Two payload shapes it requires
+(`{"stop-sequence": [...]}` and `{"sampler": {...}}`) were discovered only by
+calling the real library: the obvious shapes were rejected or, worse, accepted
+and silently ignored. A mock would have encoded the wrong assumption and made
+the suite agree with a bug. Anything crossing that boundary belongs in a
+hardware-gated integration test instead.
+
 ## Results
 
 These are **single-GEMM micro-benchmarks** -- the prefill matmul primitive

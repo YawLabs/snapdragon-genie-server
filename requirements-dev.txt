@@ -1,0 +1,11 @@
+# Test-only dependencies. The server itself has NO pip dependencies -- keep it
+# that way; nothing here may become a runtime import.
+#
+# Run:  python -m pytest -q
+#
+# These tests are device-free: no NPU, no Genie bundle, no QAIRT SDK. They
+# stub the engine deliberately rather than mocking the Genie C API, because a
+# mock would encode our assumptions about that API rather than its behaviour --
+# and those assumptions have been wrong (the stop-sequence and sampler payloads
+# both needed a keyed wrapper the obvious shape did not have).
+pytest>=8.0
