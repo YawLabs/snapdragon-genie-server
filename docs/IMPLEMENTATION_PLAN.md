@@ -24,8 +24,28 @@ HTP inside `graphFinalize`/`graphExecute`, the call never returns, and:
    mid-batch CPU fallback; `supports_op` degrade only affects *future* ops.
 2. The abandoned watchdog thread stays stuck in the QNN driver and **blocks process exit**.
 
-Conclusion: a per-op-JIT design is fundamentally at odds with the HTP. The fix is not a patch
-to the eager backend -- it is a different execution model.
+Conclusion at the time: a per-op-JIT design is fundamentally at odds with the HTP, and the fix is
+not a patch to the eager backend but a different execution model.
+
+**That root cause is now contradicted (2026-08-24), and this document should not keep resting on
+it.** The session maintaining `llama-qnn-fork` traced the static-bake execute hang to **padded IO
+transfer size**, not to per-op JIT and not to a runtime version. Both QAIRT runtimes hang above a
+threshold and pass below it -- 2.34 at roughly 1.5 MB of output buffer, 2.45 lower -- and under the
+threshold both ran a model-scale bake (512x2560) that computed and matched CPU. Battery,
+runtime-as-such, a second graph in the context, prevalidation, buffer alignment, power-of-two M and
+the finalize-opt flag were each excluded by single-variable experiments.
+
+So "the HTP cannot take this execution model" overstated what was known. What was actually observed
+was a wedge at shapes that happened to exceed a padded-transfer threshold, and sizing pad buckets
+under a conservative cap appears to avoid it. A full end-to-end model run on the eager path has NOT
+yet been demonstrated, so this is a weakened premise rather than a reversed one.
+
+**The Genie decision stands, but on its other merits rather than on this one.** AOT compilation
+still removes an entire class of mid-decode failure, Genie still ships the KV cache, tokenizer,
+sampler and session save/restore, and it still offers native speculative decoding that ONNX-RT
+genai does not. None of that depended on the eager backend being unfixable. What changes is that
+"llama.cpp on the NPU is a dead end" is no longer a supported claim, and anyone reading this plan
+to decide whether to revisit that path should read the padded-IO finding first.
 
 ## The core insight (why the ONNX/Genie path is robust by design)
 
@@ -411,6 +431,10 @@ Only if you want llama.cpp's ecosystem (GGUF, samplers, grammar) on the NPU:
 - [ ] An out-of-process RPC backend: llama.cpp's `ggml-rpc` client talks to a Genie/ONNX NPU
       worker process that is killable on hang. This isolates the driver-hang risk out of the
       main process. Likely unnecessary if Phase 3 serving is enough.
+      **Weaker motivation as of 2026-08-24:** this was designed around a hang assumed to be
+      unavoidable. The hang now has a specific, avoidable cause (padded IO transfer size --
+      see "The problem this solves"), so isolating a killable worker is insurance against
+      something that can be prevented instead. Worth reassessing before building it.
 
 ---
 
