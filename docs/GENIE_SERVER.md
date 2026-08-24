@@ -201,9 +201,17 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 
   | compiled n_ctx | decode, `poll: true` | decode, `poll: false` | idle CPU |
   |---|---|---|---|
-  | 4096 | 11.6 t/s | **18.0 t/s** (+55%) | 270% -> 0% |
-  | 8192 | 7.9 t/s | **8.8 t/s** (+11%) | 270% -> 0% |
-  | 16384 | 3.2 t/s | **3.3 t/s** (+2%) | 270% -> 0% |
+  | 4096 | 11.6 t/s | **18.0 t/s** (+55%) | 267% -> 0% |
+  | 8192 | 7.9 t/s | **8.8 t/s** (+11%) | 267% -> 0% |
+  | 16384 | 3.2 t/s | **3.3 t/s** (+2%) | 267% -> 0% |
+
+  The idle figure is controlled, because the first attempt at it was not. It
+  was originally sampled just after a benchmark, which cannot distinguish an
+  idle spin from a generation still draining -- a fair objection raised against
+  it. Re-run on a server that has answered nothing but `/health`, same bundle
+  and same 29 threads, 30-second samples: **267.1%** with `poll: true`, **0.0%**
+  with `poll: false`, and **0.1%** with `poll: false` thirty seconds after a
+  generation. It is a spin, not drain.
 
   Prefill improves too (4096: 629 -> 1157 t/s median) and run-to-run noise
   drops sharply (1.85 -> 0.23 t/s at 4096). Nothing measured got worse. The
@@ -252,16 +260,29 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   window, not by how much of it is live. A 10532-token prefill on the 16k
   bundle takes **60 seconds** of wall time.
 
-  **The 4096 prebuilt is the exception and it is worth knowing why.** It is NOT
-  flat -- 18.0 t/s at 469 tokens falling to 12.5 t/s at 2657 -- while both
-  self-exported bundles are. The likely reason is that its `metadata.json`
-  advertises `genie.context_lengths = [512, 1024, 2048, 3072, 4096]` where the
-  exports advertise a single value: a prebuilt may carry SEVERAL graphs and
-  select the smallest that fits the prompt, which would make short prompts
-  genuinely cheaper. If that is right, exporting with several
-  `--context-lengths` values buys back the shallow-prompt speed without giving
-  up the deep window, and would be the best of both. **Untested** -- it is a
-  hypothesis with one supporting observation, not a measurement.
+  **The 4096 prebuilt is the exception, and the reason is still open.** It is
+  NOT flat: measured with shallow and deep runs INTERLEAVED (250, 3300, 250,
+  3300, 250, 3300) so that a drift over the run could not be mistaken for a
+  depth effect, it gives **18.9 / 18.5 / 18.7 t/s at 250 tokens against
+  12.8 / 13.0 / 13.3 at 3300** -- a real ~30% decline that tracks depth rather
+  than elapsed time. Both self-exported bundles are flat over far wider spans.
+
+  So a prebuilt appears to pay only for the context actually in use, while a
+  single-length export pays for its whole compiled window on every token. That
+  is a meaningful artifact-quality difference and worth chasing, because it is
+  the difference between 18.9 and 8.8 t/s on a short prompt.
+
+  **A tempting explanation was tested and REFUTED.** The prebuilt advertises
+  `genie.context_lengths = [512, 1024, 2048, 3072, 4096]` where the exports
+  advertise one value, which suggested it carries several graphs and picks the
+  smallest that fits -- and a coarse sweep did look like plateaus stepping down
+  at those boundaries. It was an artifact of the bin edges. A targeted sweep
+  either side of the 512-graph boundary (requested depths 440 / 470 / 490 /
+  510 / 540, where the switch would have to fall between 490 and 510) shows a
+  smooth -2.2% / -1.7% / -2.1% / -4.1% slide with no step at all. Discrete
+  graph selection would have produced roughly flat readings then one sharp
+  drop. Whatever the prebuilt does differently, it is not that, and exporting
+  with several `--context-lengths` values is NOT known to buy it back.
 
   Practical upshot: **8192 is the sweet spot for the agent workload.** It buys
   2x the context of 4096 for about half the decode rate, which is the fair

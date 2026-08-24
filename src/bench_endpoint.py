@@ -16,6 +16,14 @@ which is exactly what the existing cross-engine table is missing.
   python src/bench_endpoint.py                         # default suite
   python src/bench_endpoint.py --base http://127.0.0.1:8080
   python src/bench_endpoint.py --decode-only --tokens 200
+  python src/bench_endpoint.py --depths 250,3300,250,3300 --decode-every
+
+The last form is worth knowing. A sweep that runs shallow-to-deep IN ORDER
+cannot tell a real depth effect from the box drifting downward over the run --
+both look like "slower at depth". Repeating depths in the list interleaves
+them, so a genuine depth effect tracks the depth while drift shows up as a
+monotonic slide regardless of it. That distinction has already overturned one
+finding here.
 
 Pure stdlib, like the server. Needs a server already up; it starts nothing.
 
@@ -252,6 +260,17 @@ def main():
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--prefill-only", action="store_true")
     ap.add_argument("--decode-only", action="store_true")
+    ap.add_argument("--depths",
+                    help="comma-separated prompt depths to probe, replacing the "
+                         "default sweep. Depths that do not leave room for "
+                         "--tokens are dropped with a note rather than silently.")
+    ap.add_argument("--decode-every", action="store_true",
+                    help="measure decode at EVERY depth instead of just the "
+                         "shallowest and deepest, and print a per-depth table. "
+                         "Use this to look for STEP changes: a bundle built at "
+                         "several --context-lengths appears to carry one graph "
+                         "per length and pick the smallest that fits, which "
+                         "would show up as plateaus rather than a smooth slope.")
     args = ap.parse_args()
 
     base = args.base.rstrip("/")
@@ -277,7 +296,21 @@ def main():
     if limit < 1:
         sys.exit("--tokens %d leaves no room in an n_ctx=%s window -- lower it"
                  % (args.tokens, ctx))
-    depths = [d for d in (500, 1500, 3000, 7000, 12000) if d < limit] or [min(500, limit)]
+    if args.depths:
+        asked = [int(d) for d in args.depths.split(",") if d.strip()]
+        depths = [d for d in asked if 0 < d < limit]
+        dropped = [d for d in asked if d not in depths]
+        if dropped:
+            # Named explicitly by the caller, so say what was dropped -- a
+            # silently shortened sweep reads as "measured everything".
+            print("  note: dropped depth(s) %s -- past the %d-token budget "
+                  "(n_ctx %s minus --tokens %d minus margin)"
+                  % (", ".join(str(d) for d in dropped), limit, ctx, args.tokens),
+                  flush=True)
+        if not depths:
+            sys.exit("every requested depth exceeds the budget of %d tokens" % limit)
+    else:
+        depths = [d for d in (500, 1500, 3000, 7000, 12000) if d < limit] or [min(500, limit)]
 
     print("\nwarmup", flush=True)
     chat(base, args.model, "Count from 1 to 5.", 24, args.timeout)
@@ -298,25 +331,50 @@ def main():
 
     if not args.prefill_only:
         print("\nDECODE (delta of N-token vs 1-token run at the same depth)", flush=True)
-        shallow, deep = [], []
-        for _ in range(max(1, args.repeat)):
-            r = measure_decode(base, args.model, depths[0], args.tokens, args.timeout)
-            if r:
-                shallow.append(r)
-        if len(depths) > 1:
-            # The deep sample is the point: if decode here matches decode at the
-            # shallow depth, cost is set by the compiled window rather than by
-            # how much context is actually resident.
-            for _ in range(max(1, args.repeat_deep)):
-                r = measure_decode(base, args.model, depths[-1], args.tokens,
-                                   args.timeout)
+
+        def at(depth, reps):
+            out = []
+            for _ in range(max(1, reps)):
+                r = measure_decode(base, args.model, depth, args.tokens, args.timeout)
                 if r:
-                    deep.append(r)
-        allr = shallow + deep
+                    out.append(r)
+            return out
+
+        per_depth = []
+        if args.decode_every:
+            for d in depths:
+                per_depth.append((d, at(d, args.repeat)))
+        else:
+            per_depth.append((depths[0], at(depths[0], args.repeat)))
+            if len(depths) > 1:
+                # The deep sample is the point: if decode here matches decode at
+                # the shallow depth, cost is set by the compiled window rather
+                # than by how much context is actually resident.
+                per_depth.append((depths[-1], at(depths[-1], args.repeat_deep)))
+
+        allr = [r for _, rs in per_depth for r in rs]
         if allr:
             print("\n  decode median %.2f t/s over %d run(s)"
                   % (statistics.median(allr), len(allr)), flush=True)
-        _verdict(shallow, deep)
+        if args.decode_every and len([1 for _, rs in per_depth if rs]) > 2:
+            print("\n  per-depth medians (look for PLATEAUS, not a smooth slope):",
+                  flush=True)
+            prev = None
+            for d, rs in per_depth:
+                if not rs:
+                    continue
+                m = statistics.median(rs)
+                # Flag the jumps rather than making the reader diff the column.
+                mark = ""
+                if prev is not None:
+                    change = (m - prev) / prev * 100
+                    mark = "  %+5.1f%%%s" % (change, "  <-- step" if abs(change) >= 8 else "")
+                print("    depth %-6d %6.2f t/s%s" % (d, m, mark), flush=True)
+                prev = m
+        first = next((rs for _, rs in per_depth if rs), [])
+        last = next((rs for _, rs in reversed(per_depth) if rs), [])
+        if first is not last:
+            _verdict(first, last)
 
 
 if __name__ == "__main__":

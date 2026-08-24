@@ -366,12 +366,25 @@ the exchange rate is ordinary. **8192 is still the right default** -- 2x context
 rate is a fair trade where 16384's 4x context for under a fifth is not -- but it is a fair price, not a
 free lunch.
 
-Still open: whether a MULTI-length export (`--context-lengths 512,1024,...,8192`) recovers
-shallow-prompt speed at a deep window. The 4096 prebuilt is the only bundle here that is not flat with
-depth (18.0 t/s at 469 tokens, 12.5 at 2657) and the only one whose metadata advertises several
-context_lengths, which hints that a prebuilt carries several graphs and picks the smallest that fits.
-One observation, not a measurement. Batch it with the SSD/Eaglet recompile -- all of them need the same
-multi-hour export.
+Still open, and now better characterised: **why a prebuilt pays only for the context it uses while a
+single-length export pays for its whole window.** Measured with shallow and deep runs INTERLEAVED so a
+drift could not be mistaken for a depth effect, the 4096 prebuilt gives 18.9 / 18.5 / 18.7 t/s at 250
+tokens against 12.8 / 13.0 / 13.3 at 3300 -- a real ~30% decline tracking depth, not elapsed time. Both
+self-exported bundles are flat across far wider spans. On a short prompt that is the difference between
+18.9 and 8.8 t/s, so it is worth understanding.
+
+The obvious explanation was tested and REFUTED. The prebuilt advertises five `genie.context_lengths`
+where the exports advertise one, suggesting several graphs with the smallest-that-fits selected; a
+coarse sweep even looked like plateaus stepping at those boundaries. A targeted sweep straddling the
+512-graph boundary (the switch would have to land between requested depths 490 and 510) instead showed
+a smooth -2.2% / -1.7% / -2.1% / -4.1% slide with no step. The plateaus were an artifact of where the
+bins were drawn. So a multi-length export is NOT known to recover shallow-prompt speed, and should not
+be planned around until something explains the difference.
+
+Methodological note worth keeping: both of the sweeps that produced the false plateau ran
+shallow-to-deep IN ORDER, which makes any downward drift over the run indistinguishable from a depth
+effect. Interleaving the depths (`--depths 250,3300,250,3300,...`) separates them and is what settled
+it.
 
 ### Phase 4 -- optional llama.cpp bridge [ ]
 Only if you want llama.cpp's ecosystem (GGUF, samplers, grammar) on the NPU:
