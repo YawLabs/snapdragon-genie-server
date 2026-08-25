@@ -63,5 +63,53 @@ $arch = & python -c "import platform;print(platform.machine())"
 if ($arch -notmatch "ARM64|aarch64") {
     Write-Warning "python arch is '$arch' -- Genie.dll is aarch64; use a native ARM64 python or this will fail to load."
 }
-Write-Host "[run] starting Genie server (python $arch) on $($env:GENIE_HOST):$($env:GENIE_PORT)"
-& python (Join-Path $here "genie_server.py")
+# Supervise. A wedged HTP cannot be recovered inside the server process -- the
+# stuck call is in the driver and Python cannot reclaim a thread blocked in
+# native code -- so the server exits 75 (EX_TEMPFAIL) and asks to be replaced.
+# Without something to act on that exit, the detection is only a better error
+# message; this loop is what turns it into recovery.
+#
+# Restarts are rate-limited and capped. A device that wedges immediately on
+# every load is not going to be fixed by looping on it, and a tight restart
+# loop against a sick NPU is worse than being down: it keeps the HTP busy and
+# buries the original failure under identical log stanzas.
+$maxRestarts = if ($env:GENIE_MAX_RESTARTS) { [int]$env:GENIE_MAX_RESTARTS } else { 5 }
+# 25s, not a token pause: a force-killed server needs roughly 20s of settling
+# before the next bundle load, and restarting sooner was measured costing about
+# half of decode throughput. A restart that silently comes back at half speed
+# is a bad way to recover from an incident -- the server looks healthy and
+# every number it produces is wrong.
+$cooldown    = if ($env:GENIE_RESTART_COOLDOWN) { [int]$env:GENIE_RESTART_COOLDOWN } else { 25 }
+$restarts = 0
+
+while ($true) {
+    Write-Host "[run] starting Genie server (python $arch) on $($env:GENIE_HOST):$($env:GENIE_PORT)"
+    $started = Get-Date
+    & python (Join-Path $here "genie_server.py")
+    $code = $LASTEXITCODE
+    $ranFor = ((Get-Date) - $started).TotalSeconds
+
+    if ($code -ne 75) {
+        # Anything else is a deliberate exit: Ctrl-C, a config error the server
+        # already explained, a port collision. Restarting would just repeat it.
+        Write-Host "[run] server exited $code -- not a wedge, not restarting."
+        exit $code
+    }
+
+    # Count only restarts that follow a SHORT life. A server that ran for hours
+    # and then wedged once is a different animal from one wedging on startup,
+    # and folding them together would exhaust the budget on a healthy box that
+    # simply had a long uptime.
+    if ($ranFor -lt 120) { $restarts++ } else { $restarts = 1 }
+
+    if ($restarts -gt $maxRestarts) {
+        Write-Host "[run] the engine wedged $restarts times in quick succession."
+        Write-Host "[run] Giving up rather than looping on a sick device. The HTP"
+        Write-Host "[run] may need a reset (reboot, or reload the driver) before"
+        Write-Host "[run] this will come back. Raise GENIE_MAX_RESTARTS to retry more."
+        exit 75
+    }
+
+    Write-Host "[run] engine wedged after ${ranFor}s -- restart $restarts/$maxRestarts in ${cooldown}s."
+    Start-Sleep -Seconds $cooldown
+}

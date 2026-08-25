@@ -421,6 +421,141 @@ class ChatML:
         return "".join(parts)
 
 
+# --- supervision ------------------------------------------------------------
+# A wedged HTP is not a per-request failure and cannot be handled like one. The
+# Genie query is a blocking call into native code: when the device stops making
+# progress the calling thread is stuck inside the driver, holding the engine
+# lock, and Python cannot reclaim it -- no timeout, no interrupt, no kill. Every
+# later request then parks behind that lock until MAX_INFLIGHT is exhausted and
+# the rest get a fast 429, which is why this presents from the outside as a
+# server that 429s forever while sitting completely idle.
+#
+# Two consequences shape everything below. First, /health MUST stop saying "ok",
+# because a health check that passes while nothing can be served is worse than
+# no health check -- it is the signal a supervisor trusts to decide not to act.
+# Second, the only real recovery is a fresh process: the stuck thread cannot be
+# reclaimed in-process, so the honest move is to exit and let a supervisor
+# restart, rather than linger in a state that answers nothing.
+#
+# Detection is by STALLED PROGRESS, not elapsed time. A long generation is not
+# a wedge -- 2000 tokens at the slowest measured 3.3 t/s is ten minutes of
+# perfectly healthy work -- but it emits tokens the whole way. A wedge emits
+# nothing. So the clock that matters is time since the last token, which
+# separates "slow" from "stopped" without capping how long a request may run.
+FIRST_TOKEN_TIMEOUT_S = float(os.environ.get("GENIE_FIRST_TOKEN_TIMEOUT", "300"))
+STALL_TIMEOUT_S = float(os.environ.get("GENIE_STALL_TIMEOUT", "120"))
+WEDGE_GRACE_S = float(os.environ.get("GENIE_WEDGE_GRACE", "60"))
+FAIL_THRESHOLD = max(1, int(os.environ.get("GENIE_FAIL_THRESHOLD", "3")))
+# Exit rather than linger. 75 is EX_TEMPFAIL: "temporary failure, try again",
+# which is exactly what a supervisor should read from it.
+EXIT_WEDGED = 75
+WEDGE_EXIT = os.environ.get("GENIE_WEDGE_EXIT", "1") not in ("0", "false", "no")
+
+
+class EngineHealth:
+    """Whether the resident engine can actually serve, as a state machine.
+
+    Deliberately free of any Genie or socket dependency: it takes timestamps and
+    returns a verdict, so the escalation logic can be tested without a device.
+    The thing being guarded against is untestable by nature (a wedged driver),
+    which is exactly why the DECISION about it has to be testable.
+    """
+
+    def __init__(self, first_token_timeout=None, stall_timeout=None,
+                 grace=None, fail_threshold=None):
+        self.first_token_timeout = (FIRST_TOKEN_TIMEOUT_S if first_token_timeout
+                                    is None else first_token_timeout)
+        self.stall_timeout = (STALL_TIMEOUT_S if stall_timeout is None
+                              else stall_timeout)
+        self.grace = WEDGE_GRACE_S if grace is None else grace
+        self.fail_threshold = (FAIL_THRESHOLD if fail_threshold is None
+                               else fail_threshold)
+        self._lock = threading.Lock()
+        self.started = None        # when the in-flight generation began
+        self.last_progress = None  # when it last produced a token
+        self.tokens = 0
+        self.consecutive_failures = 0
+        self.generations = 0
+        self.stall_signalled_at = None   # when we first tried to abort a stall
+
+    def begin(self, now):
+        """A generation has the engine lock and is about to call into Genie."""
+        with self._lock:
+            self.started = now
+            self.last_progress = None
+            self.tokens = 0
+            self.stall_signalled_at = None
+
+    def progress(self, now):
+        """A token came back. Called from Genie's callback thread, so it stays
+        to a lock and two assignments -- this runs per token."""
+        with self._lock:
+            self.last_progress = now
+            self.tokens += 1
+
+    def end(self, ok, now=None):
+        with self._lock:
+            self.started = None
+            self.last_progress = None
+            self.stall_signalled_at = None
+            self.tokens = 0
+            self.generations += 1
+            self.consecutive_failures = 0 if ok else self.consecutive_failures + 1
+
+    def note_stall_signalled(self, now):
+        with self._lock:
+            if self.stall_signalled_at is None:
+                self.stall_signalled_at = now
+
+    def assess(self, now):
+        """(state, detail). One of ok / failing / stalled / wedged.
+
+        `stalled` means an abort is worth trying; `wedged` means it was tried
+        and did not take, so the process is the only thing left to replace.
+        """
+        with self._lock:
+            if self.started is None:
+                if self.consecutive_failures >= self.fail_threshold:
+                    return "failing", (
+                        "%d consecutive generation failures; the engine is "
+                        "returning errors rather than output"
+                        % self.consecutive_failures)
+                return "ok", ""
+            since_start = now - self.started
+            if self.last_progress is None:
+                waited, limit, what = since_start, self.first_token_timeout, "first token"
+            else:
+                waited, limit, what = (now - self.last_progress,
+                                       self.stall_timeout, "further token")
+            if waited <= limit:
+                return "ok", ""
+            detail = ("no %s for %.0fs (limit %.0fs) after %d token(s); the "
+                      "HTP has stopped making progress"
+                      % (what, waited, limit, self.tokens))
+            if (self.stall_signalled_at is not None
+                    and now - self.stall_signalled_at > self.grace):
+                return "wedged", detail + (
+                    "; an abort was signalled %.0fs ago and did not take"
+                    % (now - self.stall_signalled_at))
+            return "stalled", detail
+
+    def snapshot(self, now):
+        """What /health reports. Plain data, safe to call at any time."""
+        state, detail = self.assess(now)
+        with self._lock:
+            return {
+                "state": state,
+                "detail": detail,
+                "generating": self.started is not None,
+                "tokens_in_flight": self.tokens,
+                "generations": self.generations,
+                "consecutive_failures": self.consecutive_failures,
+            }
+
+
+HEALTH = EngineHealth()
+
+
 class GenieEngine:
     """Resident Genie dialog on the HTP. All NPU access serialized by a lock."""
 
@@ -584,14 +719,23 @@ class GenieEngine:
                     except Exception:
                         return
                     seen.append(t)
+                    HEALTH.progress(time.time())
                     try:
                         on_text(t)
                     except Exception:
                         pass
 
             cb = QUERY_CALLBACK(_cb)  # keep ref alive for the blocking call
-            status = self.lib.GenieDialog_query(
-                self.dialog, send.encode("utf-8"), SENTENCE_COMPLETE, cb, None)
+            # begin() only after the lock is held: a request WAITING for the
+            # engine is not a stalled one, and counting it as such would let a
+            # busy server look wedged.
+            HEALTH.begin(time.time())
+            status = GENIE_STATUS_SUCCESS
+            try:
+                status = self.lib.GenieDialog_query(
+                    self.dialog, send.encode("utf-8"), SENTENCE_COMPLETE, cb, None)
+            finally:
+                HEALTH.end(status == GENIE_STATUS_SUCCESS, time.time())
             # commit=False for internal calls (summarisation): they leave the
             # dialog holding text that is NOT the caller's conversation, so
             # recording it as the resident prefix would be a false claim. None
@@ -633,11 +777,17 @@ class GenieEngine:
                             except Exception:
                                 return
                             seen.append(t)
+                            HEALTH.progress(time.time())
                             q.put(("text", t))
 
                     cb = QUERY_CALLBACK(_cb)
-                    status = self.lib.GenieDialog_query(
-                        self.dialog, send.encode("utf-8"), SENTENCE_COMPLETE, cb, None)
+                    HEALTH.begin(time.time())
+                    status = GENIE_STATUS_SUCCESS
+                    try:
+                        status = self.lib.GenieDialog_query(
+                            self.dialog, send.encode("utf-8"), SENTENCE_COMPLETE, cb, None)
+                    finally:
+                        HEALTH.end(status == GENIE_STATUS_SUCCESS, time.time())
                     self._commit(prompt, "".join(seen),
                                  status == GENIE_STATUS_SUCCESS)
                 q.put(("done", self._finish(status)))
@@ -1367,7 +1517,20 @@ class Handler(BaseHTTPRequestHandler):
                 "model_id": MODEL_ID,
             })
         elif self.path.rstrip("/") in ("/health", "/healthz"):
-            self._json(200, {"status": "ok", "model": MODEL_ID})
+            # Reports the ENGINE's state, not the HTTP server's. Those come
+            # apart precisely when it matters: a wedged HTP leaves this process
+            # perfectly able to accept a connection and answer this endpoint
+            # while being unable to serve a single token. The old unconditional
+            # "ok" was therefore a check that could not fail -- it would have
+            # told a supervisor everything was fine for as long as the wedge
+            # lasted.
+            #
+            # This handler deliberately takes no engine lock, which is what
+            # lets it answer AT ALL during a wedge: the lock is exactly what
+            # the stuck thread is holding.
+            snap = HEALTH.snapshot(time.time())
+            code = 200 if snap["state"] == "ok" else 503
+            self._json(code, dict(snap, status=snap["state"], model=MODEL_ID))
         else:
             self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
@@ -1795,6 +1958,80 @@ class Handler(BaseHTTPRequestHandler):
         ev("message_stop", {"type": "message_stop"})
 
 
+def _exit_for_supervisor(detail):
+    """Replace this process. The only recovery available for a wedged device.
+
+    Split out and routed through watchdog's `on_wedge` so that a test can
+    substitute it. That is not a stylistic preference: an os._exit reached by
+    any path other than the injectable one takes the TEST RUNNER down with it,
+    silently and with no output, which is a genuinely nasty thing to leave in
+    the way of whoever writes the next test here.
+    """
+    if not WEDGE_EXIT:
+        return None
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # os._exit, not sys.exit: sys.exit unwinds to main's `finally`, which calls
+    # GenieDialog_free on the very driver that is already stuck -- that call can
+    # hang too, and then the process never leaves at all. There is nothing worth
+    # cleaning up in a process whose device is gone.
+    os._exit(EXIT_WEDGED)
+
+
+def watchdog(engine, health, interval=5.0, on_wedge=None, iterations=None):
+    """Escalate a stalled engine: signal an abort, then replace the process.
+
+    Runs on its own thread precisely because the request threads are the ones
+    that get stuck -- a watchdog that shared their fate could not report on it.
+
+    The escalation has two steps because they have different costs. Signalling
+    an abort is free and is the mechanism Genie provides for exactly this, so
+    it is always worth one attempt. Exiting is not free -- it drops in-flight
+    requests -- so it happens only after the abort has been given `grace`
+    seconds to take and has not.
+
+    `on_wedge` and `iterations` exist so the escalation can be tested without
+    ending the test runner's own process. Every path to the exit goes through
+    `on_wedge`, so overriding it is sufficient to make this safe in a test --
+    there is no second route that could still terminate the runner.
+    """
+    on_wedge = _exit_for_supervisor if on_wedge is None else on_wedge
+    n = 0
+    while iterations is None or n < iterations:
+        n += 1
+        time.sleep(interval)
+        now = time.time()
+        state, detail = health.assess(now)
+        if state == "ok":
+            continue
+        if state == "failing":
+            print("[genie] UNHEALTHY: %s" % detail, flush=True)
+            continue
+        if state == "stalled":
+            print("[genie] STALL: %s -- signalling abort" % detail, flush=True)
+            health.note_stall_signalled(now)
+            try:
+                engine.signal_abort()
+            except Exception as e:
+                print("[genie] abort signal failed: %s" % e, flush=True)
+            continue
+        # wedged
+        print("[genie] WEDGED: %s" % detail, flush=True)
+        print("[genie] The engine cannot be recovered in this process: the "
+              "stuck call is inside the Genie driver, holding the engine lock, "
+              "and Python cannot reclaim a thread blocked in native code. "
+              "Exiting %d so a supervisor restarts a clean process. "
+              "(GENIE_WEDGE_EXIT=0 to stay up and keep reporting 503.)"
+              % EXIT_WEDGED, flush=True)
+        result = on_wedge(detail)
+        # Only reached when the exit was declined (GENIE_WEDGE_EXIT=0, or a
+        # test's stand-in). Keep watching and keep reporting 503 rather than
+        # spinning silently on a dead device.
+        if result is not None:
+            return result
+    return None
+
+
 def main():
     global ENGINE, TEMPLATE, TOOLS_OK
     # Before the model load, not after: loading is 30-50s of work, and finding
@@ -1830,6 +2067,15 @@ def main():
           ("enabled (<tool_call> in bundle vocab)" if TOOLS_OK
            else "unsupported by this bundle -- requests with `tools` get a 400"),
           flush=True)
+    print("[genie]   supervision: /health reports engine state and 503s when it "
+          "cannot serve. A stall (no first token in %.0fs, or no further token "
+          "in %.0fs) is aborted; if that does not take within %.0fs the process "
+          "exits %d for a supervisor to restart%s."
+          % (FIRST_TOKEN_TIMEOUT_S, STALL_TIMEOUT_S, WEDGE_GRACE_S, EXIT_WEDGED,
+             "" if WEDGE_EXIT else " -- DISABLED by GENIE_WEDGE_EXIT=0"),
+          flush=True)
+    threading.Thread(target=watchdog, args=(ENGINE, HEALTH),
+                     daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
