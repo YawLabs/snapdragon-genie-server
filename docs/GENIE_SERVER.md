@@ -67,7 +67,7 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 | `GENIE_SUMMARY_MAX_TOKENS` | 192 | cap on the retained note. Clamped at runtime to `n_ctx / 8` (floor 32) so the note cannot crowd out the window on a small-context bundle; the server logs the clamp when it bites. |
 | `GENIE_WINDOW_MARGIN` | 64 | headroom left between prompt and n_ctx |
 | `GENIE_MAX_INFLIGHT` | 2 | requests admitted at once (1 running + queue). Floored at 1 -- it cannot be disabled, since the NPU is single-flight and an unbounded setting only parks threads on the engine lock. Set 1 to protect KV reuse: two interleaved conversations share one resident KV and reset each other's prefix. |
-| `GENIE_HOST` / `GENIE_PORT` | 127.0.0.1 / 8080 | bind address |
+| `GENIE_HOST` / `GENIE_PORT` | 127.0.0.1 / **8080** | bind address. Note the launcher overrides the port: `run-genie-server.ps1` sets **8123** because 8080 usually collides with a llama-server. So the endpoint is `127.0.0.1:8123` when started the normal way, and `127.0.0.1:8080` only if you run `genie_server.py` directly. |
 | `GENIE_MODEL_ID` | qwen3-4b-npu | id reported to clients |
 | `GENIE_MAX_TOKENS` | 512 | default cap when a request omits max_tokens |
 | `GENIE_STRIP_THINK` | 0 | 1 strips `<think>...</think>` from non-streamed content |
