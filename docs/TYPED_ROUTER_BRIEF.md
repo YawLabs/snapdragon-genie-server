@@ -16,7 +16,7 @@ NPU and serves it over HTTP. It speaks both APIs typed already knows:
 | `POST /v1/messages` | Anthropic, SSE streaming, `tools`, `stop_sequences` |
 | `GET /props` | llama.cpp-shaped: `default_generation_settings.n_ctx`, `model_alias` |
 | `GET /v1/models` | superset item satisfying both OpenAI and Anthropic shapes |
-| `GET /health` | liveness only -- see the caveat below |
+| `GET /health` | **engine** state. 200 = can generate; 503 + `state` (`failing` / `stalled` / `wedged`) + `detail` = cannot. Answers during a wedge, so it is usable as a failover signal. |
 
 Default bind is `127.0.0.1:8123`.
 

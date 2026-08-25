@@ -348,9 +348,15 @@ typed, not here**:
    `"server busy; NPU is single-flight"` once its small queue is full. It was
    not built for routing, but it is exactly what a dispatcher needs to shed to
    the next engine.
-4. Health checks that survive the HTP wedge -- `/health` answering is not
-   proof the device will execute, since `1003` fails at execute time, not at
-   load.
+4. ~~Health checks that survive the HTP wedge~~ -- **done 2026-08-24.**
+   `/health` used to be a liveness ping, and the objection here was right: it
+   answering was not proof the device would execute, since `1003` fails at
+   execute time rather than at load. It now reports engine state and returns
+   503 when the engine cannot serve, deliberately touching nothing on the
+   engine so it still answers while a wedged thread holds the lock. A stall is
+   aborted; if that does not take, the process exits 75 and the launcher
+   restarts it. A dispatcher can treat 503 as "shed to another engine" and 200
+   as a real capability claim.
 
 ## Answered: does concurrent GPU + NPU inference hold up?
 

@@ -25,16 +25,30 @@ bundle running on the Snapdragon X Elite NPU (Hexagon v73). The model is loaded
 ## Run
 
 The Genie bundle and the QAIRT 2.45 runtime are large external artifacts and are
-**not** in this repo -- point `GENIE_BUNDLE_DIR` / `GENIE_SDK_DIR` at wherever you
-extracted them (edit the defaults in `run-genie-server.ps1`, or set the env vars).
+**not** in this repo. The normal way to run is the launcher, which finds them
+itself -- it looks for a `genie-npu` directory beside this repo holding
+`bundles/` and `qairt/`, and picks the newest QAIRT under it:
 
 ```powershell
+powershell -File src\run-genie-server.ps1
+```
+
+That serves on `127.0.0.1:8123`, and supervises: see Supervision below.
+
+If the artifacts live elsewhere, point `GENIE_NPU_ROOT` at the directory
+holding them, or set the two paths directly. The launcher checks both exist
+before the ~10s model load and exits naming what it tried, rather than failing
+deep inside the server:
+
+```powershell
+$env:GENIE_NPU_ROOT = "D:\genie-npu"
+# or individually:
 $env:GENIE_BUNDLE_DIR = "...\qwen3_4b-genie-w4a16-x-elite-ctx8192-multi"
 $env:GENIE_SDK_DIR    = "...\qairt\2.45.0.260326"
-$env:GENIE_PORT       = "8123"    # 8080 often collides with a llama-server
-python src\genie_server.py
-# or: powershell -File src\run-genie-server.ps1
 ```
+
+Running `python src\genie_server.py` directly works too, but then nothing
+supervises it and the port defaults to 8080 rather than 8123.
 
 Startup prints `model resident on HTP in <N>s` then the endpoint URL. Load is
 ~30-50s cold and ~7-8s once the 3 GB of context binaries are in the OS page
@@ -48,7 +62,17 @@ the resident model.
   ChatML template is taken from the bundle's own
   `metadata.json` chat_template.
 - `GET /v1/models` -- lists the served model id (`GENIE_MODEL_ID`).
-- `GET /health` -- liveness.
+- `GET /health` -- **engine** state, not process liveness. `200` when the
+  server can actually generate; `503` with a `state` of `failing`, `stalled` or
+  `wedged` when it cannot. The body carries `detail` (why), `generating`,
+  `tokens_in_flight`, `generations` and `consecutive_failures`.
+
+  The distinction is the entire point: a wedged HTP leaves this process
+  perfectly able to accept a connection and answer this endpoint while unable
+  to serve a single token, so a plain liveness ping reports healthy for as long
+  as the outage lasts. The handler touches nothing on the engine, which is what
+  lets it answer *during* a wedge -- the engine lock is exactly what the stuck
+  thread is holding.
 
 ```bash
 curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/json" \
@@ -69,9 +93,55 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 | `GENIE_MAX_INFLIGHT` | 2 | requests admitted at once (1 running + queue). Floored at 1 -- it cannot be disabled, since the NPU is single-flight and an unbounded setting only parks threads on the engine lock. Set 1 to protect KV reuse: two interleaved conversations share one resident KV and reset each other's prefix. |
 | `GENIE_HOST` / `GENIE_PORT` | 127.0.0.1 / **8080** | bind address. Note the launcher overrides the port: `run-genie-server.ps1` sets **8123** because 8080 usually collides with a llama-server. So the endpoint is `127.0.0.1:8123` when started the normal way, and `127.0.0.1:8080` only if you run `genie_server.py` directly. |
 | `GENIE_MODEL_ID` | qwen3-4b-npu | id reported to clients |
+| `GENIE_NPU_ROOT` | `../genie-npu` beside this repo | where `bundles/` and `qairt/` live. Set this instead of the two paths above; the newest `qairt/*` is picked automatically. |
+| `GENIE_FIRST_TOKEN_TIMEOUT` | 300 | seconds a generation may run before its first token before being called stalled. Generous because prefill at depth legitimately takes tens of seconds. |
+| `GENIE_STALL_TIMEOUT` | 120 | seconds between tokens before being called stalled. This is the real wedge signal -- see Supervision. |
+| `GENIE_WEDGE_GRACE` | 60 | seconds an abort gets to take effect before the stall is escalated to a wedge |
+| `GENIE_FAIL_THRESHOLD` | 3 | consecutive failed generations before `/health` reports `failing` |
+| `GENIE_WEDGE_EXIT` | 1 | `0` keeps the process up on a wedge (it stays 503) instead of exiting for a supervisor |
+| `GENIE_MAX_RESTARTS` | 5 | launcher only: rapid restarts before it gives up |
+| `GENIE_RESTART_COOLDOWN` | 25 | launcher only: seconds between restarts. Not arbitrary -- a force-killed server needs roughly 20s of settling, and restarting sooner was measured costing about half of decode throughput. |
 | `GENIE_MAX_TOKENS` | 512 | default cap when a request omits max_tokens |
 | `GENIE_STRIP_THINK` | 0 | 1 strips `<think>...</think>` from non-streamed content |
 | `GENIE_THINKING` | 1 | 0 suppresses Qwen3's reasoning block server-wide. Per request: `chat_template_kwargs.enable_thinking`, `reasoning_effort:"none"`, or `thinking:{"type":"disabled"}` |
+
+## Supervision: what happens when the HTP wedges
+
+The Genie query is a blocking call into native code. When the device stops
+making progress the calling thread is stuck inside the driver holding the
+engine lock, and Python cannot reclaim a thread blocked in native code -- no
+timeout, no interrupt, no kill. Later requests park behind that lock until
+`GENIE_MAX_INFLIGHT` is exhausted and the rest get a fast `429`, so from
+outside this looks like a server that 429s forever while sitting idle.
+
+Detection is by **stalled progress, not elapsed time**. A long generation is
+not a wedge -- 2000 tokens at the slowest measured 3.3 t/s is ten minutes of
+healthy work -- but it emits tokens the whole way, and a wedge emits nothing.
+Time since the last token separates slow from stopped without capping how long
+a request may legitimately run.
+
+Escalation, in order:
+
+1. **Stalled** -- no first token in `GENIE_FIRST_TOKEN_TIMEOUT`, or no further
+   token in `GENIE_STALL_TIMEOUT`. `/health` goes 503; the server signals
+   Genie's abort, which is free and is the mechanism provided for exactly this.
+   On a healthy device this is usually where it ends: forced against a live
+   generation, the abort landed and the engine returned to `ok` on its own.
+2. **Wedged** -- the abort did not take within `GENIE_WEDGE_GRACE`. Nothing
+   in-process can help, so the server exits **75** (`EX_TEMPFAIL`) and asks to
+   be replaced. `GENIE_WEDGE_EXIT=0` keeps it up and reporting 503 instead.
+3. **Restarted** -- `run-genie-server.ps1` restarts on exit 75 and only on 75;
+   any other code is a deliberate exit (Ctrl-C, a config error it already
+   explained) and repeating it would be pointless. Restarts are capped and
+   rate-limited, because looping on a device that wedges every time keeps the
+   HTP busy and buries the original failure under identical log stanzas. Only
+   restarts following a short life count toward the cap, so a server that ran
+   for hours and wedged once does not share a budget with one wedging at
+   startup.
+
+Separately, `consecutive_failures` reaching `GENIE_FAIL_THRESHOLD` reports
+`failing` on `/health` **without** restarting: the engine is answering, just
+badly, and restarting on that would turn a bad bundle into a crash loop.
 
 ## Notes / limitations
 

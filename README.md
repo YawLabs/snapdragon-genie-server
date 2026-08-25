@@ -108,7 +108,7 @@ placement check from hard-fail to a flag in the output.
 
 ```powershell
 python src\bench_endpoint.py                          # prefill + decode sweep
-python src\bench_endpoint.py --base http://127.0.0.1:8080 --decode-only
+python src\bench_endpoint.py --base http://127.0.0.1:8123 --decode-only
 ```
 
 It reports prefill and decode in tokens/sec at several context depths. Decode
@@ -132,9 +132,20 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-78 tests, ~4s, and **none of them need the NPU, a Genie bundle, or the QAIRT
+Lint with the same config CI would have used, if there were CI:
+
+```powershell
+python -m ruff check src tests
+```
+
+203 tests, ~2s, and **none of them need the NPU, a Genie bundle, or the QAIRT
 SDK** -- they drive the handlers with a fake socket and a stub engine, so they
 run anywhere.
+
+That device-free property is load-bearing rather than incidental, and it has a
+cost worth stating: the ctypes bindings and every Genie call are NOT covered.
+A regression there is invisible until the server is actually started, so
+starting it remains part of checking a change that touches the engine.
 
 The Genie C API is deliberately NOT mocked. Two payload shapes it requires
 (`{"stop-sequence": [...]}` and `{"sampler": {...}}`) were discovered only by
@@ -266,7 +277,7 @@ src/bench.py              CLI GEMM benchmark (FP16 / INT8 QDQ / prompt-length sw
 src/genie_server.py       OpenAI + Anthropic HTTP server over a resident Genie bundle
 src/bench_endpoint.py     prefill/decode benchmark against any OpenAI-compatible server
 src/genie_smoke.py        minimal one-shot Genie generation, for isolating server bugs
-src/run-genie-server.ps1  launcher; edit the bundle/SDK paths at the top
+src/run-genie-server.ps1  launcher + supervisor; finds the bundle/SDK itself
 tests/                    78 device-free tests (no NPU, no bundle, no SDK needed)
 
 docs/GENIE_SERVER.md      the server: endpoints, env vars, and its measured limits
