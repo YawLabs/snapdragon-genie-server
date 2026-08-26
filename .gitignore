@@ -17,5 +17,9 @@ __pycache__/
 *.gguf
 models/
 
+# coverage (pytest --cov writes this; the repo has no CI to collect it)
+.coverage
+htmlcov/
+
 # logs / scratch
 *.log

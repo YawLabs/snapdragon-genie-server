@@ -562,3 +562,229 @@ def test_the_genie_block_is_additive_not_a_replacement(gs):
     assert body["default_generation_settings"]["n_ctx"] == gs.read_context_size()
     assert body["model_alias"] == gs.MODEL_ID
     assert "model_path" not in body and "modality" not in body
+
+
+# --- POST /v1/messages: the surface typed actually drives ------------------
+# Every load-shed branch in do_POST forks on the path, and only the OpenAI leg
+# of each was covered. docs/TYPED_ROUTER_BRIEF.md sells 429/529 as THE
+# "shed to the next engine" signal, so half of a documented contract was
+# running unverified -- and the two error envelopes are not interchangeable:
+# OpenAI is {"error": {...}}, Anthropic wraps it as {"type": "error",
+# "error": {...}}. A client reading the wrong one sees an empty error.
+
+def _post_raw(gs, handler_factory, body, path="/v1/messages"):
+    """Like _post above, but keeps the status code and takes RAW bytes.
+
+    The code is the load-shed contract (a router keys on 529, not on the
+    message), and raw bytes are the only way to reach the JSON-parse failure.
+    """
+    h = handler_factory()
+    h.path = path
+    sent = {}
+    h.send_response = lambda code: sent.setdefault("code", code)
+    h.headers = {"Content-Length": str(len(body))}
+    h.rfile = io.BytesIO(body)
+    h.do_POST()
+    return sent.get("code"), json.loads(h.wfile.text())
+
+
+def _post_json(gs, handler_factory, payload, path="/v1/messages"):
+    return _post_raw(gs, handler_factory, json.dumps(payload).encode(), path)
+
+
+def test_a_full_queue_sheds_an_anthropic_request_with_529(gs, handler):
+    # 529 is the Anthropic spelling of the 429 the OpenAI leg returns. The
+    # whole point of the code is that a router moves on to the next engine
+    # instead of failing the turn, so the body shape has to be the one that
+    # client can parse.
+    for _ in range(gs.MAX_INFLIGHT):
+        gs._INFLIGHT.acquire()
+    try:
+        code, body = _post_json(gs, handler,
+                                {"messages": [{"role": "user", "content": "hi"}]})
+    finally:
+        for _ in range(gs.MAX_INFLIGHT):
+            gs._INFLIGHT.release()          # must not raise: never acquired
+    assert code == 529
+    assert body == {"type": "error",
+                    "error": {"type": "overloaded_error",
+                              "message": "server busy; NPU is single-flight"}}
+
+
+def test_a_refused_anthropic_tool_request_uses_the_anthropic_envelope(gs, handler):
+    # The 400 that tells typed's probeLocalToolCalls to disable tools for the
+    # session. In the OpenAI envelope there is no top-level "type", so an
+    # Anthropic client reads it as an unparseable 400 and keeps sending
+    # schemas the bundle can never act on.
+    gs.TOOLS_OK = False
+    code, body = _post_json(gs, handler, {
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "read_file", "input_schema": {"type": "object"}}]})
+    assert code == 400
+    assert body["type"] == "error", "answered in the OpenAI shape"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert "tool calling is not supported" in body["error"]["message"]
+    assert gs.ENGINE.calls == []
+
+
+def test_a_full_queue_does_not_turn_the_anthropic_400_into_a_529(gs, handler):
+    # Refusing costs no NPU time, so the tools check runs BEFORE the permit.
+    # Flip the order and a busy server answers 529 -- "come back later" -- to a
+    # request that will never work, and a well-behaved router retries it
+    # forever against the one engine guaranteed to refuse it.
+    gs.TOOLS_OK = False
+    for _ in range(gs.MAX_INFLIGHT):
+        gs._INFLIGHT.acquire()
+    try:
+        code, body = _post_json(gs, handler, {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "read_file", "input_schema": {"type": "object"}}]})
+    finally:
+        for _ in range(gs.MAX_INFLIGHT):
+            gs._INFLIGHT.release()
+    assert code == 400
+    assert "tool calling is not supported" in body["error"]["message"]
+
+
+# --- _anthropic_messages, end to end ---------------------------------------
+# The Anthropic handlers were only ever driven directly, so everything the
+# entry point itself decides -- validation, the stream/complete fork, what it
+# hands the engine -- was untested on the endpoint typed actually uses.
+
+@pytest.mark.parametrize("payload", [{}, {"messages": []}])
+def test_anthropic_messages_requires_messages(gs, handler, payload):
+    # An empty turn is a client bug, and it has to say so in the envelope the
+    # client parses. It also must not reach the NPU: on a single-flight device
+    # a request that cannot succeed still costs everyone else the permit.
+    code, body = _post_json(gs, handler, payload)
+    assert code == 400
+    assert body["type"] == "error"
+    assert body["error"] == {"type": "invalid_request_error",
+                             "message": "messages required"}
+    assert gs.ENGINE.calls == []
+
+
+def test_anthropic_messages_returns_a_well_formed_message(gs, handler):
+    # The whole path in one go: request -> prompt -> engine -> message body.
+    gs.ENGINE = StubEngine(chunks=["hello"])
+    code, body = _post_json(gs, handler, {
+        "model": "npu-router-name",
+        "system": "You are a coding agent.",
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert code == 200
+    assert body["type"] == "message" and body["role"] == "assistant"
+    assert body["content"] == [{"type": "text", "text": "hello"}]
+    assert body["stop_reason"] == "end_turn"
+    assert body["id"].startswith("msg_")
+    # Echoed, not replaced with MODEL_ID: a router fanning out to several
+    # engines matches the reply to the request by the model it asked for.
+    assert body["model"] == "npu-router-name"
+    assert body["usage"]["output_tokens"] == len("hello") // 4
+    # ... and the request really reached the engine, system prompt and all.
+    assert len(gs.ENGINE.calls) == 1
+    assert "You are a coding agent." in gs.ENGINE.calls[0]["prompt"]
+
+
+@pytest.mark.parametrize("extra,expected", [
+    ({"stream": True}, "stream"),
+    ({"stream": False}, "complete"),
+    ({}, "complete"),                    # absent means non-streaming
+])
+def test_the_stream_flag_picks_the_anthropic_handler(gs, handler, extra, expected):
+    # The two paths write bodies that share nothing -- a run of SSE events
+    # against one JSON object -- so dispatching to the wrong one hands the
+    # client bytes it cannot parse at all, with a 200 on the front.
+    fired = []
+    gs.Handler._anthropic_stream = lambda self, *a, **k: fired.append("stream")
+    gs.Handler._anthropic_complete = lambda self, *a, **k: fired.append("complete")
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    payload.update(extra)
+    # _post, not _post_json: the stubs write no body to parse.
+    _post(gs, handler, payload, path="/v1/messages")
+    assert fired == [expected]
+
+
+# --- Anthropic content blocks -> ChatML ------------------------------------
+# Anthropic carries tool traffic as content BLOCKS (tool_use on assistant
+# turns, tool_result on user turns) where ChatML wants assistant tool_calls
+# and role="tool" messages. Flatten them to prose and a multi-turn tool
+# conversation replays as the model never having seen a result -- so it calls
+# the same tool again, forever, one NPU turn at a time.
+
+def test_an_anthropic_system_string_is_folded_into_the_prompt(gs):
+    # Anthropic puts the system prompt in a top-level field, not a message, so
+    # it reaches the template only if this translation moves it.
+    prompt, dropped, fits, overhead = gs._anthropic_to_prompt(
+        {"system": "You are a coding agent.",
+         "messages": [{"role": "user", "content": "hi"}]})
+    assert (dropped, fits, overhead) == (0, True, 0)
+    assert "You are a coding agent." in prompt
+
+
+def test_a_tool_result_block_becomes_a_tool_response_turn(gs):
+    # Left as a plain user turn the model reads a tool result as the human
+    # talking, which is how an agent loop starts arguing with its own output.
+    prompt, _dropped, fits, _overhead = gs._anthropic_to_prompt({"messages": [
+        {"role": "user", "content": "read a.py"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "read_file",
+             "input": {"path": "a.py"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1",
+             "content": "print(1)"}]},
+    ]})
+    assert fits
+    assert "<tool_response>\nprint(1)\n</tool_response>" in prompt
+
+
+def test_a_tool_use_block_becomes_a_tool_call_with_its_name(gs):
+    # The name is the whole payload of the replayed call -- an empty or wrong
+    # one makes the history describe a tool that was never invoked.
+    prompt, _dropped, fits, _overhead = gs._anthropic_to_prompt({"messages": [
+        {"role": "user", "content": "read a.py"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "read_file",
+             "input": {"path": "a.py"}}]},
+    ]})
+    assert fits
+    assert "<tool_call>" in prompt
+    assert '{"name": "read_file", "arguments": {"path": "a.py"}}' in prompt
+
+
+def test_anthropic_tools_reach_the_prompt_as_openai_schemas(gs):
+    # Qwen3 was trained on OpenAI-shaped function schemas inside <tools>.
+    # Anthropic's input_schema spelling is one the model has never seen, and
+    # tool-call accuracy is what pays for the difference.
+    prompt, _dropped, fits, _overhead = gs._anthropic_to_prompt(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        tools=[{"name": "read_file", "description": "Read a file",
+                "input_schema": {"type": "object",
+                                 "properties": {"path": {"type": "string"}}}}])
+    assert fits
+    assert '"type": "function"' in prompt
+    assert '"parameters": {"type": "object"' in prompt
+    assert "input_schema" not in prompt, "Anthropic's own spelling reached the model"
+
+
+# --- do_POST entry point ---------------------------------------------------
+
+def test_a_malformed_body_names_the_parse_problem(gs, handler):
+    # "bad request" on its own sends the caller auditing their JSON encoder.
+    # The parser's position is what identifies the common cause instead -- a
+    # body cut short by a dropped connection.
+    code, body = _post_raw(gs, handler, b'{"messages": [{"role": "user"')
+    assert code == 400
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["message"].startswith("bad JSON:")
+    assert "char" in body["error"]["message"], "a label with no parser detail"
+    assert gs.ENGINE.calls == []
+
+
+def test_an_unknown_post_path_404s_rather_than_guessing(gs, handler):
+    # The GET twin is covered; this one was not. 404 rather than 400 is what
+    # tells a probing client the endpoint is absent, not its request bad -- so
+    # it stops asking instead of rewriting the payload.
+    code, body = _post_json(gs, handler, {"input": "x"}, path="/v1/embeddings")
+    assert code == 404
+    assert body["error"]["type"] == "invalid_request_error"
+    assert gs.ENGINE.calls == []

@@ -266,3 +266,124 @@ def test_verdict_hint_names_the_flag_that_actually_applies(be, capsys):
 def test_verdict_hint_defaults_to_the_two_depth_flag(be, capsys):
     be._verdict([18.5], [13.0])
     assert "--repeat-deep" in capsys.readouterr().out
+
+
+# --- the N-minus-1 decode delta -------------------------------------------
+# Every decode figure this repo quotes comes out of this subtraction, and the
+# prefill correction is derived from it too. The two requests differ only in
+# the cap, so prefill, connection setup and template rendering occur in both
+# and cancel; returning the TOTALS instead would fold a full prefill into the
+# decode rate and understate it badly at depth.
+
+def _run(completion_tokens, wall, prompt_tokens=469):
+    return {"prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens, "wall": wall}
+
+
+def _stub_chat_seq(be, *results):
+    """Stub `chat` with one return value per call, recording the calls.
+
+    _delta_run's whole point is that its two requests come back DIFFERENT, so
+    the single-value _stub_chat above cannot express it.
+    """
+    calls = []
+
+    def fake(base, model, prompt, max_tokens, timeout):
+        calls.append({"prompt": prompt, "max_tokens": max_tokens})
+        return results[len(calls) - 1]
+
+    be.chat = fake
+    return calls
+
+
+def test_delta_run_returns_the_difference_not_the_totals(be):
+    # Deep prefill dominates the 1-token run: 3.00s of the 8.12s total is not
+    # decode. Reporting the totals gives 65/8.12 = 8.0 t/s for a bundle that
+    # is really doing 12.5.
+    _stub_chat_seq(be, _run(1, 3.00), _run(65, 8.12))
+    one, many, steps, secs = be._delta_run("b", "m", "p", 64, 1)
+    assert steps == 64
+    assert secs == pytest.approx(5.12, rel=1e-6)
+    assert steps / secs == pytest.approx(12.5, rel=1e-6)
+    assert secs < many["wall"], "the totals would report 8.0 t/s, a third low"
+    # measure_decode unpacks this positionally and names the depth off `many`.
+    assert one["completion_tokens"] == 1 and many["completion_tokens"] == 65
+
+
+def test_delta_run_sends_one_prompt_at_two_caps(be):
+    # The cancellation is only valid because the two requests are identical
+    # apart from the cap. A differing prompt would leave a prefill difference
+    # in the delta and nothing downstream could tell.
+    calls = _stub_chat_seq(be, _run(1, 3.00), _run(65, 8.12))
+    be._delta_run("b", "m", "PROMPT", 64, 1)
+    assert [c["max_tokens"] for c in calls] == [1, 65]
+    assert calls[0]["prompt"] == calls[1]["prompt"] == "PROMPT"
+
+
+def test_delta_run_returns_none_when_the_first_request_failed(be):
+    calls = _stub_chat_seq(be, None, _run(65, 8.12))
+    assert be._delta_run("b", "m", "p", 64, 1) is None
+    assert len(calls) == 1, "no point paying for the long run once the pair is dead"
+
+
+def test_delta_run_returns_none_when_the_second_request_failed(be):
+    # A 429 on the second leg must skip the point, not produce a delta against
+    # a missing run -- the sweep carries on around a gap.
+    _stub_chat_seq(be, _run(1, 3.00), None)
+    assert be._delta_run("b", "m", "p", 64, 1) is None
+
+
+def test_delta_run_reports_no_window_when_the_model_stopped_early(be):
+    # Both runs hit EOS at one token, so there is no decode window at all. A
+    # rate derived from a zero- or one-token difference is noise printed as a
+    # measurement.
+    _stub_chat_seq(be, _run(1, 3.00), _run(1, 3.05))
+    r = be._delta_run("b", "m", "p", 64, 1)
+    assert r is not None, "callers distinguish 'no window' from 'request failed'"
+    one, many, steps, secs = r
+    assert steps == 0 and secs == 0.0
+    assert many["prompt_tokens"] == 469, "measure_decode names the depth off this"
+
+
+def test_delta_run_reports_no_window_when_the_delta_time_is_negative(be):
+    # The long run coming back FASTER than the short one is queueing noise, not
+    # a measurement; 64 / -0.06 would print -1066 t/s.
+    _stub_chat_seq(be, _run(1, 3.00), _run(65, 2.94))
+    _, _, steps, secs = be._delta_run("b", "m", "p", 64, 1)
+    assert steps == 0 and secs == 0.0
+
+
+# --- the decode probe that feeds the prefill correction -------------------
+# This is where the per_step above comes from. It is subtracted from EVERY
+# prefill figure in a run, so a wrong value here inflates the whole table at
+# once -- and a failed probe must read as "no correction available" rather
+# than as a correction of zero-ish size.
+
+def test_decode_probe_returns_seconds_per_step(be):
+    _stub_chat_seq(be, _run(1, 0.30), _run(9, 0.74))
+    per_step = be.decode_probe("b", "m", 1, depth=500, steps=8)
+    assert per_step == pytest.approx(0.055, rel=1e-6)
+    assert per_step < 1, "seconds per step, not the 18.2 t/s reciprocal"
+
+
+def test_decode_probe_returns_none_when_the_run_failed(be):
+    be._delta_run = lambda *a, **k: None
+    assert be.decode_probe("b", "m", 1) is None
+
+
+def test_decode_probe_returns_none_when_there_was_no_decode_window(be):
+    # steps==0 is the early-EOS case above. Dividing by it raises, and any
+    # number returned here becomes a subtraction against every prefill row.
+    be._delta_run = lambda *a, **k: ({}, {}, 0, 0.0)
+    assert be.decode_probe("b", "m", 1) is None
+
+
+def test_decode_probe_value_is_in_the_units_prefill_subtracts(be):
+    # The two halves have to agree on orientation: hand measure_prefill the
+    # reciprocal (18.2) and PROBE_MAX_SHARE refuses it, so every prefill figure
+    # silently reverts to raw and reads low.
+    _stub_chat_seq(be, _run(1, 0.30), _run(9, 0.74))
+    per_step = be.decode_probe("b", "m", 1, depth=500, steps=8)
+    _stub_chat(be, wall=0.40)
+    rate = be.measure_prefill("b", "m", 469, 1, per_step=per_step)
+    assert rate == pytest.approx(469 / (0.40 - 0.055), rel=1e-6)

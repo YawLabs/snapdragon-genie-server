@@ -4,6 +4,8 @@ Every case here corresponds to something that actually broke or was actually
 ambiguous, not to a hypothetical.
 """
 
+import json
+
 import pytest
 
 TEXT_BLOCK = [{"type": "text", "text": "hello"}]
@@ -28,6 +30,22 @@ def test_content_flattener_handles_every_shape(gs):
     assert f(TEXT_BLOCK) == "hello"
     assert f([{"type": "image"}, {"type": "text", "text": "a"}]) == "a"   # image ignored
     assert f([{"type": "tool_result", "content": TEXT_BLOCK}]) == "hello"  # nested
+
+
+def test_content_flattener_accepts_bare_strings_in_the_list(gs):
+    # Some clients put BARE STRINGS in the list instead of text blocks. They
+    # are not dicts, so a flattener that only understands blocks drops them
+    # silently -- the model is then asked to answer a prompt the user's words
+    # are missing from, which reads as a bad answer rather than as a bug.
+    f = gs._content_text
+    assert f(["one ", "two"]) == "one two"
+    # A MIXED list must concatenate in the order the client sent it, not
+    # grouped by kind: reordering scrambles the sentence.
+    assert f(["A", {"type": "text", "text": "B"}, "C"]) == "ABC"
+    # ...and the ignored shapes stay ignored with a bare string beside them --
+    # the string branch must not become "stringify anything".
+    assert f(["A", {"type": "image"}, "B"]) == "AB"
+    assert f([{"type": "tool_result", "content": ["x", "y"]}]) == "xy"  # via recursion
 
 
 def test_anthropic_text_delegates_to_the_shared_flattener(gs):
@@ -73,6 +91,45 @@ def test_bare_json_call_is_accepted(gs):
 def test_text_and_call_are_split(gs):
     text, calls = gs.parse_tool_calls("Let me look.\n<tool_call>%s</tool_call>" % CALL_JSON)
     assert text == "Let me look." and calls == EXPECTED
+
+
+# OpenAI's actual wire format: `arguments` arrives as a STRING containing JSON,
+# not as an object. Built with json.dumps so the escaping is unambiguous.
+STR_ARGS_CALL = json.dumps({"name": "read_file", "arguments": '{"path": "c.yaml"}'})
+
+
+def test_string_arguments_are_parsed_into_an_object(gs):
+    # Handing the string straight back makes every client json.loads it a
+    # second time. The wrapped path and the bare-blob path do this parse in
+    # SEPARATE code, so one can be fixed and the other left behind -- both are
+    # asserted against the same EXPECTED as the object form, which is the
+    # actual contract: a client cannot tell the two wire shapes apart.
+    assert gs.parse_tool_calls("<tool_call>%s</tool_call>" % STR_ARGS_CALL)[1] == EXPECTED
+    assert gs.parse_tool_calls(STR_ARGS_CALL)[1] == EXPECTED          # bare, no tags
+    assert gs._bare_tool_calls(STR_ARGS_CALL) == EXPECTED             # and the helper itself
+
+
+def test_unparseable_string_arguments_pass_through_raw(gs):
+    # Pins what the bare `except: pass` actually does -- `arguments` comes back
+    # as the RAW STRING, so a client doing args["path"] gets TypeError, not a
+    # KeyError it could handle. Both paths behave the same. If that is ever
+    # tightened (to {}, or to refusing the call) this is the test that says so.
+    junk = json.dumps({"name": "read_file", "arguments": "path=c.yaml"})
+    raw = [{"name": "read_file", "arguments": "path=c.yaml"}]
+    assert gs.parse_tool_calls("<tool_call>%s</tool_call>" % junk)[1] == raw
+    assert gs._bare_tool_calls(junk) == raw
+
+
+def test_empty_string_arguments_stay_an_empty_string(gs):
+    # The pass-through case a WELL-FORMED client can produce, not model junk: a
+    # zero-argument call rendered as "". json.loads("") raises, so it falls
+    # through the same except and the caller gets "" where {} is what the call
+    # means -- unlike an omitted `arguments`, which the wrapped path defaults.
+    empty = json.dumps({"name": "now", "arguments": ""})
+    assert gs.parse_tool_calls("<tool_call>%s</tool_call>" % empty)[1] == [
+        {"name": "now", "arguments": ""}]
+    assert gs.parse_tool_calls('<tool_call>{"name": "now"}</tool_call>')[1] == [
+        {"name": "now", "arguments": {}}]
 
 
 @pytest.mark.parametrize("payload", [

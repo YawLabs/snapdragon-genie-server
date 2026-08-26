@@ -121,6 +121,22 @@ def test_single_oversized_message_reports_unfittable(gs):
     assert not fits          # caller owes the client a 400, not a doomed query
 
 
+def test_a_long_conversation_ending_oversized_reports_unfittable(gs):
+    # The other way to be unfittable: plenty to evict, but evicting ALL of it
+    # still does not fit. The bisection finds no k that works, and a `fits`
+    # defaulted to True there would send a prompt over the compiled window --
+    # a hard GenieDialog_query failure rather than the 400 the client is owed.
+    tools = [{"type": "function", "function": {"name": "read_file",
+              "description": "Read", "parameters": {"type": "object"}}}]
+    msgs = convo(20)
+    msgs[-1] = {"role": "user", "content": "W" * 8000}
+    p, kept, ev, fits = gs._fit(msgs, tools, True, 400)
+    assert not fits
+    # Reached with turns still on the table, not via the len(rest) <= 1 guard:
+    # everything but the current turn was dropped and it STILL did not fit.
+    assert kept == [msgs[-1]] and len(ev) == len(msgs) - 2
+
+
 def test_overflow_message_names_the_numbers(gs):
     # Names the real numbers, not just "too big" -- the client needs to know
     # what to shrink.
@@ -181,6 +197,26 @@ def test_summariser_failure_degrades_to_plain_eviction(gs):
     p, dropped, fits, overhead = gs.build_windowed(convo(20), max_tokens=64)
     # A summary is a nice-to-have; it must never break the request.
     assert fits and gs.SUMMARY_MARKER not in p and overhead == 0
+
+
+def test_a_note_too_big_to_fit_degrades_to_plain_eviction(gs):
+    # The other half of that guarantee, and the harder half: the summariser
+    # SUCCEEDS, but the note pushes the render back over budget. Returning the
+    # second pass's unfitting prompt would overflow the window on a request
+    # that was already fitting before we tried to help it.
+    gs._CONTEXT_SIZE = SMALL
+    gs.ENGINE = StubEngine(chunks=["should not run"])
+    plain, plain_dropped, _, _ = gs.build_windowed(
+        convo(20), max_tokens=64, summarize=False)
+
+    gs.ENGINE = StubEngine(chunks=["- " + "note " * 900])
+    p, dropped, fits, overhead = gs.build_windowed(convo(20), max_tokens=64)
+    assert fits and gs.SUMMARY_MARKER not in p
+    assert (p, dropped) == (plain, plain_dropped)   # the plain-eviction result
+    # The NPU call really happened, so reporting it as free would hide real
+    # decode time from the caller -- the same failure as billing zero for a
+    # tool turn.
+    assert gs.ENGINE.calls and overhead > 0
 
 
 def test_summarisation_does_not_claim_the_resident_kv(gs):
@@ -425,6 +461,67 @@ def test_a_real_list_is_read_normally(gs, tmp_path):
     gs.BUNDLE_DIR = str(tmp_path)
     gs._CONTEXT_LENGTHS = None
     assert gs.read_context_lengths() == [512, 1024, 8192]
+
+
+def test_poll_is_found_in_a_real_genie_config(gs, tmp_path):
+    # Everything above pins _POLL_MATCHES by hand, so the search had never
+    # actually run against a file. A read that silently returns nothing reports
+    # a busy-waiting bundle as unconfigured -- 2.7 idle cores and up to 55% of
+    # decode, unremarked.
+    (tmp_path / "genie_config.json").write_text(json.dumps({
+        "dialog": {
+            "version": 1,
+            "type": "basic",
+            "context": {"version": 1, "size": 4096, "n-vocab": 151936},
+            "sampler": {"version": 1, "temp": 0.8},
+            "engine": {
+                "version": 1,
+                "n-threads": 3,
+                "backend": {"version": 1, "type": "QnnHtp",
+                            "QnnHtp": {"version": 1, "spill-fill-bufsize": 0,
+                                       "use-mmap": True, "poll": True,
+                                       "pos-id-dim": 64}},
+                "model": {"version": 1, "type": "binary"},
+            },
+        }}), encoding="utf-8")
+    gs.BUNDLE_DIR = str(tmp_path)
+    gs._POLL_MATCHES = None
+    assert gs.read_poll_setting() == (
+        True, "dialog.engine.backend.QnnHtp.poll")
+
+
+def test_an_unparseable_genie_config_claims_nothing_and_does_not_raise(gs, tmp_path):
+    # This runs during startup. Raising on a malformed bundle file would turn a
+    # performance note into a server that will not boot -- the opposite of
+    # warn-never-refuse.
+    (tmp_path / "genie_config.json").write_text(
+        '{"dialog": {"engine": ', encoding="utf-8")
+    gs.BUNDLE_DIR = str(tmp_path)
+    gs._POLL_MATCHES = None
+    assert gs.read_poll_setting() == (None, None)
+    assert gs._POLL_MATCHES == []      # absent, not "unread" -- see the cache
+
+
+def test_a_missing_genie_config_claims_nothing(gs, tmp_path):
+    # Absent is not false: the shipped default is true, but we did not read it
+    # and must not report a bundle as correctly configured on that basis.
+    gs.BUNDLE_DIR = str(tmp_path)               # no config at all
+    gs._POLL_MATCHES = None
+    assert gs.read_poll_setting() == (None, None)
+    assert gs.bundle_config_warnings()[0].startswith("note:")
+
+
+def test_the_poll_read_is_cached(gs, tmp_path):
+    # It is called per warning line and from /props; re-opening and JSON-parsing
+    # the bundle config each time is blocking I/O for a value that cannot change
+    # while the bundle is loaded.
+    cfg = tmp_path / "genie_config.json"
+    cfg.write_text('{"dialog": {"QnnHtp": {"poll": true}}}', encoding="utf-8")
+    gs.BUNDLE_DIR = str(tmp_path)
+    gs._POLL_MATCHES = None
+    assert gs.read_poll_setting() == (True, "dialog.QnnHtp.poll")
+    cfg.unlink()                                            # file gone
+    assert gs.read_poll_setting() == (True, "dialog.QnnHtp.poll")
 
 
 def test_a_bogus_length_list_does_not_claim_multi_length(gs, tmp_path):
