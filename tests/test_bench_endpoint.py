@@ -213,3 +213,56 @@ def test_crosscheck_tolerance_is_not_hair_trigger(be):
     # Decode on this engine swings run to run; a threshold that fires on
     # ordinary noise would train the reader to ignore it.
     assert "WARNING" not in be._probe_crosscheck(0.055, 0.075)
+
+
+# --- pooling interleaved depths before the verdict ------------------------
+# The verdict line states this repo's headline finding, and it was computed
+# from the first and last non-empty GROUPS. That is right only when the depths
+# run once each in ascending order -- and wrong in exactly the mode the module
+# docstring recommends, where depths alternate so that drift cannot masquerade
+# as a depth effect. The per-depth table printed every row regardless, so the
+# discarded repeats left no trace.
+
+def test_pooling_keeps_every_repeat_of_an_interleaved_sweep(be):
+    # --depths 250,3300,250,3300 --decode-every. first-vs-last groups gave
+    # [18.9] against [13.3]: n=1 a side, three quarters of the run thrown away.
+    per_depth = [(250, [18.9]), (3300, [12.8]), (250, [18.5]), (3300, [13.3])]
+    shallow, deep = be.pool_by_depth(per_depth)
+    assert sorted(shallow) == [18.5, 18.9]
+    assert sorted(deep) == [12.8, 13.3]
+
+
+def test_pooling_compares_the_extremes_not_the_order_measured(be):
+    # The deepest depth is measured FIRST here, so taking the last group would
+    # report the middle depth as "deep".
+    per_depth = [(3300, [13.0]), (250, [18.7]), (1200, [15.0])]
+    shallow, deep = be.pool_by_depth(per_depth)
+    assert shallow == [18.7] and deep == [13.0]
+
+
+def test_pooling_ignores_depths_whose_every_sample_was_skipped(be):
+    # A depth can come back empty (429 backpressure, an early EOS); it is not a
+    # side of a cross-depth comparison.
+    shallow, deep = be.pool_by_depth([(250, [18.5]), (1200, []), (3300, [13.0])])
+    assert shallow == [18.5] and deep == [13.0]
+
+
+def test_pooling_makes_no_claim_from_a_single_depth(be):
+    # One depth cannot support a statement ABOUT depth, however many repeats.
+    assert be.pool_by_depth([(250, [18.5, 18.9, 18.7])]) == ([], [])
+    assert be.pool_by_depth([(250, []), (3300, [])]) == ([], [])
+
+
+def test_verdict_hint_names_the_flag_that_actually_applies(be, capsys):
+    # --decode-every measures every depth with --repeat and never consults
+    # --repeat-deep, so naming it there sends the reader to a flag that changes
+    # nothing about the run they just did.
+    be._verdict([18.5], [13.0], deep_flag="--repeat")
+    out = capsys.readouterr().out
+    assert "--repeat raises that" in out
+    assert "--repeat-deep" not in out
+
+
+def test_verdict_hint_defaults_to_the_two_depth_flag(be, capsys):
+    be._verdict([18.5], [13.0])
+    assert "--repeat-deep" in capsys.readouterr().out

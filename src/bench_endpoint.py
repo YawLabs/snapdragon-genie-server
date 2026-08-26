@@ -264,7 +264,38 @@ def measure_decode(base, model, target, tokens, timeout):
     return rate
 
 
-def _verdict(shallow, deep):
+def pool_by_depth(per_depth):
+    """(shallowest-depth rates, deepest-depth rates) pooled across repeats.
+
+    Lifted out of main() so it can be tested, same reasoning as resolve_depths:
+    it decides what the headline verdict is computed FROM, and it was previously
+    unreachable from any test.
+
+    The bug it fixes was invisible by construction. main() used to take the
+    first and last non-empty GROUPS, which is correct only when the depths run
+    once each in ascending order. In the mode this tool actively recommends --
+    `--depths 250,3300,250,3300 --decode-every` -- the groups ALTERNATE, so
+    first-vs-last compared a single 250 sample against a single 3300 sample and
+    discarded the repeats that are the entire reason for interleaving. The
+    per-depth table printed all four rows either way, so nothing looked wrong;
+    the verdict line just claimed more confidence than it had.
+
+    Pooling by depth VALUE puts every shallow sample on one side and every deep
+    one on the other, and sorting picks the true extremes rather than whichever
+    happened to be measured first. Returns ([], []) when fewer than two depths
+    produced samples -- there is no cross-depth claim to make from one depth.
+    """
+    pooled = {}
+    for depth, rates in per_depth:
+        if rates:
+            pooled.setdefault(depth, []).extend(rates)
+    if len(pooled) < 2:
+        return [], []
+    order = sorted(pooled)
+    return pooled[order[0]], pooled[order[-1]]
+
+
+def _verdict(shallow, deep, deep_flag="--repeat-deep"):
     """Compare decode at two depths, keeping same-depth noise out of the claim.
 
     The point of this line is whether cost tracks the COMPILED window or the
@@ -287,7 +318,8 @@ def _verdict(shallow, deep):
              if delta < 0.25 * min(ms, md)
              else "varies with depth on this engine"), flush=True)
     if len(deep) == 1:
-        print("  (deep depth sampled once -- --repeat-deep raises that)", flush=True)
+        print("  (deep depth sampled once -- %s raises that)" % deep_flag,
+              flush=True)
 
 
 DEFAULT_DEPTHS = (500, 1500, 3000, 7000, 12000)
@@ -465,10 +497,14 @@ def main():
                     mark = "  %+5.1f%%%s" % (change, "  <-- step" if abs(change) >= 8 else "")
                 print("    depth %-6d %6.2f t/s%s" % (d, m, mark), flush=True)
                 prev = m
-        first = next((rs for _, rs in per_depth if rs), [])
-        last = next((rs for _, rs in reversed(per_depth) if rs), [])
-        if first is not last:
-            _verdict(first, last)
+        shallow, deep = pool_by_depth(per_depth)
+        if shallow and deep:
+            # --repeat is what raises the count when every depth is measured;
+            # --repeat-deep is not consulted in that mode, so naming it there
+            # would send the reader to a flag that changes nothing.
+            _verdict(shallow, deep,
+                     deep_flag="--repeat" if args.decode_every
+                     else "--repeat-deep")
 
 
 if __name__ == "__main__":
