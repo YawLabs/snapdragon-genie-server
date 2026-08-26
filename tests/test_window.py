@@ -10,6 +10,7 @@ fits comfortably inside the real 4096.
 """
 
 import importlib
+import json
 import random
 import re
 
@@ -241,3 +242,197 @@ def test_context_size_falls_back_when_unreadable(gs, tmp_path, monkeypatch):
     # /props answering with a default beats failing to start over a field it
     # only needs for a metadata endpoint.
     assert gs.read_context_size() == 4096
+
+
+# --- bundle configuration --------------------------------------------------
+# The two settings that decide most of this server's throughput were the two
+# nothing read. `poll: true` ships as the default, busy-waits on ~2.7 host
+# cores while idle and costs up to 55% of decode; a single-length bundle runs
+# every token against its whole compiled window and is 2-3x slower on short
+# prompts than a multi-length one at the SAME n_ctx. Both were left to whoever
+# remembered the docs, in a server that otherwise derives and asserts every
+# fact it depends on -- placement, port, Hexagon arch.
+
+def test_poll_true_is_called_out_with_what_it_costs(gs):
+    gs._POLL_MATCHES = [(True, "dialog.engine.backend.QnnHtp.poll")]
+    gs._CONTEXT_LENGTHS = [512, 4096]
+    warnings = gs.bundle_config_warnings()
+    assert len(warnings) == 1
+    w = warnings[0]
+    assert "WARNING" in w
+    assert "dialog.engine.backend.QnnHtp.poll" in w, "name the key to edit"
+    assert "1.45x" in w and "0.78x" in w, "the concurrency reversal is the point"
+
+
+def test_a_correctly_configured_bundle_says_nothing(gs):
+    # A startup warning that fires on a healthy bundle trains the reader to
+    # skip it, which is how the real one goes unread.
+    gs._POLL_MATCHES = [(False, "QnnHtp.poll")]
+    gs._CONTEXT_LENGTHS = [512, 1024, 2048, 4096]
+    assert gs.bundle_config_warnings() == []
+
+
+def test_a_missing_poll_key_is_a_note_not_a_warning(gs):
+    # Absent is not the same as false: the shipped default is true, but we did
+    # not read it here and must not claim we did.
+    gs._POLL_MATCHES = []
+    gs._CONTEXT_LENGTHS = [512, 4096]
+    out = gs.bundle_config_warnings()
+    assert len(out) == 1 and out[0].startswith("note:")
+    assert "WARNING" not in out[0]
+
+
+def test_a_single_length_bundle_is_flagged(gs):
+    gs._POLL_MATCHES = [(False, "QnnHtp.poll")]
+    gs._CONTEXT_LENGTHS = [8192]
+    out = gs.bundle_config_warnings()
+    assert len(out) == 1 and "SINGLE-length" in out[0]
+    assert "--context-lengths" in out[0], "must say how to fix it"
+
+
+def test_an_unreadable_bundle_claims_nothing_about_its_graphs(gs):
+    # metadata.json missing -> [] -> no claim either way. Guessing "multi"
+    # would be the same silent-degradation this server refuses elsewhere.
+    gs._POLL_MATCHES = [(False, "QnnHtp.poll")]
+    gs._CONTEXT_LENGTHS = []
+    assert gs.bundle_config_warnings() == []
+
+
+def test_both_problems_are_reported_together(gs):
+    # One restart should surface everything wrong, not the first thing wrong.
+    gs._POLL_MATCHES = [(True, "QnnHtp.poll")]
+    gs._CONTEXT_LENGTHS = [16384]
+    assert len(gs.bundle_config_warnings()) == 2
+
+
+def test_the_poll_key_is_found_wherever_the_sdk_nests_it(gs):
+    # Searched rather than addressed by a fixed path: the QnnHtp block has moved
+    # between QAIRT releases and this server supports more than one, so a path
+    # that is right for 2.45 and absent on the next reads as "not set" -- the
+    # wrong answer for a flag whose default is the expensive one.
+    cfg = {"dialog": {"engine": {"backend": {"QnnHtp": {"poll": True}}}}}
+    assert gs._find_all(cfg, "poll") == [
+        (True, "dialog.engine.backend.QnnHtp.poll")]
+
+
+def test_a_nested_false_is_found_and_not_mistaken_for_absent(gs):
+    # The discriminating case for any "did we find it" guard: `false` is a
+    # value, not a miss. Reading it as absent would report a correctly
+    # configured bundle as unconfigured and warn about nothing.
+    cfg = {"dialog": {"engine": {"backend": {"QnnHtp": {"poll": False}}}}}
+    value, where = gs._pick_poll(gs._find_all(cfg, "poll"))
+    assert value is False
+    assert where == "dialog.engine.backend.QnnHtp.poll"
+
+
+def test_key_search_reports_absence_rather_than_a_default(gs):
+    assert gs._find_all({"dialog": {"engine": {}}}, "poll") == []
+    assert gs._pick_poll([]) == (None, None)
+
+
+def test_key_search_descends_through_lists(gs):
+    cfg = {"dialog": {"engine": {"backends": [{"type": "cpu"},
+                                              {"type": "QnnHtp", "poll": True}]}}}
+    matches = gs._find_all(cfg, "poll")
+    assert len(matches) == 1
+    assert matches[0][0] is True and "[1]" in matches[0][1]
+
+
+def test_the_qnnhtp_copy_wins_over_a_shallower_one(gs):
+    # Depth-first-first-match preferred whichever came first in insertion order,
+    # which on this config is the nested one regardless of which is correct.
+    # The BLOCK is always called QnnHtp; only its nesting moves.
+    cfg = {"poll": False, "dialog": {"backend": {"QnnHtp": {"poll": True}}}}
+    assert gs._pick_poll(gs._find_all(cfg, "poll")) == (
+        True, "dialog.backend.QnnHtp.poll")
+
+
+def test_the_shallowest_wins_when_nothing_is_qnnhtp_qualified(gs):
+    cfg = {"poll": True, "a": {"b": {"poll": False}}}
+    assert gs._pick_poll(gs._find_all(cfg, "poll")) == (True, "poll")
+
+
+def test_conflicting_poll_keys_are_reported_not_silently_resolved(gs):
+    # The picker is a heuristic. One that resolves a real conflict without
+    # saying so is how a wrong value reaches /props looking authoritative.
+    gs._POLL_MATCHES = [(True, "poll"), (False, "dialog.QnnHtp.poll")]
+    gs._CONTEXT_LENGTHS = [512, 4096]
+    out = gs.bundle_config_warnings()
+    assert any("conflicting values" in w for w in out)
+    assert any("dialog.QnnHtp.poll" in w for w in out), "name where each was found"
+
+
+def test_agreeing_duplicate_poll_keys_are_not_noise(gs):
+    # Same value twice is odd but harmless; warning on it trains the reader to
+    # skip the warning that matters.
+    gs._POLL_MATCHES = [(False, "poll"), (False, "dialog.QnnHtp.poll")]
+    gs._CONTEXT_LENGTHS = [512, 4096]
+    assert gs.bundle_config_warnings() == []
+
+
+# --- poll truthiness, not identity ----------------------------------------
+# `poll is True` was identity-strict, so every truthy non-True encoding fell
+# through it AND through the `is None` branch and produced no warning at all --
+# silently accepting the one setting this check exists to catch. JSON `true`
+# parses to Python True, but 1 and "true" are valid config and both busy-wait.
+
+@pytest.mark.parametrize("value", [True, 1, "true", "yes"])
+def test_every_truthy_poll_encoding_warns(gs, value):
+    gs._POLL_MATCHES = [(value, "QnnHtp.poll")]
+    gs._CONTEXT_LENGTHS = [512, 4096]
+    out = gs.bundle_config_warnings()
+    assert len(out) == 1 and out[0].startswith("WARNING")
+    assert "2.7 host" in out[0], "must say what it costs, not just that it is set"
+
+
+def test_the_warning_reports_the_value_as_written(gs):
+    # It used to assert "= true" regardless. Naming the actual value is what
+    # lets the reader find it in the file.
+    gs._POLL_MATCHES = [(1, "QnnHtp.poll")]
+    gs._CONTEXT_LENGTHS = [512, 4096]
+    assert "QnnHtp.poll = 1" in gs.bundle_config_warnings()[0]
+
+
+@pytest.mark.parametrize("value", [False, 0])
+def test_falsy_poll_encodings_stay_silent(gs, value):
+    # The correctly-configured case. Warning here would train the reader to
+    # skip the warning that matters.
+    gs._POLL_MATCHES = [(value, "QnnHtp.poll")]
+    gs._CONTEXT_LENGTHS = [512, 4096]
+    assert gs.bundle_config_warnings() == []
+
+
+# --- context_lengths must be a LIST ---------------------------------------
+# A bare string is iterable, so "8192" was read element-wise into [8, 1, 9, 2]:
+# a single-length bundle reported as MULTI-length with four invented graph
+# lengths, in the startup banner and in /props.genie.context_lengths. A router
+# reading that concludes the bundle is fast on short prompts when it is 2-3x
+# slower -- precisely the misreport the field was added to prevent.
+
+@pytest.mark.parametrize("bad", ["8192", 8192, {"a": 1}, None])
+def test_a_non_list_context_lengths_claims_nothing(gs, tmp_path, bad):
+    (tmp_path / "metadata.json").write_text(
+        json.dumps({"genie": {"context_lengths": bad}}), encoding="utf-8")
+    gs.BUNDLE_DIR = str(tmp_path)
+    gs._CONTEXT_LENGTHS = None
+    assert gs.read_context_lengths() == []
+
+
+def test_a_real_list_is_read_normally(gs, tmp_path):
+    (tmp_path / "metadata.json").write_text(
+        json.dumps({"genie": {"context_lengths": [512, 1024, 8192]}}),
+        encoding="utf-8")
+    gs.BUNDLE_DIR = str(tmp_path)
+    gs._CONTEXT_LENGTHS = None
+    assert gs.read_context_lengths() == [512, 1024, 8192]
+
+
+def test_a_bogus_length_list_does_not_claim_multi_length(gs, tmp_path):
+    # The consequence that actually reaches a router, asserted end to end.
+    (tmp_path / "metadata.json").write_text(
+        json.dumps({"genie": {"context_lengths": "8192"}}), encoding="utf-8")
+    gs.BUNDLE_DIR = str(tmp_path)
+    gs._CONTEXT_LENGTHS = None
+    gs._POLL_MATCHES = [(False, "QnnHtp.poll")]
+    assert len(gs.read_context_lengths()) != 4, "must not invent four graphs"
+    assert gs.bundle_config_warnings() == [], "unreadable is not single-length"

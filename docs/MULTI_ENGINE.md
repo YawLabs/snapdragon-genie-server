@@ -61,9 +61,12 @@ Three consequences for the multi-engine design here:
   measurement of another engine taken while the NPU server was resident is
   pessimistic by up to 2.7 cores of stolen CPU. That includes the baselines
   below.
-- **The 0.2 t/s CPU anomaly needs re-testing before anything is concluded from
-  it.** It is the highest-leverage unknown on this page and it was measured in
-  exactly the conditions this finding invalidates. It may simply be this.
+- **The 0.2 t/s CPU anomaly was exactly this, and is RETRACTED (2026-08-24).**
+  It was never a property of the CPU backend: it was the compound of a
+  `poll: true` Genie server busy-waiting on 2.7 host cores, concurrent
+  benchmarks from other sessions on this shared box, and a thread-count effect
+  (the all-cores default costs 2-5x on this hardware -- use about half). See the
+  baselines table below for the re-measured figures.
 - **It invalidates the first concurrency run outright.** That measurement was
   taken across the flag change, and its `poll: true` half had a spinning NPU
   server stealing the host CPU the OpenCL backend needs to dispatch a kernel
@@ -225,7 +228,7 @@ Measured single-engine baselines (prefill / decode, tokens/sec):
 |---|---|---|---|
 | NPU (Genie / QnnHtp) | **855-938** @ d469 | **18.55** @ d469 | `poll: false`, quiet box 2026-08-24; supersedes 277 / 13.2 |
 | GPU (Adreno) | **226.8** @256 | **18.05** @ d469 | quiet box 2026-08-23; supersedes 117 / 6.0 |
-| CPU (KleidiAI) | fine | **~0.2** | **broken -- unresolved anomaly** |
+| CPU (KleidiAI) | ~115 @ pp512 | **22.57** @ d0, **13.15** @ d469 | NOT broken -- the 0.2 is RETRACTED. Quiet box 2026-08-24, `--device none -t 6`, r=5, Qwen3-4B-Q4_K_M; +-6.7 / +-6.3 |
 
 The **GPU** row is a 3.0x correction on decode and roughly 1.9x on prefill. The
 retired 117 / 6.0 pair was taken in the same loaded window as the NPU's 277, and
@@ -237,9 +240,18 @@ file has carried -- 13.2 in the old table, 13.0 from the prebuilt sweep, 12.82
 from the first contention run -- was measured against a `poll: true` bundle and
 carries the busy-wait. Prefill moved for the unrelated reason that the original
 277 sweep was taken on a loaded box; the `poll` flag does not touch prefill, and
-855-938 stands as measured. **The CPU row is unchanged and still carries that
-loaded-window doubt** -- it has not been re-measured, and re-measuring it is
-still the highest-leverage item here.
+855-938 stands as measured.
+
+The **CPU** row has now been re-measured on a verified-quiet box and the ~0.2
+is withdrawn. Three things were folded into that figure and only one of them
+was the CPU: the busy-waiting NPU server above, other sessions benchmarking the
+same box, and a thread-count effect -- the all-cores default costs 2-5x here, so
+the re-run used `-t 6` on a 12-core part. What replaced it is not an
+endorsement, though. CPU loses **42%** between d0 and d469 against the GPU's 8%,
+so it is competitive-to-fastest on an empty prompt and the slowest of the three
+at the depth an agent actually runs at. It is also much the noisiest leg
+(~30% relative variance on a quiet box), so a single sample is not a rate.
+**A router that ranks CPU off a d0 benchmark picks wrong for real traffic.**
 
 **The two engines are near-identical decoders.** 18.55 against 18.05 at the same
 depth is not a gap worth routing on, which means neither "the NPU is the fastest
@@ -266,13 +278,21 @@ at d~0 against 18.55 at d469 is flat within noise. That matches the 16384
 bundle, which was flat all along (3.26 at d469, 3.27 at d10532). The GPU by
 comparison loses about 8% over the same span (19.7 -> 18.05).
 
-**The CPU leg is not worth building yet.** At 0.2 t/s it contributes nothing,
-and it now has a sharper cost than "it contributes nothing": the two working
-engines already draw about three-quarters of this memory system's achievable
-bandwidth, so a third divides a nearly-full bus. Until that anomaly is
-understood this is a **two**-engine design. Fixing CPU decode is worth more than
-adding a third instance, and it matters far beyond this box: CPU is the fallback
-every non-Snapdragon user lands on.
+**This is still a two-engine design, but on evidence rather than on breakage.**
+The "CPU is broken at 0.2 t/s" reason is gone. What replaces it is narrower and
+better founded: CPU is ~27% slower than either accelerator at agent depth, is
+the noisiest of the three, and the two working engines already draw about
+three-quarters of this memory system's achievable bandwidth -- so a third
+instance *of the same 4B model* divides a nearly-full bus.
+
+That last clause is the one worth reading carefully, because bandwidth demand
+scales with weight bytes per token rather than with engine count. A third leg
+running a SMALLER model is a different proposition and has not been measured.
+**CPU+NPU specifically may well be fine**, since the NPU proved insensitive to
+host load; what is predicted -- and unmeasured -- is that CPU would starve the
+GPU through the same host-core mechanism the busy-wait demonstrated at 60%.
+Open question, not a closed exclusion. CPU also still matters far beyond this
+box: it is the fallback every non-Snapdragon user lands on.
 
 ## Why it is still worth doing
 
@@ -389,9 +409,13 @@ directions were measured and retention is roughly symmetric (72% NPU, 75% GPU).
   `bench_contention.py` run, a flip back and another run -- roughly fifteen
   minutes. Cheapest high-value item on the list, and it underwrites everything
   above.
-- **Why is CPU decode 0.2 t/s?** Blocks the third engine and is still the
-  highest-leverage *unknown* here. It has *not* been re-measured on a quiet box,
-  and the box it was measured on had a spinning NPU server on it.
+- ~~**Why is CPU decode 0.2 t/s?**~~ **Answered 2026-08-24: it was not.** The
+  figure was an artifact of a busy-waiting NPU server, co-tenant benchmarks and
+  an all-cores thread count. Re-measured quiet at `-t 6`: 22.57 t/s at d0,
+  13.15 at d469. What is still open is narrower -- **does a CPU leg starve the
+  GPU the way the busy-wait did?** Predicted yes through the same host-core
+  mechanism, unmeasured. CPU+NPU is the pairing most likely to work, since the
+  NPU is host-load-insensitive.
 - **Does a second resident model change the NPU's `1003` rate?** Memory pressure
   is a plausible aggravator; unproven.
 - **Is there headroom for a third engine at all?** The pair already draws

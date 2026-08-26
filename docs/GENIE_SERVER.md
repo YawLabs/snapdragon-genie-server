@@ -30,6 +30,7 @@ itself -- it looks for a `genie-npu` directory beside this repo holding
 `bundles/` and `qairt/`, and picks the newest QAIRT under it:
 
 ```powershell
+cd <your clone of this repo>   # the path below is relative to the repo root
 powershell -File src\run-genie-server.ps1
 ```
 
@@ -62,6 +63,24 @@ the resident model.
   ChatML template is taken from the bundle's own
   `metadata.json` chat_template.
 - `GET /v1/models` -- lists the served model id (`GENIE_MODEL_ID`).
+- `GET /props` -- llama.cpp-shaped metadata: `default_generation_settings.n_ctx`
+  and `model_alias` / `model_id`, which is what typed reads. Plus a namespaced
+  `genie` block carrying what a router cannot otherwise learn over HTTP:
+
+  | field | why a dispatcher needs it |
+  |---|---|
+  | `engine` | `npu-hexagon-htp` -- which silicon is answering |
+  | `single_flight` | `true`; the constraint behind the 429/529, stated rather than discovered from one |
+  | `context_lengths` | the graphs compiled into the bundle |
+  | `multi_length` | `false` means 2-3x slower on short prompts at the SAME `n_ctx` |
+  | `poll` | `true` means an idle 2.7-core busy-wait, and NPU+GPU concurrency is a 0.78x LOSS rather than a 1.45x gain |
+
+  `n_ctx` alone is not enough to rank this endpoint against a GPU or CPU one,
+  and on this engine it is actively misleading: it is the SOFTWARE cap
+  (`dialog.context.size`), while throughput is set by the compiled window and by
+  how many graphs the bundle carries. Two bundles reporting the same `n_ctx`
+  differ 2-3x on a short prompt. The block is additive and namespaced, so a
+  client that ignores it sees exactly the response it saw before.
 - `GET /health` -- **engine** state, not process liveness. `200` when the
   server can actually generate; `503` with a `state` of `failing`, `stalled` or
   `wedged` when it cannot. The body carries `detail` (why), `generating`,
@@ -87,7 +106,7 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 | `GENIE_SDK_DIR` | scratchpad 2.45 SDK | QAIRT 2.45 root (lib/aarch64-windows-msvc, lib/hexagon-v*) |
 | `GENIE_HEXAGON_ARCH` | unset | pin one skel arch (`v81`); default offers all |
 | `GENIE_SUMMARIZE_EVICTED` | 1 | 0 disables summarising evicted turns (plain drop) |
-| (not an env var) | -- | **`poll: false` in the bundle's `genie_config.json`** -- see the poll note below. Worth up to +55% decode and frees 2.7 idle cores. |
+| (not an env var) | -- | **`poll: false` in the bundle's `genie_config.json`** -- see the poll note below. Worth up to +55% decode and frees 2.7 idle cores. The server now CHECKS this at startup (before the 30-50s load) and warns loudly if the bundle ships `true`; it also warns on a single-length bundle. Both are warnings, never refusals -- a slow server is still a working one. |
 | `GENIE_SUMMARY_MAX_TOKENS` | 192 | cap on the retained note. Clamped at runtime to `n_ctx / 8` (floor 32) so the note cannot crowd out the window on a small-context bundle; the server logs the clamp when it bites. |
 | `GENIE_WINDOW_MARGIN` | 64 | headroom left between prompt and n_ctx |
 | `GENIE_MAX_INFLIGHT` | 2 | requests admitted at once (1 running + queue). Floored at 1 -- it cannot be disabled, since the NPU is single-flight and an unbounded setting only parks threads on the engine lock. Set 1 to protect KV reuse: two interleaved conversations share one resident KV and reset each other's prefix. |
@@ -103,7 +122,7 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 | `GENIE_RESTART_COOLDOWN` | 25 | launcher only: seconds between restarts. Not arbitrary -- a force-killed server needs roughly 20s of settling, and restarting sooner was measured costing about half of decode throughput. |
 | `GENIE_MAX_TOKENS` | 512 | default cap when a request omits max_tokens |
 | `GENIE_STRIP_THINK` | 0 | 1 strips `<think>...</think>` from non-streamed content |
-| `GENIE_THINKING` | 1 | 0 suppresses Qwen3's reasoning block server-wide. Per request: `chat_template_kwargs.enable_thinking`, `reasoning_effort:"none"`, or `thinking:{"type":"disabled"}` |
+| `GENIE_THINKING` | **0** | Qwen3's reasoning block is **suppressed by default** -- it costs 10-17x on an agent turn (see the tool-calling note below). `1` re-enables it server-wide. Per request either way: `chat_template_kwargs.enable_thinking`, `reasoning_effort` (`"none"` / `"high"`), or `thinking:{"type":"disabled"|"enabled"}` -- an explicit request always beats the server default. |
 
 ## Supervision: what happens when the HTP wedges
 
@@ -249,12 +268,27 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
 
   | | wall | completion tokens |
   |---|---|---|
-  | thinking on (default) | 10.7 - 41 s | 113 - 300 |
-  | thinking off | 1.8 - 2.4 s | 17 - 25 |
+  | thinking on (`GENIE_THINKING=1`) | 10.7 - 41 s | 113 - 300 |
+  | thinking off (**default**) | 1.8 - 2.4 s | 17 - 25 |
 
-  Nearly all of the default-path cost is the `<think>` block, and its length
-  varies a lot run to run -- so agent step latency is not just slow but
-  unpredictable. For agentic use, turn thinking off.
+  Nearly all of the reasoning-path cost is the `<think>` block, and its length
+  varies a lot run to run -- so that path is not just slow but unpredictable,
+  which is the property a human waiting on an agent step actually notices.
+
+  **This is why the default is off, and it is a deliberate change.** The server
+  used to default it ON, on the reasoning that faithfulness to the model is the
+  honest default and agent clients could opt out. That made the configuration
+  these docs recommend the one nobody got without asking, on a server whose
+  reason to exist is being driven by an agent. Suppression is a prompt PREFILL
+  (a closed, empty think block the model resumes after), not a filter over the
+  output -- so nothing is hidden, and a caller that asks for reasoning gets
+  exactly what the model produced. Set `GENIE_THINKING=1`, or send
+  `reasoning_effort: "high"` on the request, to get it back.
+
+  One consequence worth knowing: with reasoning suppressed Qwen3 improvises its
+  tool-call wrapper more often, so the `<function_call>` and bare-JSON shapes in
+  the next note are now the common case rather than the exception. The parser
+  accepts all of them.
 
 - **Tool-call wrappers vary.** `<tool_call>` is the trained, in-vocab tag, but
   with thinking suppressed the model also emits `<function_call>` and
@@ -469,10 +503,14 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   bundle left the HTP allocation byte-identical (343,933,440 both ways) and
   decode unchanged at ~11.0 t/s. The window is fixed at export time
   (`--context-lengths`); lowering the config only lowers the ceiling the
-  evictor works against. Related trap: the 4k bundle's `metadata.json`
-  advertises `genie.context_lengths = [512, 1024, 2048, 3072, 4096]`, which
-  lists what the model can be EXPORTED at -- not multiple graphs inside the
-  `.bin`. Its actual KV shape is `4095`.
+  evictor works against. Note that `genie.context_lengths` in `metadata.json`
+  is NOT merely a record of what the model could be exported at -- it names the
+  graphs actually compiled into the `.bin`, confirmed with
+  `qnn-context-binary-utility` in the mechanism note above. (This bullet said
+  the opposite until the graphs were read off the artifact; that reading is what
+  the mechanism note supersedes.) What the config cannot do is pick among them:
+  selection is per request, smallest-that-fits, and the KV tensor is shaped to
+  the largest either way -- `4095` on the 4k bundle.
 
 - **KV is `uint8`, ~72 KB/token** -- read off the bundle's own `metadata.json`
   (`past_key_0_in` / `past_value_0_in` are `dtype: uint8` with a fixed quant

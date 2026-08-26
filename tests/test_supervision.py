@@ -309,3 +309,109 @@ def test_the_stall_message_reads_as_english(H):
     _state, detail = H.assess(100)
     assert "further token" in detail
     assert "another token" not in detail
+
+
+# --- internal work is supervised but not counted as served -----------------
+# Summarising evicted turns is a real generation on the same device and can
+# wedge it exactly as a client request can, so it keeps full stall and failure
+# supervision. What it is not is traffic anyone asked for.
+
+def test_an_internal_call_is_not_counted_as_a_generation(H):
+    H.begin(0)
+    H.end(ok=True, now=1, counted=False)
+    assert H.snapshot(2)["generations"] == 0, \
+        "/health would report more work served than any client requested"
+
+
+def test_an_internal_call_still_clears_the_in_flight_state(H):
+    # Not counting it must not mean not closing it out -- a `started` left set
+    # would make the next assess() read the finished call as a stall.
+    H.begin(0)
+    H.progress(1)
+    H.end(ok=True, now=2, counted=False)
+    snap = H.snapshot(10_000)
+    assert snap["state"] == "ok" and snap["generating"] is False
+    assert snap["tokens_in_flight"] == 0
+
+
+def test_a_failing_internal_call_still_counts_against_the_engine(H):
+    # The failure streak is about the DEVICE, not about who asked. A summariser
+    # failing three times running is the engine returning errors.
+    for i in range(3):
+        H.begin(i)
+        H.end(ok=False, now=i, counted=False)
+    assert H.assess(10)[0] == "failing"
+    assert H.snapshot(10)["generations"] == 0
+
+
+def test_client_traffic_is_still_counted(H):
+    H.begin(0)
+    H.end(ok=True, now=1)
+    assert H.snapshot(2)["generations"] == 1
+
+
+def test_summarisation_marks_itself_internal(gs):
+    from conftest import StubEngine, convo
+    gs._CONTEXT_SIZE = 500
+    gs.ENGINE = StubEngine(chunks=["- a note"])
+    gs.build_windowed(convo(20), max_tokens=64)
+    assert [c["internal"] for c in gs.ENGINE.calls] == [True]
+
+
+# --- the steady states announce once ---------------------------------------
+# `failing` persists until a generation succeeds and `wedged` persists forever
+# under GENIE_WEDGE_EXIT=0, so printing them every interval reprinted a
+# multi-line stanza every five seconds for as long as the outage lasted --
+# burying the first occurrence, which carries the original cause, under
+# thousands of identical copies of itself.
+
+class ScriptedHealth:
+    """Returns a fixed sequence of states, so nothing here depends on a clock."""
+
+    def __init__(self, states):
+        self.states = list(states)
+        self.calls = 0
+
+    def assess(self, now):
+        state = self.states[min(self.calls, len(self.states) - 1)]
+        self.calls += 1
+        return state, "scripted %s" % state
+
+    def note_stall_signalled(self, now):
+        pass
+
+
+def test_a_persistent_wedge_is_announced_once(gs, capsys):
+    eng = FakeEngine()
+    gs.watchdog(eng, ScriptedHealth(["wedged"] * 5), interval=0, iterations=5,
+                on_wedge=lambda d: None)
+    out = capsys.readouterr().out
+    assert out.count("WEDGED") == 1, \
+        "reprinted the stanza %d times -- the first one carries the cause" % \
+        out.count("WEDGED")
+
+
+def test_a_persistent_failing_engine_is_announced_once(gs, capsys):
+    eng = FakeEngine()
+    gs.watchdog(eng, ScriptedHealth(["failing"] * 5), interval=0, iterations=5,
+                on_wedge=lambda d: pytest.fail("must not escalate on failures"))
+    assert capsys.readouterr().out.count("UNHEALTHY") == 1
+
+
+def test_recovery_re_arms_the_announcement(gs, capsys):
+    # A second, genuinely new episode is new information and must be printed.
+    eng = FakeEngine()
+    gs.watchdog(eng, ScriptedHealth(["failing", "failing", "ok", "failing"]),
+                interval=0, iterations=4,
+                on_wedge=lambda d: pytest.fail("must not escalate"))
+    assert capsys.readouterr().out.count("UNHEALTHY") == 2
+
+
+def test_a_stall_is_not_latched_because_each_line_marks_a_retry(gs, capsys):
+    # Deliberately unlike the two above: every STALL line corresponds to a
+    # fresh abort signal, and the state is bounded by the grace period rather
+    # than open-ended.
+    eng = FakeEngine()
+    gs.watchdog(eng, ScriptedHealth(["stalled"] * 3), interval=0, iterations=3)
+    assert capsys.readouterr().out.count("STALL") == 3
+    assert eng.aborts == 3, "each announcement is a real re-signal"

@@ -38,9 +38,10 @@ class StubEngine:
         return len(text) // 4
 
     def query(self, prompt, on_text, max_tokens=None, stop=None, sampler=None,
-              commit=True):
+              commit=True, internal=False):
         self.calls.append({"prompt": prompt, "stop": stop, "sampler": sampler,
-                           "commit": commit, "max_tokens": max_tokens})
+                           "commit": commit, "max_tokens": max_tokens,
+                           "internal": internal})
         for c in self.chunks:
             self.yielded += 1
             on_text(c)
@@ -96,8 +97,19 @@ def gs():
     importlib.reload(g)
     g.TEMPLATE = g.load_chat_template()   # no bundle -> standard ChatML fallback
     g._CONTEXT_SIZE = 4096                # pin, so no genie_config.json is read
+    g._CONTEXT_LENGTHS = [512, 1024, 2048, 4096]   # a multi-length bundle
+    g._POLL_MATCHES = [(False, "dialog.engine.backend.QnnHtp.poll")]
     g._TOK_CACHE.clear()
     g.STRIP_THINK = False
+    # Pinned, not inherited. THINKING_DEFAULT is read from os.environ at import,
+    # and this fixture reloads the module -- so a developer who exports
+    # GENIE_THINKING=1 in their shell flipped it under the whole suite and two
+    # tests failed for a reason that had nothing to do with the code. A suite
+    # whose header promises it "runs anywhere" has to pin every ambient input,
+    # not only the ones that needed pinning when it was written. The tests that
+    # exercise the env var itself reload the module deliberately, which
+    # overrides this.
+    g.THINKING_DEFAULT = False
     g.ENGINE = StubEngine()
     return g
 

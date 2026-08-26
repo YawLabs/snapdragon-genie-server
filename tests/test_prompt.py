@@ -110,12 +110,56 @@ def test_tool_conversation_renders_in_template_shape(gs):
         {"role": "tool", "content": "print('hi')"},
         {"role": "tool", "content": "second result"},
     ]
-    p = gs.TEMPLATE.build(msgs, tools=tools)
+    # thinking passed EXPLICITLY: this test is about the tool round-trip
+    # shape, not the server's reasoning policy, and leaving it implicit made
+    # it silently depend on that policy -- it broke the day the default
+    # flipped.
+    p = gs.TEMPLATE.build(msgs, tools=tools, thinking=True)
     assert "# Tools" in p and '"name": "read_file"' in p
     assert "<tool_call>" in p and "<tool_response>" in p
     # Consecutive tool results share ONE user turn, per the bundle's template.
     assert p.count("<|im_start|>user") == 2
-    assert p.endswith("<|im_start|>assistant\n")
+    # The template's own prefix, not a copy of it -- a duplicated literal
+    # here is a second place to update when the bundle's template changes.
+    assert p.endswith(gs.TEMPLATE.asst_pre)
+
+    # And the shape the server ACTUALLY ships now: the same open assistant
+    # turn, with the closed think block prefilled after it.
+    off = gs.TEMPLATE.build(msgs, tools=tools, thinking=False)
+    assert off.endswith(gs.TEMPLATE.asst_pre + gs._NO_THINK)
+    # Twice, not once: the prefill goes in front of every assistant turn,
+    # HISTORY included, because that is what was actually sent when those
+    # turns were generated. Rendering history without it would diverge from
+    # the dialog's resident KV by exactly those bytes and silently defeat
+    # reuse -- see the note in ChatML.build.
+    assert off.count(gs._NO_THINK) == 2, (
+        "one for the assistant history turn, one for the open turn")
+    assert p.count(gs._NO_THINK) == 0
+
+
+def test_the_render_default_follows_the_server_policy(gs):
+    """Omitting `thinking` means "whatever the server does", not `True`.
+
+    These two defaults disagreed for a while: the signatures said True while
+    THINKING_DEFAULT said False. No production caller was affected -- both
+    handlers pass it explicitly -- but every eviction test omitted it, so the
+    suite was exercising a prompt shape the server would never emit.
+    """
+    msgs = [{"role": "user", "content": "hi"}]
+    gs.THINKING_DEFAULT = False
+    assert gs.TEMPLATE.build(msgs) == gs.TEMPLATE.build(msgs, thinking=False)
+    gs.THINKING_DEFAULT = True
+    assert gs.TEMPLATE.build(msgs) == gs.TEMPLATE.build(msgs, thinking=True)
+
+
+def test_build_windowed_default_follows_the_server_policy(gs):
+    # Same contract one layer up, where the handlers actually call in.
+    msgs = [{"role": "user", "content": "hi"}]
+    for default in (False, True):
+        gs.THINKING_DEFAULT = default
+        implicit = gs.build_windowed(msgs, max_tokens=32)
+        explicit = gs.build_windowed(msgs, thinking=default, max_tokens=32)
+        assert implicit[0] == explicit[0]
 
 
 def test_thinking_off_prefills_a_closed_think_block(gs):

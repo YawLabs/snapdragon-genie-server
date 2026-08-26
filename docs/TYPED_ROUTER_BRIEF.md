@@ -14,7 +14,7 @@ NPU and serves it over HTTP. It speaks both APIs typed already knows:
 |---|---|
 | `POST /v1/chat/completions` | OpenAI, SSE streaming, `tools`, `stop` |
 | `POST /v1/messages` | Anthropic, SSE streaming, `tools`, `stop_sequences` |
-| `GET /props` | llama.cpp-shaped: `default_generation_settings.n_ctx`, `model_alias` |
+| `GET /props` | llama.cpp-shaped: `default_generation_settings.n_ctx`, `model_alias`. Plus a namespaced `genie` block: `engine`, `single_flight`, `context_lengths`, `multi_length`, `poll` -- see the capability notes below |
 | `GET /v1/models` | superset item satisfying both OpenAI and Anthropic shapes |
 | `GET /health` | **engine** state. 200 = can generate; 503 + `state` (`failing` / `stalled` / `wedged`) + `detail` = cannot. Answers during a wedge, so it is usable as a failover signal. |
 
@@ -248,49 +248,6 @@ n and no spread beside it is how two thin measurements come to read as a robust
 finding. Both of us wrote it that way; both figures are now stated with n and
 spread inline.
 
-Provenance: measured independently by two sessions on this box on 2026-08-24.
-Canonical write-up is **ADR 019, `17da11da` on YawLabs/typed master**
-(`docs/adr/019-local-multi-engine-routing.md`; supersedes `3c99a1af`). A second
-source recorded `t6 26.2 +-1.8, t12 11.9 +-5.2` at tg16 (d0), `30.2 / 6.2` at
-tg8, and `pp512 t12 115`, corroborating the shallow end.
-
-**The deep ranking is now measured, and it does NOT flip -- so depth is not a
-routing input for the decoder choice.** Both accelerators fall past ~600 tokens
-and they fall together. GPU, 3 passes x 5 depths, r=1 per point, every point
-gated to >=95% of base; NPU, interleaved, `poll: false`, 4096 bundle:
-
-| depth | GPU | NPU |
-|---|---|---|
-| d0 / d250 | 19.41 | 18.7 |
-| d469 | 18.06 | ~18.0 |
-| d1024 | 15.30 | -- |
-| d2048 | 15.72 | -- |
-| d3300 | 14.43 | 13.0 |
-
-Near-parallel: **GPU -26% from shallow to d3300, NPU -30%**, with the GPU a few
-percent ahead throughout. It does not hold near 18 and pull away; it tracks the
-NPU down. So the durable differentiators stay what they already were --
-**prefill (NPU ~4x) and host-load sensitivity (NPU -1.2%, GPU -64%)** -- and a
-router does not need a separate long-prompt case for choosing between them.
-
-Two caveats on that table, both worth carrying:
-
-*The two series were gated at different thresholds* -- the GPU sweep at >=95% of
-base, the earlier figures at >=92%. On hardware that swings 1.64x on box state
-those are not interchangeable, so the thresholds travel with the numbers rather
-than being flattened into one table's worth of authority.
-
-*There is a real non-monotonic knee around d1024-d1600, seen INDEPENDENTLY on
-both engines.* The GPU reads 15.30 at d1024 against 15.72 at d2048 -- deeper is
-faster, and the sample ranges do not overlap (15.14-15.37 vs 15.63-16.30). The
-NPU shows the same inversion in the same band: 14.95 at d1082 (14.61-15.29)
-against 15.40 at d1607 (15.39-15.41), also non-overlapping. Two engines, two
-harnesses, different prompt content, same direction -- which argues against the
-OpenCL-batching explanation that the GPU result alone would suggest, and for
-something common to both paths. Unexplained. It is small enough not to change
-routing, but a rate sampled at exactly d1024 will understate the surrounding
-curve on either engine.
-
 One note on the surviving GPU observation: **it cannot be graph selection**,
 tempting as that is now that the multi-length mechanism is confirmed to be
 exactly that. llama.cpp does no graph selection at all. Whatever it is, if it
@@ -354,7 +311,9 @@ stddev column. Checkable from the source in this repo without trusting anyone's
 account.
 
 **Bundle build note, 2026-08-24: how a bundle was BUILT changes its numbers by
-2-3x, and `/props` does not expose it.** A Genie bundle carries
+2-3x. `/props` DOES expose it now (`genie.context_lengths` /
+`genie.multi_length`); it did not when this was written, and a llama.cpp
+endpoint still will not.** A Genie bundle carries
 `genie.context_lengths` in its `metadata.json`. Built with several values it
 pays for the context actually in USE; built with one it pays for its whole
 compiled window on every token. Provenance of every bundle here, since the
@@ -388,8 +347,9 @@ A single-length bundle pays for its whole compiled window on every token; a
 multi-length one pays for the context in use. Cost is +3.8% bundle size and
 zero extra HTP memory. **A router should therefore not assume a deep-window NPU
 endpoint is slow on short prompts** -- that depends on how the bundle was built,
-which `/props` does not expose. If it matters, measure the endpoint at two
-depths rather than inferring from `n_ctx`.
+which `n_ctx` alone cannot tell you. `/props` now reports it directly as
+`genie.multi_length`, so prefer reading it; measuring at two depths remains the
+fallback for any endpoint that does not publish the field.
 
 *Verified, for the bare NPU figures, by a second fingerprint:* every one was
 reported as `shallow median X t/s (n=3)`. That string occurs once in this repo
@@ -603,11 +563,20 @@ These are properties of the NPU endpoint that a router must not assume away:
   do tools, the server returns a `400` naming the limitation rather than
   accepting `tools` and ignoring them -- so a 4xx on a tools probe means
   "disable tools for this session", exactly as `probeLocalToolCalls` expects.
-- **Reasoning is expensive and should usually be off.** Qwen3 emits a `<think>`
-  block by default: measured **41s vs 2.4s** for the same tool-calling turn.
-  Suppress it per request with any of `chat_template_kwargs.enable_thinking:
-  false`, `reasoning_effort: "none"`, or `thinking: {"type": "disabled"}`.
-  **For agentic use, send one of these.**
+- **Reasoning is expensive, and the NPU server now suppresses it by default.**
+  Qwen3's `<think>` block measured **41s vs 2.4s** for the same tool-calling
+  turn, with a length that swings run to run. The server used to default it on;
+  as of this change it defaults OFF, so a router needs to send nothing to get
+  the fast path. Ask for it back per request with
+  `chat_template_kwargs.enable_thinking: true`, `reasoning_effort: "high"`, or
+  `thinking: {"type": "enabled"}` -- an explicit request beats the server
+  default in both directions.
+
+  **This is NOT true of a `llama-server` leg**, which has no such default and
+  will happily emit a think block. So a dispatcher that fans the same request
+  across engines still has to send the suppression field explicitly, or the
+  same prompt costs 10-17x more on one engine than another and the difference
+  reads as the engine being slow.
 - **`stop` / `stop_sequences` work.** `stop_reason` distinguishes
   `stop_sequence` from `end_turn`, though the matched sequence is reported as
   `null` (the runtime strips it before we see it).

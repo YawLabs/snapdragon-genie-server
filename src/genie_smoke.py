@@ -14,7 +14,7 @@ def get(path):
         return json.load(r)
 
 
-def post(path, body, stream=False):
+def post(path, body):
     data = json.dumps(body).encode()
     req = urllib.request.Request(BASE + path, data=data,
                                  headers={"Content-Type": "application/json"})

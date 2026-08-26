@@ -51,16 +51,75 @@ def test_sampler_params_absent_when_nothing_asked(gs):
 
 
 @pytest.mark.parametrize("req,expected", [
-    ({}, True),                                              # server default
+    ({}, False),                                             # server default: OFF
     ({"chat_template_kwargs": {"enable_thinking": False}}, False),   # Qwen
     ({"reasoning_effort": "none"}, False),                   # OpenAI
     ({"thinking": {"type": "disabled"}}, False),             # Anthropic
+    ({"chat_template_kwargs": {"enable_thinking": True}}, True),
     ({"reasoning_effort": "high"}, True),
+    ({"thinking": {"type": "enabled"}}, True),
 ])
 def test_thinking_toggle_accepts_every_ecosystem_spelling(gs, req, expected):
     # Three ecosystems disagree; a client should not have to know which one
-    # this server speaks.
+    # this server speaks. Each spelling has to work in BOTH directions -- a
+    # request that asks FOR reasoning must get it now that the default is off,
+    # which the old table never checked for two of the three spellings.
     assert gs._wants_thinking(req) is expected
+
+
+def test_reasoning_is_suppressed_by_default(gs):
+    """The default is OFF, and it is load-bearing rather than incidental.
+
+    Measured on this box, the same prompt and the same correct tool call cost
+    41s with the reasoning block and 2.4s without -- 10-17x on every agent step,
+    with a length that swings run to run, so the old default was unpredictable
+    as well as slow. This server exists to be driven by an agent and its own
+    docs recommend suppressing it, so the recommended configuration is now the
+    one you get without asking.
+    """
+    assert gs.THINKING_DEFAULT is False
+    assert gs._wants_thinking({}) is False
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("1", True), ("true", True), ("yes", True),
+    ("0", False), ("false", False), ("", False),
+])
+def test_the_server_default_is_still_one_env_var_away(gs, monkeypatch, value,
+                                                      expected):
+    # Flipping a default must not remove the choice. Faithfulness to the model
+    # is a legitimate thing to want -- suppression is a prompt prefill, not a
+    # filter over the output, so a caller who asks for reasoning gets exactly
+    # what the model produced.
+    import importlib
+    monkeypatch.setenv("GENIE_THINKING", value)
+    importlib.reload(gs)
+    assert gs.THINKING_DEFAULT is expected
+    assert gs._wants_thinking({}) is expected
+
+
+def test_an_explicit_request_still_beats_the_server_default(gs, monkeypatch):
+    # Both directions: the per-request field wins over whatever the server is
+    # configured to do, or the three spellings would be decorative.
+    import importlib
+    monkeypatch.setenv("GENIE_THINKING", "1")
+    importlib.reload(gs)
+    assert gs._wants_thinking({"reasoning_effort": "none"}) is False
+    monkeypatch.setenv("GENIE_THINKING", "0")
+    importlib.reload(gs)
+    assert gs._wants_thinking({"reasoning_effort": "high"}) is True
+
+
+def test_suppression_renders_as_a_prefill_not_a_filter(gs):
+    # Why flipping the default is not a loss of fidelity: the "off" path adds a
+    # CLOSED, empty think block to the prompt so the model resumes after it. It
+    # never strips anything the model produced -- that is GENIE_STRIP_THINK, a
+    # separate knob that stays off.
+    on = gs.TEMPLATE.build([{"role": "user", "content": "hi"}], thinking=True)
+    off = gs.TEMPLATE.build([{"role": "user", "content": "hi"}], thinking=False)
+    assert off == on + gs._NO_THINK
+    assert gs._NO_THINK.startswith("<think>") and "</think>" in gs._NO_THINK
+    assert gs.STRIP_THINK is False
 
 
 @pytest.mark.parametrize("finish,calls,stop,expected", [
@@ -451,3 +510,55 @@ def test_a_refused_tool_request_never_queues_behind_a_generation(gs, handler):
     finally:
         for _ in range(gs.MAX_INFLIGHT):
             gs._INFLIGHT.release()
+
+
+# --- /props carries what a router cannot otherwise learn -------------------
+# n_ctx alone is not enough to choose among an NPU, a GPU and a CPU endpoint,
+# and on this engine it is actively misleading: it is the SOFTWARE cap, while
+# throughput is set by the compiled window and by whether the bundle carries
+# one graph or several. Two bundles reporting the same n_ctx differ 2-3x on
+# short prompts, and nothing over HTTP could tell them apart.
+
+def test_props_says_which_engine_is_answering(gs):
+    _code, body = _get(gs, "/props")
+    assert body["genie"]["engine"] == "npu-hexagon-htp"
+    # The constraint a dispatcher has to encode, not discover from a 429.
+    assert body["genie"]["single_flight"] is True
+
+
+def test_props_exposes_the_compiled_graphs_not_just_the_window(gs):
+    gs._CONTEXT_LENGTHS = [512, 1024, 2048, 4096]
+    _code, body = _get(gs, "/props")
+    assert body["genie"]["context_lengths"] == [512, 1024, 2048, 4096]
+    assert body["genie"]["multi_length"] is True
+
+
+def test_props_marks_a_single_length_bundle_as_such(gs):
+    # The 2-3x short-prompt difference a router would otherwise attribute to
+    # the model or the depth.
+    gs._CONTEXT_LENGTHS = [8192]
+    _code, body = _get(gs, "/props")
+    assert body["genie"]["multi_length"] is False
+
+
+def test_props_reports_poll_because_it_decides_concurrency(gs):
+    # poll:true turns NPU+GPU from a 1.45x gain into a 0.78x loss, so a client
+    # deciding whether to run a second engine needs to see it.
+    gs._POLL_MATCHES = [(True, "QnnHtp.poll")]
+    _code, body = _get(gs, "/props")
+    assert body["genie"]["poll"] is True
+
+
+def test_props_does_not_invent_a_poll_value_it_could_not_read(gs):
+    gs._POLL_MATCHES = []
+    _code, body = _get(gs, "/props")
+    assert body["genie"]["poll"] is None
+
+
+def test_the_genie_block_is_additive_not_a_replacement(gs):
+    # Namespaced so no llama.cpp-shaped field is misreported, and additive so a
+    # client that ignores it sees exactly what it saw before.
+    _code, body = _get(gs, "/props")
+    assert body["default_generation_settings"]["n_ctx"] == gs.read_context_size()
+    assert body["model_alias"] == gs.MODEL_ID
+    assert "model_path" not in body and "modality" not in body

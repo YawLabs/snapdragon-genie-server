@@ -23,7 +23,7 @@ Config via environment (all have sensible defaults for this repo's scratchpad):
   GENIE_MODEL_ID     model id reported to clients (default qwen3-4b-npu)
   GENIE_MAX_TOKENS   default max generated tokens if request omits it (default 512)
   GENIE_STRIP_THINK  "1" strips <think>...</think> from content (default 0 = faithful)
-  GENIE_THINKING     "0" suppresses Qwen3's reasoning block entirely (default 1 = on).
+  GENIE_THINKING     "1" re-enables Qwen3's reasoning block (default 0 = suppressed).
                      Per request: chat_template_kwargs.enable_thinking,
                      reasoning_effort:"none", or thinking:{"type":"disabled"}
 """
@@ -55,11 +55,24 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("GENIE_MAX_TOKENS", "512"))
 STRIP_THINK = os.environ.get("GENIE_STRIP_THINK", "0") == "1"
 # Qwen3 is a reasoning model: left alone it emits a <think> block before every
 # answer. Measured on this box, a single tool-calling turn spent ~280 of its
-# 300 output tokens thinking -- 37s for one agent step at 13 t/s. The bundle's
-# own template supports suppressing it by PREFILLING an empty think block, so
-# expose that as a knob. Default stays ON (faithful to the model); agent
-# clients that want the latency back turn it off per request or per server.
-THINKING_DEFAULT = os.environ.get("GENIE_THINKING", "1") != "0"
+# 300 output tokens thinking -- 41s against 2.4s for the same prompt and the
+# same correct call. The bundle's own template supports suppressing it by
+# PREFILLING a closed, empty think block, so this exposes that as a knob.
+#
+# DEFAULT IS OFF, changed deliberately. This used to default ON, on the
+# reasoning that faithfulness to the model is the honest default and agent
+# clients could opt out. Two things make that the wrong trade HERE. The cost is
+# not a tax on quality, it is 10-17x on every agent step, and its length swings
+# run to run -- so the default was not merely slow but unpredictable, which is
+# the property a human actually notices. And this server exists to be driven by
+# an agent: the docs recommend turning thinking off for agentic use, so shipping
+# the opposite made the recommended configuration the one nobody got by default.
+# A default should be the thing the primary caller wants.
+#
+# Faithfulness is still one env var or one request field away, and NOTHING here
+# is lossy -- suppression is a prompt prefill, not a filter over the output, so
+# a caller that asks for reasoning gets exactly what the model produces.
+THINKING_DEFAULT = os.environ.get("GENIE_THINKING", "0") in ("1", "true", "yes")
 # Headroom left between the rendered prompt and the compiled window, so a
 # generation has somewhere to go. Genie hard-errors (status=4) on overflow --
 # it does not truncate -- so the margin is what stands between a long session
@@ -95,7 +108,16 @@ _CONTEXT_SIZE = None
 
 
 def read_context_size(default=4096):
-    """The context length this bundle was COMPILED with, from genie_config.json.
+    """`dialog.context.size` from genie_config.json -- the SOFTWARE window cap.
+
+    Precisely NOT "the window this bundle was compiled at", which this
+    docstring used to claim. The two can differ: measured here, setting this to
+    1024 against a 4096-compiled bundle left the HTP allocation byte-identical
+    and decode unchanged, because the compiled window is fixed at export time
+    (`--context-lengths`) and this key only lowers the ceiling the evictor works
+    against. So it is the right number for the eviction budget and for what a
+    client may send, and the WRONG number to predict latency from -- that
+    belongs to the compiled window, which read_context_lengths() reports.
 
     Read rather than hardcoded, for the same reason llama.cpp reports n_ctx at
     /props instead of publishing a constant: the value belongs to the bundle,
@@ -124,6 +146,178 @@ def read_context_size(default=4096):
     except Exception:
         _CONTEXT_SIZE = default
     return _CONTEXT_SIZE
+
+
+_CONTEXT_LENGTHS = None
+# Every `poll` found in the config; None until read, [] when there are none.
+# Deliberately ONE global rather than this plus a cached pick: two that must be
+# written together is an invariant nothing enforces, and the failure is silent
+# -- a pre-set pick with no matches makes the conflict check below evaluate to
+# empty and report nothing. _pick_poll is pure and runs on a 0-2 element list,
+# so deriving it per call costs nothing worth keeping a second global for.
+_POLL_MATCHES = None
+
+
+def _find_all(obj, key, path=""):
+    """Every (value, dotted-path) for `key`, in document order.
+
+    Searched rather than addressed by a fixed path because the QnnHtp block's
+    nesting has moved between QAIRT releases and this server deliberately
+    supports more than one. A hardcoded path that is right for 2.45 and absent
+    on the next SDK would read as "the flag is not set" -- the wrong answer for
+    a flag whose shipped default is the expensive one.
+
+    ALL of them rather than the first, because "first" means depth-first in
+    insertion order, which prefers a NESTED match over a shallower one: on
+    {"a": {"poll": true}, "poll": false} it returned a.poll. Harmless on every
+    real genie_config.json, which has one -- and silently wrong on one with
+    two, in a value that drives both a startup warning and /props. Collect them
+    and let the caller disambiguate, so a config we cannot read confidently
+    says so instead of picking.
+    """
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            here = "%s.%s" % (path, k) if path else k
+            if k == key:
+                out.append((v, here))
+            else:
+                out.extend(_find_all(v, key, here))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            out.extend(_find_all(v, key, "%s[%d]" % (path, i)))
+    return out
+
+
+def _pick_poll(matches):
+    """The (value, path) that is most likely the backend's, or (None, None).
+
+    A QnnHtp-qualified path wins. The BLOCK is called QnnHtp in every QAIRT
+    that ships one; what moves between releases is where it sits, which is
+    exactly why the search is by key rather than by path. Failing that, the
+    shallowest match -- a buried key is less likely to be the backend's than a
+    top-level one -- and document order breaks a remaining tie, since sorted()
+    is stable.
+    """
+    if not matches:
+        return (None, None)
+    qualified = [m for m in matches if "qnnhtp" in m[1].lower()]
+    return sorted(qualified or matches, key=lambda m: m[1].count("."))[0]
+
+
+def read_poll_setting():
+    """The bundle's QnnHtp `poll` flag as (value, where). (None, None) if absent.
+
+    Checked at startup rather than left to a doc line, because it is the single
+    most consequential thing about a bundle and it ships in the wrong state.
+    `"poll": true` busy-waits: measured here, a server that has answered nothing
+    but /health burns 270% CPU -- 2.7 cores -- while completely idle, and it
+    costs up to 55% of decode on top. It also decides whether running this
+    engine beside a GPU one is a 1.45x gain or a 0.78x LOSS, because the OpenCL
+    backend needs those same host cores to dispatch a kernel per token.
+
+    Nearly every retracted number in docs/ traces back to this flag being true
+    and nobody noticing. Noticing is cheap; the docs are the record of what not
+    noticing costs.
+    """
+    global _POLL_MATCHES
+    if _POLL_MATCHES is None:
+        try:
+            with open(os.path.join(BUNDLE_DIR, "genie_config.json"),
+                      encoding="utf-8") as f:
+                _POLL_MATCHES = _find_all(json.load(f), "poll")
+        except Exception:
+            _POLL_MATCHES = []
+    return _pick_poll(_POLL_MATCHES)
+
+
+def read_context_lengths():
+    """`genie.context_lengths` from metadata.json -- the graphs inside the bundle.
+
+    Not a record of what the model COULD be exported at: confirmed with
+    `qnn-context-binary-utility`, a bundle carries one prefill and one decode
+    graph per compiled length and runs each token against the smallest that
+    fits. A single-length bundle has one pair and so runs every token against
+    its whole window. Measured 2-3x on short prompts at the SAME n_ctx, for
+    +3.8% bundle size and zero extra HTP memory.
+
+    Read off the artifact because nothing else can show it: two bundles of the
+    same window are byte-identical in metadata.json apart from this list, so
+    /props cannot distinguish them and neither can a latency measurement taken
+    at one depth.
+    """
+    global _CONTEXT_LENGTHS
+    if _CONTEXT_LENGTHS is None:
+        try:
+            with open(os.path.join(BUNDLE_DIR, "metadata.json"),
+                      encoding="utf-8") as f:
+                v = (json.load(f).get("genie") or {}).get("context_lengths")
+            # isinstance, not truthiness: a bare string is iterable, so
+            # "8192" yielded [8, 1, 9, 2] -- a bundle reported as multi-length
+            # with four invented graph lengths, which is exactly the misreport
+            # this field was added to prevent. Anything that is not a list
+            # claims nothing.
+            _CONTEXT_LENGTHS = [int(x) for x in v] if isinstance(v, list) else []
+        except Exception:
+            _CONTEXT_LENGTHS = []
+    return _CONTEXT_LENGTHS
+
+
+def bundle_config_warnings():
+    """Lines to print about a bundle configured to be slower than it needs to be.
+
+    Both settings below are worth more than anything else this server does, and
+    both were previously left to whoever remembered to read the docs. This
+    repo's habit everywhere else -- placement, port, Hexagon arch -- is to
+    DERIVE the fact from the artifact and say so out loud rather than hope. This
+    is that habit applied to the two it had missed.
+
+    Warn, never refuse: a bundle is a large external artifact and a slow server
+    is still a working one. Refusing to start would turn a performance note into
+    an outage.
+    """
+    out = []
+    poll, where = read_poll_setting()
+    # Say so rather than pick silently. _pick_poll's rule is a heuristic, and a
+    # heuristic that resolves a genuine conflict without mentioning it is how a
+    # wrong value reaches /props looking authoritative.
+    decided = {bool(v) for v, _p in (_POLL_MATCHES or []) if v is not None}
+    if len(decided) > 1:
+        out.append(
+            "WARNING: genie_config.json defines `poll` in %d places with "
+            "conflicting values (%s). Using %s=%s; confirm that is the QnnHtp "
+            "backend's copy, because the others are being ignored."
+            % (len(_POLL_MATCHES),
+               ", ".join("%s=%s" % (p, v) for v, p in _POLL_MATCHES),
+               where, poll))
+    # Absence first, then TRUTHINESS -- not `poll is True`. Identity-strict was
+    # wrong for the thing being guarded: JSON `true` parses to Python True, but
+    # `1` and `"true"` are valid config, both busy-wait, and both fell through
+    # the old `is True` AND the `is None` below to produce no warning at all.
+    # Silently accepting the expensive setting is the one outcome this check
+    # exists to prevent, so it now fires on anything truthy and reports the
+    # value as written rather than asserting "= true".
+    if poll is None:
+        out.append(
+            "note: no `poll` key found in genie_config.json. The shipped "
+            "default is true, which busy-waits on ~2.7 cores; if this bundle "
+            "is slower than expected, add \"poll\": false to its QnnHtp block.")
+    elif poll:
+        out.append(
+            "WARNING: this bundle has %s = %s. It busy-waits: ~2.7 host "
+            "cores burned while IDLE, up to 55%% of decode lost, and NPU+GPU "
+            "concurrency turned from a 1.45x gain into a 0.78x loss. Set it to "
+            "false in genie_config.json and restart -- nothing measured got "
+            "worse." % (where or "QnnHtp.poll", json.dumps(poll)))
+    lengths = read_context_lengths()
+    if len(lengths) == 1:
+        out.append(
+            "WARNING: this is a SINGLE-length bundle (genie.context_lengths = "
+            "%s). It runs every token against its whole compiled window, "
+            "measured 2-3x slower on short prompts than a multi-length bundle "
+            "of the SAME window. Re-export with several --context-lengths "
+            "(+3.8%% size, zero extra HTP memory)." % lengths)
+    return out
 
 
 LIB_DIR = os.path.join(SDK_DIR, "lib", "aarch64-windows-msvc")
@@ -347,14 +541,22 @@ class ChatML:
         self.asst_suf = tmpl["assistant_suffix"]
         self.default_system = tmpl.get("default_system_prompt", "")
 
-    def build(self, messages, tools=None, thinking=True):
+    def build(self, messages, tools=None, thinking=None):
         """Assemble a ChatML prompt ending with an open assistant turn.
+
+        `thinking=None` means "whatever the server is configured to do", read
+        from THINKING_DEFAULT. Spelling the default as a literal `True` here is
+        what let this drift out of step with the policy when that flipped: the
+        signature kept promising reasoning-enabled prompts the server would
+        never itself produce. One source of truth, so it cannot happen twice.
 
         `tools` renders Qwen3's tool preamble into the system turn; assistant
         `tool_calls` and role="tool" results round-trip in the same shapes the
         bundle's own Jinja template uses, so a multi-turn tool conversation
         replays exactly as the model was trained to see it.
         """
+        if thinking is None:
+            thinking = THINKING_DEFAULT
         parts = []
         sys_text = ""
         for m in messages:
@@ -493,13 +695,24 @@ class EngineHealth:
             self.last_progress = now
             self.tokens += 1
 
-    def end(self, ok, now=None):
+    def end(self, ok, now=None, counted=True):
+        """Close out a generation.
+
+        `counted=False` is for the server's OWN calls into the engine -- today
+        just summarising evicted turns. Those still get full stall and failure
+        supervision, because they run on the same device and can wedge it
+        exactly as a client request can. What they are not is traffic anyone
+        asked for, so counting them made `generations` on /health report more
+        work served than any client ever requested -- a diagnostic that drifts
+        from the thing it describes, which is what this endpoint exists to end.
+        """
         with self._lock:
             self.started = None
             self.last_progress = None
             self.stall_signalled_at = None
             self.tokens = 0
-            self.generations += 1
+            if counted:
+                self.generations += 1
             self.consecutive_failures = 0 if ok else self.consecutive_failures + 1
 
     def note_stall_signalled(self, now):
@@ -696,9 +909,13 @@ class GenieEngine:
         self._committed = prompt + generated
 
     def query(self, prompt, on_text, max_tokens=None, stop=None, sampler=None,
-              commit=True):
+              commit=True, internal=False):
         """Run one query synchronously (for non-streaming). on_text(str) is
-        called per chunk. Returns 'stop' | 'length'. Serialized (NPU is single)."""
+        called per chunk. Returns 'stop' | 'length'. Serialized (NPU is single).
+
+        `internal=True` marks a call this server made for its own purposes
+        rather than one a client asked for; it is supervised the same but is
+        not counted as served traffic. See EngineHealth.end."""
         with self.lock:
             self._aborted = False       # stale abort must not poison this turn
             self.set_stop_sequences(stop)
@@ -735,7 +952,8 @@ class GenieEngine:
                 status = self.lib.GenieDialog_query(
                     self.dialog, send.encode("utf-8"), SENTENCE_COMPLETE, cb, None)
             finally:
-                HEALTH.end(status == GENIE_STATUS_SUCCESS, time.time())
+                HEALTH.end(status == GENIE_STATUS_SUCCESS, time.time(),
+                           counted=not internal)
             # commit=False for internal calls (summarisation): they leave the
             # dialog holding text that is NOT the caller's conversation, so
             # recording it as the resident prefix would be a false claim. None
@@ -825,7 +1043,22 @@ class GenieEngine:
 
     def count_tokens(self, text):
         """Exact token count via the Genie tokenizer, or None on any failure
-        (callers fall back to an estimate). Serialized with generation."""
+        (callers fall back to an estimate). Serialized with generation.
+
+        That serialization has a cost worth naming, because it is invisible
+        from the call site: this takes the SAME lock a generation holds, so a
+        queued request cannot even be SIZED while another is decoding, and
+        during a wedge it blocks with everything else. _fit's bisection and
+        _tok_count's memo exist to keep the number of these calls near the
+        floor (~log2(turns) per request, down from one per evicted turn)
+        rather than to avoid the lock.
+
+        Dropping the lock is NOT the obvious win it looks like: the tokenizer
+        handle comes from the resident dialog, and whether it is safe to encode
+        on one thread while another is inside GenieDialog_query is a property
+        of the driver that cannot be established without the device. Concurrent
+        HTP access is what wedges this part in the first place, so the lock
+        stays until someone measures the alternative on hardware."""
         if not self.tokenizer or not text:
             return None
         try:
@@ -1209,7 +1442,7 @@ TOOLS_OK = False
 
 # Bound the number of in-flight generation requests (1 running on the NPU + a
 # small queue). Excess requests are rejected fast instead of piling up parked
-# threads behind the single-flight lock. 0 disables the cap.
+# threads behind the single-flight lock. Floored at 1 -- see below.
 # Concurrency vs KV reuse, a real tradeoff worth stating: the dialog holds ONE
 # resident KV, so when two conversations interleave here each one resets the
 # other's prefix and both pay a full re-prefill. MAX_INFLIGHT=2 keeps the
@@ -1367,7 +1600,7 @@ def _summarize_turns(msgs, prior=""):
     out = []
     try:
         ENGINE.query(prompt, out.append, max_tokens=summary_token_cap(),
-                     commit=False)
+                     commit=False, internal=True)
     except Exception:
         return None, 0
     text = _THINK_RE.sub("", "".join(out)).strip()
@@ -1412,7 +1645,7 @@ def _prior_note(messages):
     return ""
 
 
-def build_windowed(messages, tools=None, thinking=True, max_tokens=0,
+def build_windowed(messages, tools=None, thinking=None, max_tokens=0,
                    summarize=None):
     """Render a prompt that FITS, summarising what it has to evict.
 
@@ -1427,6 +1660,8 @@ def build_windowed(messages, tools=None, thinking=True, max_tokens=0,
     """
     if summarize is None:
         summarize = SUMMARIZE_EVICTED
+    if thinking is None:
+        thinking = THINKING_DEFAULT   # see ChatML.build -- one source of truth
     budget = read_context_size() - max(0, max_tokens) - WINDOW_MARGIN
 
     prompt, kept, evicted, fits = _fit(messages, tools, thinking, budget)
@@ -1498,9 +1733,19 @@ class Handler(BaseHTTPRequestHandler):
             # token budget and the compaction threshold, so the client would
             # never suggest /compact and would overrun the model instead.
             #
-            # Only the two fields typed actually reads are emitted:
+            # The two fields typed actually reads:
             #   default_generation_settings.n_ctx -- the window
             #   model_alias / model_id            -- the served model's name
+            #
+            # Plus a namespaced `genie` block, because a router choosing among
+            # an NPU, a GPU and a CPU endpoint cannot otherwise learn any of it
+            # from HTTP. n_ctx alone is actively misleading here: it is the
+            # SOFTWARE cap, while throughput is set by the compiled window and
+            # by whether the bundle carries one graph or several -- two bundles
+            # of the same n_ctx differ 2-3x on short prompts, and `poll` decides
+            # whether running this engine beside another is a gain or a loss.
+            # Namespaced so no llama.cpp-shaped field is misreported, and
+            # additive so a client that ignores it sees what it saw before.
             #
             # `model_path` is deliberately OMITTED even though typed checks it
             # FIRST: it would take precedence and typed would then display the
@@ -1511,10 +1756,19 @@ class Handler(BaseHTTPRequestHandler):
             # No modality field: absence reads as text-only, which is the
             # truth for this bundle. Claiming a modality it does not have
             # would be worse than saying nothing.
+            poll, _where = read_poll_setting()
+            lengths = read_context_lengths()
             self._json(200, {
                 "default_generation_settings": {"n_ctx": read_context_size()},
                 "model_alias": MODEL_ID,
                 "model_id": MODEL_ID,
+                "genie": {
+                    "engine": "npu-hexagon-htp",
+                    "single_flight": True,
+                    "context_lengths": lengths,
+                    "multi_length": len(lengths) > 1,
+                    "poll": poll,
+                },
             })
         elif self.path.rstrip("/") in ("/health", "/healthz"):
             # Reports the ENGINE's state, not the HTTP server's. Those come
@@ -1568,7 +1822,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": {"message": msg,
                                            "type": "invalid_request_error"}})
             return
-        if _INFLIGHT is not None and not _INFLIGHT.acquire(blocking=False):
+        if not _INFLIGHT.acquire(blocking=False):
             # NPU is single-flight and the small queue is full -> shed load.
             if path == "/v1/messages":
                 self._anthropic_error(529, "overloaded_error", "server busy; NPU is single-flight")
@@ -1579,8 +1833,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             gen(req)
         finally:
-            if _INFLIGHT is not None:
-                _INFLIGHT.release()
+            _INFLIGHT.release()
 
     def _openai_chat(self, req):
         messages = req.get("messages", [])
@@ -1994,18 +2247,32 @@ def watchdog(engine, health, interval=5.0, on_wedge=None, iterations=None):
     ending the test runner's own process. Every path to the exit goes through
     `on_wedge`, so overriding it is sufficient to make this safe in a test --
     there is no second route that could still terminate the runner.
+
+    The steady states ANNOUNCE ONCE. `failing` persists until a generation
+    succeeds and `wedged` persists forever under GENIE_WEDGE_EXIT=0, so
+    printing them every `interval` reprinted a multi-line stanza every five
+    seconds for as long as the outage lasted -- burying the first occurrence,
+    which is the one carrying the original cause, under thousands of identical
+    copies of itself. The latch clears when the engine returns to ok, so a
+    second, genuinely new episode is announced again. `stalled` is deliberately
+    NOT latched: each line marks a fresh abort signal, and it is bounded by the
+    grace period rather than open-ended.
     """
     on_wedge = _exit_for_supervisor if on_wedge is None else on_wedge
     n = 0
+    announced = None
     while iterations is None or n < iterations:
         n += 1
         time.sleep(interval)
         now = time.time()
         state, detail = health.assess(now)
         if state == "ok":
+            announced = None
             continue
         if state == "failing":
-            print("[genie] UNHEALTHY: %s" % detail, flush=True)
+            if announced != "failing":
+                print("[genie] UNHEALTHY: %s" % detail, flush=True)
+                announced = "failing"
             continue
         if state == "stalled":
             print("[genie] STALL: %s -- signalling abort" % detail, flush=True)
@@ -2016,13 +2283,15 @@ def watchdog(engine, health, interval=5.0, on_wedge=None, iterations=None):
                 print("[genie] abort signal failed: %s" % e, flush=True)
             continue
         # wedged
-        print("[genie] WEDGED: %s" % detail, flush=True)
-        print("[genie] The engine cannot be recovered in this process: the "
-              "stuck call is inside the Genie driver, holding the engine lock, "
-              "and Python cannot reclaim a thread blocked in native code. "
-              "Exiting %d so a supervisor restarts a clean process. "
-              "(GENIE_WEDGE_EXIT=0 to stay up and keep reporting 503.)"
-              % EXIT_WEDGED, flush=True)
+        if announced != "wedged":
+            print("[genie] WEDGED: %s" % detail, flush=True)
+            print("[genie] The engine cannot be recovered in this process: the "
+                  "stuck call is inside the Genie driver, holding the engine "
+                  "lock, and Python cannot reclaim a thread blocked in native "
+                  "code. Exiting %d so a supervisor restarts a clean process. "
+                  "(GENIE_WEDGE_EXIT=0 to stay up and keep reporting 503.)"
+                  % EXIT_WEDGED, flush=True)
+            announced = "wedged"
         result = on_wedge(detail)
         # Only reached when the exit was declined (GENIE_WEDGE_EXIT=0, or a
         # test's stand-in). Keep watching and keep reporting 503 rather than
@@ -2044,6 +2313,12 @@ def main():
             "process kept answering, so requests would hit ITS model, not the "
             "bundle named here. Stop it first, or set GENIE_PORT to a free "
             "port." % (HOST, PORT))
+    # Before the model load, for the same reason as the port check above:
+    # these two settings are worth more than everything else this server does,
+    # and finding out after 30-50s of loading that the bundle is configured to
+    # run at half speed wastes all of it.
+    for line in bundle_config_warnings():
+        print("[genie] %s" % line, flush=True)
     TEMPLATE = load_chat_template()
     TOOLS_OK = probe_tool_support()
     ENGINE = load_engine()
@@ -2054,6 +2329,18 @@ def main():
     print("[genie]   POST /v1/chat/completions (OpenAI)   POST /v1/messages (Anthropic)",
           flush=True)
     print("[genie]   GET /v1/models   GET /health", flush=True)
+    _lengths = read_context_lengths()
+    _poll, _ = read_poll_setting()
+    # Printed even when nothing is wrong, so a log or a screenshot carries what
+    # a measurement has to be filed under. Two bundles of the same n_ctx differ
+    # 2-3x on short prompts, and this is the only place the difference shows.
+    print("[genie]   bundle: n_ctx=%d  context_lengths=%s (%s)  poll=%s"
+          % (read_context_size(),
+             _lengths or "unknown",
+             "multi-length" if len(_lengths) > 1 else
+             "SINGLE-length -- 2-3x slower on short prompts"
+             if len(_lengths) == 1 else "unreadable",
+             "unset (ships true)" if _poll is None else _poll), flush=True)
     print("[genie]   sampling: server-level only (dialog.sampler in "
           "genie_config.json). Per-request temperature/top_p are accepted but "
           "NOT honoured -- QAIRT 2.45 ignores a post-create sampler apply.",
@@ -2062,6 +2349,28 @@ def main():
     if cap != SUMMARY_MAX_TOKENS:
         print("[genie]   summary note capped at %d tokens (n_ctx=%d), not the "
               "requested %d" % (cap, read_context_size(), SUMMARY_MAX_TOKENS),
+              flush=True)
+    # Both branches spelled out. Interpolating only the state into a fixed
+    # sentence made the opt-in branch contradict itself -- it announced
+    # reasoning ON and then told a user who had just set GENIE_THINKING=1 to
+    # set GENIE_THINKING=1. A startup line that argues with itself is worse
+    # than none, because it is read once, at the moment the operator is
+    # deciding whether the server is configured the way they meant.
+    if THINKING_DEFAULT:
+        print("[genie]   reasoning: ON server-wide (GENIE_THINKING). Qwen3's "
+              "<think> block costs 10-17x on an agent turn (41s vs 2.4s "
+              "measured) and its length swings run to run, so agent clients "
+              "should turn it off per request: "
+              "chat_template_kwargs.enable_thinking=false, "
+              "reasoning_effort=\"none\", or thinking={\"type\":\"disabled\"}.",
+              flush=True)
+    else:
+        print("[genie]   reasoning: suppressed by default. Qwen3's <think> "
+              "block costs 10-17x on an agent turn (41s vs 2.4s measured), so "
+              "it is prefilled closed unless asked for. GENIE_THINKING=1 "
+              "re-enables it server-wide; per request, "
+              "chat_template_kwargs.enable_thinking=true, "
+              "reasoning_effort=\"high\", or thinking={\"type\":\"enabled\"}.",
               flush=True)
     print("[genie]   tool calling: %s" %
           ("enabled (<tool_call> in bundle vocab)" if TOOLS_OK
