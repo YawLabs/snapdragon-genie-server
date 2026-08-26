@@ -780,6 +780,45 @@ def test_a_malformed_body_names_the_parse_problem(gs, handler):
     assert gs.ENGINE.calls == []
 
 
+def test_a_malformed_body_uses_the_envelope_of_the_endpoint_it_hit(gs, handler):
+    """The parse failure happens BEFORE the path fork, and used to ignore it.
+
+    Every /v1/messages error was assumed to be Anthropic-shaped, but do_POST
+    forked on path only for the tools refusal and the load shed -- both BELOW
+    this failure. So a body cut short by a dropped connection came back to an
+    Anthropic client as {"error": {...}} with no top-level "type": a shape it
+    cannot parse, at the one moment it needs to be told something.
+
+    Asserting error.type is NOT enough to catch this, which is why it went
+    unnoticed: both envelopes carry error.type and error.message, so a check on
+    those passes whichever shape is returned. The discriminator is the
+    top-level "type": "error" that only the Anthropic envelope has.
+    """
+    code, body = _post_raw(gs, handler, b'{"messages": [', path="/v1/messages")
+    assert code == 400
+    assert body.get("type") == "error", (
+        "an Anthropic client cannot parse an OpenAI-shaped error")
+    assert body["error"]["message"].startswith("bad JSON:")
+
+    code, body = _post_raw(gs, handler, b'{"messages": [',
+                           path="/v1/chat/completions")
+    assert code == 400
+    assert "type" not in body, "the OpenAI envelope has no top-level type"
+    assert body["error"]["message"].startswith("bad JSON:")
+
+
+def test_the_tools_refusal_keeps_each_api_envelope(gs, handler):
+    # The same fork, one layer down, now routed through the shared helper --
+    # so a later edit cannot fix one envelope and leave the other behind.
+    gs.TOOLS_OK = False
+    req = {"messages": [{"role": "user", "content": "hi"}],
+           "tools": [{"type": "function"}]}
+    _code, anth = _post_json(gs, handler, req, path="/v1/messages")
+    assert anth.get("type") == "error"
+    _code, oai = _post_json(gs, handler, req, path="/v1/chat/completions")
+    assert "type" not in oai
+
+
 def test_an_unknown_post_path_404s_rather_than_guessing(gs, handler):
     # The GET twin is covered; this one was not. 404 rather than 400 is what
     # tells a probing client the endpoint is absent, not its request bad -- so

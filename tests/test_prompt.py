@@ -109,27 +109,57 @@ def test_string_arguments_are_parsed_into_an_object(gs):
     assert gs._bare_tool_calls(STR_ARGS_CALL) == EXPECTED             # and the helper itself
 
 
-def test_unparseable_string_arguments_pass_through_raw(gs):
-    # Pins what the bare `except: pass` actually does -- `arguments` comes back
-    # as the RAW STRING, so a client doing args["path"] gets TypeError, not a
-    # KeyError it could handle. Both paths behave the same. If that is ever
-    # tightened (to {}, or to refusing the call) this is the test that says so.
+def test_arguments_that_do_not_resolve_to_an_object_are_not_a_call(gs):
+    # Was: the raw string came back as `arguments`, so a client doing
+    # args["path"] got TypeError rather than a KeyError it could handle. There
+    # is no honest dict to hand back here -- coercing to {} would invent an
+    # argument-free call the model never made -- so the block is treated like
+    # any other malformed one and LEFT VISIBLE, where a human can see what the
+    # model actually emitted. Both parse paths agree.
     junk = json.dumps({"name": "read_file", "arguments": "path=c.yaml"})
-    raw = [{"name": "read_file", "arguments": "path=c.yaml"}]
-    assert gs.parse_tool_calls("<tool_call>%s</tool_call>" % junk)[1] == raw
-    assert gs._bare_tool_calls(junk) == raw
+    text, calls = gs.parse_tool_calls("<tool_call>%s</tool_call>" % junk)
+    assert calls == []
+    assert "path=c.yaml" in text, "swallowing it leaves a mystery empty reply"
+    assert gs._bare_tool_calls(junk) == []
 
 
-def test_empty_string_arguments_stay_an_empty_string(gs):
-    # The pass-through case a WELL-FORMED client can produce, not model junk: a
-    # zero-argument call rendered as "". json.loads("") raises, so it falls
-    # through the same except and the caller gets "" where {} is what the call
-    # means -- unlike an omitted `arguments`, which the wrapped path defaults.
+def test_valid_json_that_is_not_an_object_is_not_a_call(gs):
+    # The subtler half: these PARSE fine and still cannot be an argument set.
+    # `arguments` reaching a client as the int 123 breaks the OpenAI schema and
+    # produces an Anthropic tool_use block whose input is not an object.
+    for scalar in ('"123"', '"[1, 2]"', '"null"', '"\"hello\""'):
+        body = '{"name": "n", "arguments": %s}' % scalar
+        assert gs.parse_tool_calls("<tool_call>%s</tool_call>" % body)[1] == [], scalar
+
+
+def test_a_zero_argument_call_means_no_arguments(gs):
+    # A WELL-FORMED client shape, not model junk: arguments rendered as "".
+    # json.loads("") raises, so it used to fall through to the raw string and
+    # the caller got "" where {} is what the call means -- inconsistent with an
+    # OMITTED arguments three lines away, which already defaulted to {}. The
+    # two spellings of "no arguments" now agree.
     empty = json.dumps({"name": "now", "arguments": ""})
     assert gs.parse_tool_calls("<tool_call>%s</tool_call>" % empty)[1] == [
-        {"name": "now", "arguments": ""}]
+        {"name": "now", "arguments": {}}]
     assert gs.parse_tool_calls('<tool_call>{"name": "now"}</tool_call>')[1] == [
         {"name": "now", "arguments": {}}]
+    assert gs._bare_tool_calls(empty) == [{"name": "now", "arguments": {}}]
+
+
+def test_arguments_are_always_a_dict_when_a_call_is_returned(gs):
+    # The contract the downstream consumers need, stated once: _complete
+    # json.dumps this and _anthropic_complete puts it in tool_use.input, where
+    # Anthropic requires an object. Anything that cannot be one is not a call.
+    # Bodies built with json.dumps rather than literal escapes -- a hand-written
+    # backslash here is one layer of quoting away from silently testing
+    # something else.
+    for payload in ({"name": "n"},
+                    {"name": "n", "arguments": ""},
+                    {"name": "n", "arguments": {"a": 1}},
+                    {"name": "n", "arguments": json.dumps({"a": 1})}):
+        body = json.dumps(payload)
+        calls = gs.parse_tool_calls("<tool_call>%s</tool_call>" % body)[1]
+        assert calls and isinstance(calls[0]["arguments"], dict), body
 
 
 @pytest.mark.parametrize("payload", [

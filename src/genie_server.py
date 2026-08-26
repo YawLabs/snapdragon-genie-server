@@ -426,6 +426,48 @@ _TOOL_CALL_RE = re.compile(
     r"<(?P<tag>tool_call|function_call|tool_use)>\s*(?P<body>.*?)\s*</(?P=tag)>", re.DOTALL)
 
 
+def _tool_arguments(raw):
+    """(arguments, usable) for one call's `arguments` field.
+
+    OpenAI sends `arguments` as a JSON STRING containing an object, Qwen3 often
+    emits the object directly, and both shapes have to land on the same thing
+    because a client cannot tell them apart. What this pins is the TYPE
+    CONTRACT, which nothing previously enforced: the field came back as dict OR
+    str OR int OR None depending on what the string happened to hold, and the
+    downstream consumers cannot take that. `_complete` json.dumps it and
+    `_anthropic_complete` puts it in tool_use.input, where Anthropic requires an
+    object -- so a bare int here produced a block no Anthropic client accepts.
+
+    Two cases that look alike and are not:
+
+      * "" (or whitespace) is a WELL-FORMED zero-argument call, not junk. It
+        parsed to nothing and fell through to the raw string, so `arguments`
+        came back as "" where {} is what the call means -- and inconsistently
+        with an OMITTED `arguments`, three lines away, which already defaulted
+        to {}. Both now mean {}.
+
+      * anything that does not resolve to an object -- unparseable, or valid
+        JSON that is a scalar or a list -- is not a usable call. Coercing it to
+        {} would invent an argument-free call the model never made, so it is
+        reported unusable and the caller leaves the raw block VISIBLE, exactly
+        as it already does for a block whose body does not parse. The model's
+        output survives where a client can see it.
+    """
+    if isinstance(raw, dict):
+        return raw, True
+    if raw is None:
+        return {}, True
+    if not isinstance(raw, str):
+        return None, False          # a number or a list is not an argument set
+    if not raw.strip():
+        return {}, True             # zero-argument call
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None, False
+    return (parsed, True) if isinstance(parsed, dict) else (None, False)
+
+
 def _bare_tool_calls(text):
     """Accept a whole-output JSON blob that is unambiguously a tool call.
 
@@ -453,12 +495,9 @@ def _bare_tool_calls(text):
     for o in items:
         if not (isinstance(o, dict) and "name" in o and "arguments" in o):
             return []
-        args = o["arguments"]
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except Exception:
-                pass
+        args, usable = _tool_arguments(o["arguments"])
+        if not usable:
+            return []               # not certainly a call -> stays text
         calls.append({"name": o["name"], "arguments": args})
     return calls
 
@@ -478,12 +517,9 @@ def parse_tool_calls(text):
             name = obj["name"]
         except Exception:
             continue  # malformed -> leave the raw block visible
-        args = obj.get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except Exception:
-                pass
+        args, usable = _tool_arguments(obj.get("arguments", {}))
+        if not usable:
+            continue  # same treatment as a malformed body: leave it visible
         calls.append({"name": name, "arguments": args})
         spans.append(m.span())
     out, prev = [], 0
@@ -1788,14 +1824,30 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
+    def _request_error(self, code, msg, path=None,
+                       etype="invalid_request_error"):
+        """One error, in whichever envelope the TARGETED api uses.
+
+        do_POST used to fork on path for the tools refusal and the load shed but
+        not for the two failures above them, so a malformed body sent to
+        /v1/messages came back as {"error": {...}} with no top-level "type" --
+        the OpenAI shape, which an Anthropic client cannot parse. A client that
+        cannot read the error is told nothing at the one moment it needs to be
+        told something, so the envelope has to follow the endpoint everywhere,
+        not only where it was convenient.
+        """
+        if (path if path is not None else self.path.rstrip("/")) == "/v1/messages":
+            self._anthropic_error(code, etype, msg)
+        else:
+            self._json(code, {"error": {"message": msg, "type": etype}})
+
     def do_POST(self):
         path = self.path.rstrip("/")
         try:
             length = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(length) or b"{}")
         except Exception as e:
-            self._json(400, {"error": {"message": "bad JSON: %s" % e,
-                                       "type": "invalid_request_error"}})
+            self._request_error(400, "bad JSON: %s" % e, path)
             return
         gen = {"/v1/chat/completions": self._openai_chat,   # OpenAI Chat Completions
                "/v1/messages": self._anthropic_messages      # Anthropic Messages (typed)
@@ -1816,16 +1868,16 @@ class Handler(BaseHTTPRequestHandler):
             msg = ("tool calling is not supported: this bundle's tokenizer has "
                    "no <tool_call> token, so %s cannot emit a parseable call. "
                    "Retry without `tools`." % MODEL_ID)
-            if path == "/v1/messages":
-                self._anthropic_error(400, "invalid_request_error", msg)
-            else:
-                self._json(400, {"error": {"message": msg,
-                                           "type": "invalid_request_error"}})
+            self._request_error(400, msg, path)
             return
         if not _INFLIGHT.acquire(blocking=False):
             # NPU is single-flight and the small queue is full -> shed load.
+            # 429 on OpenAI, 529 on Anthropic -- the codes differ because the
+            # two ecosystems spell backpressure differently, so this one cannot
+            # use _request_error's shared code.
             if path == "/v1/messages":
-                self._anthropic_error(529, "overloaded_error", "server busy; NPU is single-flight")
+                self._anthropic_error(529, "overloaded_error",
+                                      "server busy; NPU is single-flight")
             else:
                 self._json(429, {"error": {"message": "server busy; NPU is single-flight",
                                            "type": "overloaded_error"}})
