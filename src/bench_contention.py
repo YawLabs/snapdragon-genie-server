@@ -58,8 +58,9 @@ structurally blind to what happens next: a leg takes a minute or two, and
 sustained load drives this box to 48.9% of base, so a figure can be gated at
 entry and decay through its own measurement. So the sweep finishes by re-running
 the leg it STARTED with, under the same gate -- an A/A whose only variable is
-elapsed time. Opening and closing within a few percent means the box held;
-anything else means the ratios above it are measuring the box, not contention.
+elapsed time. Opening and closing within `--closing-tol` (default 10%) means
+the box held; anything else means the ratios above it are measuring the box,
+not contention.
 
 Symmetric on purpose. Slower at the end means decay landed in the numerator
 (contended samples are taken after the solo ones they divide) and contention is
@@ -473,21 +474,29 @@ def paired_sweep(engines, a, make_load):
     # This produces a NUMBER instead, from the one comparison that isolates
     # box state: same engine, same depth, same token count, same gate, ~20
     # minutes apart.
-    closing = None
-    if a.closing_recheck and engines:
-        name, base, model = engines[0]
-        opened_with = per_engine[name]["solo"]
-        if opened_with:
-            print()
-            print("--- closing re-check: %s solo, the leg this run opened "
-                  "with ---" % name, flush=True)
-            final = measure(base, model, a.depth, a.tokens, a.timeout,
-                            "%s solo (closing)" % name, cool_floor=a.cool_floor)
-            if final:
-                closing = {"engine": name, "first": opened_with[0],
-                           "final": final, "retained": final / opened_with[0]}
-
-    return per_engine, clocks, closing
+    # ALWAYS a dict with a `state`, never None. Three different things used to
+    # collapse into one "did not run" line -- the operator disabling it, the
+    # closing leg failing, and the opening leg having produced nothing to
+    # compare against. Those want opposite responses (respectively: none, look
+    # at why it failed, look at why the whole sweep is empty), and a null in
+    # the JSON additionally read as "the flag was off".
+    if not (a.closing_recheck and engines):
+        return per_engine, clocks, {"state": "disabled"}
+    name, base, model = engines[0]
+    opened_with = per_engine[name]["solo"]
+    if not opened_with:
+        return per_engine, clocks, {"state": "no-opening-sample",
+                                    "engine": name}
+    print()
+    print("--- closing re-check: %s solo, the leg this run opened with ---"
+          % name, flush=True)
+    final = measure(base, model, a.depth, a.tokens, a.timeout,
+                    "%s solo (closing)" % name, cool_floor=a.cool_floor)
+    if not final:
+        return per_engine, clocks, {"state": "failed", "engine": name}
+    return per_engine, clocks, {"state": "ok", "engine": name,
+                                "first": opened_with[0], "final": final,
+                                "retained": final / opened_with[0]}
 
 
 def closing_note(closing, tol_pct=10.0):
@@ -510,9 +519,20 @@ def closing_note(closing, tol_pct=10.0):
     learns to skip -- the same reasoning as _probe_crosscheck's tol in
     bench_endpoint, which brackets its decode probe the same way.
     """
-    if not closing:
-        return ("note: the closing re-check did not run, so nothing says "
-                "whether the box held across this sweep."), False
+    state = (closing or {}).get("state")
+    if state != "ok":
+        why = {
+            "disabled": "skipped by --no-closing-recheck",
+            "no-opening-sample": "the opening leg produced no sample to "
+                                 "compare against, so the whole sweep is "
+                                 "suspect for that reason first",
+            "failed": "the closing measurement itself failed",
+        }.get(state, "it did not run")
+        # NOT the words the passing branch uses. "Not checked" reading like
+        # "checked and fine" is the defect this harness keeps finding in its
+        # own instruments.
+        return ("note: no closing re-check -- %s. Nothing here says whether "
+                "the box held across this sweep." % why), False
     drift = 100.0 * (closing["retained"] - 1.0)
     shape = ("%s solo opened at %.2f t/s and closed at %.2f (%+.1f%%)"
              % (closing["engine"], closing["first"], closing["final"], drift))
@@ -839,7 +859,7 @@ def main():
                        "tokens": a.tokens, "repeat": a.repeat,
                        "solo_median": solo, "contended_median": contended,
                        "paired_ratio_median": ratios, "per_engine": per_engine,
-                       "cpu_clock_pct": clocks, "closing_recheck": closing,
+                       "cpu_clock_pct": clocks, "closing_check": closing,
                        "bandwidth": bw,
                        "warnings": warnings}, f, indent=2)
         print("\nwrote %s" % a.json)
