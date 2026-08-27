@@ -138,7 +138,7 @@ Lint with the same config CI would have used, if there were CI:
 python -m ruff check src tests
 ```
 
-352 tests, ~9s, and **none of them need the NPU, a Genie bundle, or the QAIRT
+357 tests, ~9s, and **none of them need the NPU, a Genie bundle, or the QAIRT
 SDK** -- they drive the handlers with a fake socket and a stub engine, so they
 run anywhere.
 
@@ -278,7 +278,7 @@ src/genie_server.py       OpenAI + Anthropic HTTP server over a resident Genie b
 src/bench_endpoint.py     prefill/decode benchmark against any OpenAI-compatible server
 src/genie_smoke.py        minimal one-shot Genie generation, for isolating server bugs
 src/run-genie-server.ps1  launcher + supervisor; finds the bundle/SDK itself
-tests/                    352 device-free tests (no NPU, no bundle, no SDK needed)
+tests/                    357 device-free tests (no NPU, no bundle, no SDK needed)
 
 docs/GENIE_SERVER.md      the server: endpoints, env vars, and its measured limits
 docs/IMPLEMENTATION_PLAN.md  living plan + decision log; start here for the why

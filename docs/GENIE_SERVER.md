@@ -302,7 +302,18 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
 
   The server checks this at startup and warns when the block is absent, when
   `penalize-last-n` is 0 (the penalties beside it are then applied to an empty
-  window and do nothing), or when every penalty in it is 0.
+  window and do nothing), or when every penalty in it is 0. It says nothing
+  when there is no bundle config at all -- a note about a file you do not have
+  is noise in front of the error naming the env vars to set.
+
+  **This is a PER-MACHINE fix, and nothing in this repo can apply it for you.**
+  Bundles are large external artifacts deliberately kept out of version
+  control, so a fresh clone on another box gets the recommendation above and an
+  unpatched bundle. The startup warning is the part that ships: it fires on
+  every launch until the block is added, which is the whole reason it exists
+  rather than a line in these docs that someone has to remember to read. Keep a
+  `genie_config.json.orig` beside the edited one so a measurement can be
+  reproduced against the shipped sampler.
 
 - **Sampling is server-level, not per-request.** `temperature` / `top_p` /
   `top_k` are accepted and **not honoured**. Measured directly against QAIRT

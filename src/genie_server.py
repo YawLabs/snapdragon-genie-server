@@ -157,6 +157,7 @@ _CONTEXT_LENGTHS = None
 # so deriving it per call costs nothing worth keeping a second global for.
 _POLL_MATCHES = None
 _SAMPLER = None
+_CONFIG_PRESENT = None
 
 
 def _find_all(obj, key, path=""):
@@ -264,6 +265,28 @@ def read_context_lengths():
     return _CONTEXT_LENGTHS
 
 
+def config_present():
+    """Is there a bundle config here AT ALL?
+
+    Distinct from "the config has no poll key", and the distinction is the
+    whole point. With no bundle dir -- unset env, a typo, a fresh clone --
+    every reader below returns its could-not-read value, and the checks then
+    report a bundle that is missing rather than misconfigured. The first line a
+    new user saw was a note about `poll` in a genie_config.json they do not
+    have, sitting in front of the real error naming the env vars to set.
+
+    read_sampler already refuses to make a claim about a file it could not
+    open; this applies the same rule to the config as a whole. A config that is
+    PRESENT and corrupt still warns, because there the note is true and
+    actionable.
+    """
+    global _CONFIG_PRESENT
+    if _CONFIG_PRESENT is None:
+        _CONFIG_PRESENT = os.path.isfile(
+            os.path.join(BUNDLE_DIR, "genie_config.json"))
+    return _CONFIG_PRESENT
+
+
 def read_sampler():
     """The bundle's `dialog.sampler` block, or {} if it cannot be read.
 
@@ -336,6 +359,11 @@ def bundle_config_warnings():
     is still a working one. Refusing to start would turn a performance note into
     an outage.
     """
+    # Nothing to say about a bundle that is not there. load_engine is about to
+    # exit naming the env vars, and a note in front of it reads as "your bundle
+    # is misconfigured" when the answer is "you have not pointed me at one".
+    if not config_present():
+        return []
     out = []
     poll, where = read_poll_setting()
     # Say so rather than pick silently. _pick_poll's rule is a heuristic, and a

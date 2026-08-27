@@ -104,6 +104,7 @@ def gs():
     # genie_config.json, and an unpinned fixture would read whatever bundle the
     # developer's GENIE_BUNDLE_DIR points at -- or nothing, and then every test
     # touching the warnings would carry a penalty warning it never asked for.
+    g._CONFIG_PRESENT = True   # pinned like the readers below; see config_present
     g._SAMPLER = {"version": 1, "seed": 42, "temp": 0.8, "top-k": 40,
                   "top-p": 0.95,
                   "token-penalty": {"version": 1, "penalize-last-n": 64,

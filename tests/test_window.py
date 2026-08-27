@@ -626,3 +626,75 @@ def test_the_restore_baseline_survives_an_unreadable_config(gs):
     assert gs.read_default_sampler() == {"version": 1}
     gs._SAMPLER = _sampler(**{"penalize-last-n": 64, "repetition-penalty": 2.3})
     assert gs.read_default_sampler()["temp"] == 0.8
+
+
+# --- a bundle that is not there is not a misconfigured bundle -------------
+# The first line a new user saw running the server directly was a note about
+# `poll` in a genie_config.json they did not have, printed in front of the real
+# error naming the env vars to set. It reads as "your bundle is misconfigured"
+# when the answer is "you have not pointed me at one". read_sampler already
+# refuses to make a claim about a file it could not open; this is the same rule
+# applied to the config as a whole.
+
+def test_no_bundle_config_means_no_warnings_at_all(gs, tmp_path):
+    gs.BUNDLE_DIR = str(tmp_path)          # a real dir, but no genie_config.json
+    gs._CONFIG_PRESENT = None
+    gs._POLL_MATCHES = None
+    gs._SAMPLER = None
+    gs._CONTEXT_LENGTHS = None
+    assert gs.config_present() is False
+    assert gs.bundle_config_warnings() == [], (
+        "a note about a file that does not exist is noise in front of the real "
+        "error")
+
+
+def test_an_unset_bundle_dir_is_silent_too(gs):
+    # The literal first-run case: nothing exported at all.
+    gs.BUNDLE_DIR = ""
+    gs._CONFIG_PRESENT = None
+    assert gs.config_present() is False
+    assert gs.bundle_config_warnings() == []
+
+
+def test_a_config_that_IS_present_still_warns(gs, tmp_path):
+    # The check must not have silenced the real thing. A bundle that exists and
+    # is misconfigured is exactly what these warnings are for.
+    cfg = tmp_path / "genie_config.json"
+    cfg.write_text(json.dumps({
+        "dialog": {"engine": {"backend": {"QnnHtp": {"poll": True}}},
+                   "sampler": {"version": 1, "temp": 0.8}}}), encoding="utf-8")
+    gs.BUNDLE_DIR = str(tmp_path)
+    gs._CONFIG_PRESENT = None
+    gs._POLL_MATCHES = None
+    gs._SAMPLER = None
+    gs._CONTEXT_LENGTHS = []
+    assert gs.config_present() is True
+    out = gs.bundle_config_warnings()
+    assert any("poll" in w and "busy-waits" in w for w in out)
+    assert any("token-penalty" in w for w in out)
+
+
+def test_a_present_but_corrupt_config_still_warns(gs, tmp_path):
+    # PRESENT and unparseable is a different case from ABSENT: the operator has
+    # a bundle and something is wrong with it, so the note is true and
+    # actionable rather than noise.
+    (tmp_path / "genie_config.json").write_text("{not json", encoding="utf-8")
+    gs.BUNDLE_DIR = str(tmp_path)
+    gs._CONFIG_PRESENT = None
+    gs._POLL_MATCHES = None
+    gs._SAMPLER = None
+    gs._CONTEXT_LENGTHS = []
+    assert gs.config_present() is True
+    assert gs.bundle_config_warnings(), "a corrupt config must not go quiet"
+
+
+def test_config_presence_is_cached_like_the_other_readers(gs, tmp_path):
+    # It sits in front of every warning at startup; re-statting per call would
+    # be filesystem I/O for a value that cannot change while the server runs.
+    cfg = tmp_path / "genie_config.json"
+    cfg.write_text("{}", encoding="utf-8")
+    gs.BUNDLE_DIR = str(tmp_path)
+    gs._CONFIG_PRESENT = None
+    assert gs.config_present() is True
+    cfg.unlink()
+    assert gs.config_present() is True, "served from cache after the first stat"
