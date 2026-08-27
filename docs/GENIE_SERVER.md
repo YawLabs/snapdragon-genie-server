@@ -56,10 +56,36 @@ $env:GENIE_SDK_DIR    = "...\qairt\2.45.0.260326"
 Running `python src\genie_server.py` directly works too, but then nothing
 supervises it and the port defaults to 8080 rather than 8123.
 
-Startup prints `model resident on HTP in <N>s` then the endpoint URL. Load is
-~30-50s cold and ~7-8s once the 3 GB of context binaries are in the OS page
-cache (measured both ways on the same bundle); after that every request reuses
-the resident model.
+Startup prints `model resident on HTP in <N>s` then the endpoint URL, and
+after that every request reuses the resident model.
+
+Re-measured 2026-08-26 on the 8192 multi-length bundle (the launcher default),
+because the figures here were an older bundle's and the startup string still
+advertises a range no run has produced:
+
+| | seconds | n |
+|---|---|---|
+| cold | 34.4 | 1 |
+| warm | 10.8, 12.7, 15.0 | 3 |
+
+State the spread, not the best sample: warm is a **10.8-15.0** band, not the
+10.8 it is tempting to quote, and 39% separates its ends. The cold reading is
+n=1 and its cold-ness was self-inflicted -- it followed a recursive grep over
+the whole QAIRT SDK, which is exactly the kind of thing that evicts a 3 GB
+bundle from the page cache. Treat it as "after heavy unrelated disk traffic"
+rather than as a reboot-cold number.
+
+Worth recording how that was checked, since a neighbouring session raised it:
+the three readings above ran back-to-back, and on this box a sequential series
+is normally suspect -- an identical leg repeated at the end of a four-leg sweep
+came back 26% low on AC and 43% low on battery, with the clock sliding 87% to
+69% of base (measured by that session on the llama.cpp path; see the thermal
+note in `MULTI_ENGINE.md`, which this independently corroborates). That
+mechanism is ruled out HERE, but by the data rather than by assertion: decay
+predicts monotonically slower, and these went 34.4 -> 10.8 -> 15.0. The largest
+is first and the series is not monotonic, which is a page-cache signature and
+the opposite of a thermal one. The n=1 and the 39% warm spread stand
+regardless.
 
 ## Endpoints
 

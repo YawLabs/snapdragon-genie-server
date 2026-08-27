@@ -1473,7 +1473,12 @@ Check GENIE_SDK_DIR, or unset GENIE_HEXAGON_ARCH if you pinned an arch."""
 
     dialog = Handle()
     t0 = time.time()
-    print("[genie] loading model on the NPU (this takes ~8-12s)...", flush=True)
+    # Measured range, not an aspiration: ~11-15s warm on the 8192 bundle and
+    # 34s after unrelated disk traffic has evicted it from the page cache. The
+    # old "~8-12s" was under every reading taken since, which makes a normal
+    # load look like a hang to anyone watching the line.
+    print("[genie] loading model on the NPU (~11-15s warm, up to ~35s cold)...",
+          flush=True)
     st = lib.GenieDialog_create(cfg, C.byref(dialog))
     if st != GENIE_STATUS_SUCCESS:
         # The overwhelmingly likely cause is an arch/version mismatch: a Genie

@@ -431,6 +431,24 @@ multi-instance numbers taken then would be meaningless. The same warning
 already applies to the GEMM benchmark: a loaded machine inflates the NPU's
 apparent win by slowing its baseline.
 
+**Independently corroborated on a different stack, 2026-08-26.** A session
+benchmarking the llama.cpp/ggml QNN path on this same box -- no Genie runtime
+in the loop -- measured the same effect from the other side: an IDENTICAL first
+leg repeated at the end of a four-leg sweep came back **26% low on AC and 43%
+low on battery**, with the clock sliding **87% to 69% of base** across the four.
+Counterbalancing the order (A,B,C,C,B,A) with 120 s cooldowns and averaging
+each pair reproduced every backend to within 0.1-3.5%.
+
+Two things worth taking from that. The effect is a property of the BOX, not of
+either stack, since it reproduces through a completely different runtime. And
+the cheap control is one this file's harness does not implement: **repeat the
+first leg last.** `bench_contention.py` interleaves solo against contended and
+flags a monotonic decline afterwards (`drift_note`), and `bench_endpoint.py`
+brackets its decode probe before and after a `--prefill-only` sweep -- but
+nothing here re-runs leg one at the end of a multi-BACKEND comparison, which is
+the single measurement that turns "the later legs look slower" from a suspicion
+into a number. Written up on that session's side in its `docs/backend/QNN.md`.
+
 Thermals are the half of this that is easy to miss, and on the GPU leg they are
 worth **1.64x**. The same measurement at d469, varying only the state of the
 box: 11.04 with an unrelated export running, 11.57 with a `poll: true` NPU
