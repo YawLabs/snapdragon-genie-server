@@ -533,3 +533,96 @@ def test_a_bogus_length_list_does_not_claim_multi_length(gs, tmp_path):
     gs._POLL_MATCHES = [(False, "QnnHtp.poll")]
     assert len(gs.read_context_lengths()) != 4, "must not invent four graphs"
     assert gs.bundle_config_warnings() == [], "unreadable is not single-length"
+
+
+# --- the sampler's repetition penalty --------------------------------------
+# Genie's token-penalty block is OPTIONAL and every field in it defaults to 0,
+# so a bundle without it samples at temp 0.8 with nothing suppressing a loop.
+# Qualcomm's reference config for this stack sets it; the AI Hub export path
+# emits the same sampler WITHOUT it. The symptom is not a crash or an error --
+# the model answers normally and then repeats one paragraph to max_tokens --
+# so nothing about it is visible until someone reads the output.
+
+def _sampler(**pen):
+    s = {"version": 1, "seed": 42, "temp": 0.8, "top-k": 40, "top-p": 0.95}
+    if pen:
+        s["token-penalty"] = dict({"version": 1}, **pen)
+    return s
+
+
+def test_a_sampler_with_no_penalty_block_is_flagged(gs):
+    gs._SAMPLER = _sampler()
+    out = [w for w in gs.bundle_config_warnings() if "token-penalty" in w]
+    assert len(out) == 1 and out[0].startswith("WARNING")
+    assert "penalize-last-n" in out[0], "must give the block to paste, not a hint"
+    assert "per request" in out[0], "sampling binds at create -- say so"
+
+
+def test_penalties_applied_to_an_empty_window_are_flagged(gs):
+    # The subtle one. Someone sets repetition-penalty, restarts, sees no change
+    # and concludes the knob is broken -- when penalize-last-n=0 means it was
+    # read and then applied to nothing.
+    gs._SAMPLER = _sampler(**{"penalize-last-n": 0, "repetition-penalty": 2.3})
+    out = [w for w in gs.bundle_config_warnings() if "penalize-last-n" in w]
+    assert len(out) == 1 and "empty window" in out[0]
+
+
+def test_a_window_with_every_penalty_zero_is_flagged(gs):
+    gs._SAMPLER = _sampler(**{"penalize-last-n": 64, "repetition-penalty": 0.0,
+                              "presence-penalty": 0.0, "frequency-penalty": 0.0})
+    assert [w for w in gs.bundle_config_warnings() if "every penalty" in w]
+
+
+def test_a_correctly_penalised_sampler_is_silent(gs):
+    # The fixture default. A warning that fires on a good bundle trains the
+    # reader to skip the one that matters.
+    assert gs.bundle_config_warnings() == []
+
+
+def test_an_unreadable_config_makes_no_claim_about_the_sampler(gs):
+    # {} is "could not open it", which the poll note already reports. Saying it
+    # twice in different words reads as two separate problems.
+    gs._SAMPLER = {}
+    gs._POLL_MATCHES = []
+    assert not [w for w in gs.bundle_config_warnings() if "token-penalty" in w]
+
+
+@pytest.mark.parametrize("pen,expected", [
+    (None, "absent"),
+    ({"penalize-last-n": 0, "repetition-penalty": 2.3}, "no-window"),
+    ({"repetition-penalty": 2.3}, "no-window"),           # key omitted == 0
+    ({"penalize-last-n": 64}, "all-zero"),
+    ({"penalize-last-n": 64, "repetition-penalty": 0, "presence-penalty": 0,
+      "frequency-penalty": 0}, "all-zero"),
+    ({"penalize-last-n": 64, "repetition-penalty": 2.3}, "ok"),
+    ({"penalize-last-n": 64, "presence-penalty": 0.7}, "ok"),   # any one is enough
+    ({"penalize-last-n": 64, "frequency-penalty": 0.8}, "ok"),
+])
+def test_penalty_state_classification(gs, pen, expected):
+    s = _sampler(**pen) if pen is not None else _sampler()
+    assert gs.sampler_penalty_state(s) == expected
+
+
+def test_a_junk_penalty_value_does_not_crash_startup(gs):
+    # A malformed config must not take the server down before it can say what
+    # is wrong with it -- float("abc") would raise inside the check itself.
+    gs._SAMPLER = _sampler(**{"penalize-last-n": "sixty-four",
+                              "repetition-penalty": None})
+    assert gs.sampler_penalty_state(gs._SAMPLER) == "no-window"
+    assert gs.bundle_config_warnings()
+
+
+def test_a_non_dict_penalty_is_treated_as_absent(gs):
+    assert gs.sampler_penalty_state({"token-penalty": "yes"}) == "absent"
+    assert gs.sampler_penalty_state({}) == "absent"
+    assert gs.sampler_penalty_state(None) == "absent"
+
+
+def test_the_restore_baseline_survives_an_unreadable_config(gs):
+    # read_default_sampler now reads THROUGH read_sampler, so the two cannot
+    # disagree -- but its fallback has to stay non-empty: it is what a
+    # per-request override is restored TO, and {} would restore nothing.
+    gs._SAMPLER = {}
+    assert gs.read_default_sampler() == {"version": 1}
+    gs._SAMPLER = _sampler(**{"penalize-last-n": 64, "repetition-penalty": 2.3})
+    assert gs.read_default_sampler()["temp"] == 0.8

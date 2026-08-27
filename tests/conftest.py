@@ -99,6 +99,17 @@ def gs():
     g._CONTEXT_SIZE = 4096                # pin, so no genie_config.json is read
     g._CONTEXT_LENGTHS = [512, 1024, 2048, 4096]   # a multi-length bundle
     g._POLL_MATCHES = [(False, "dialog.engine.backend.QnnHtp.poll")]
+    # A correctly configured sampler, so bundle_config_warnings is quiet by
+    # default. Pinned for the same reason as the two above: read_sampler opens
+    # genie_config.json, and an unpinned fixture would read whatever bundle the
+    # developer's GENIE_BUNDLE_DIR points at -- or nothing, and then every test
+    # touching the warnings would carry a penalty warning it never asked for.
+    g._SAMPLER = {"version": 1, "seed": 42, "temp": 0.8, "top-k": 40,
+                  "top-p": 0.95,
+                  "token-penalty": {"version": 1, "penalize-last-n": 64,
+                                    "repetition-penalty": 2.3,
+                                    "presence-penalty": 0.7,
+                                    "frequency-penalty": 0.8}}
     g._TOK_CACHE.clear()
     g.STRIP_THINK = False
     # Pinned, not inherited. THINKING_DEFAULT is read from os.environ at import,

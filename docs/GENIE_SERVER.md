@@ -10,13 +10,18 @@ bundle running on the Snapdragon X Elite NPU (Hexagon v73). The model is loaded
 - **Native ARM64 Python** (aarch64). Genie.dll and its Qnn* deps are
   `aarch64-windows-msvc`; an x64/emulated Python cannot load them.
 - The QAIRT 2.45 runtime (extracted) and a Genie bundle matching this box's
-  Hexagon. Supported: **v73 (X Elite / X Plus)** and **v81 (X2 Elite)** -- the
-  two Windows-on-Snapdragon parts. The server derives that set at startup by
-  intersecting `lib/hexagon-v*/unsigned` (DSP skel) with
+  Hexagon. The server DERIVES the supported set at startup by intersecting
+  `lib/hexagon-v*/unsigned` (DSP skel) with
   `lib/aarch64-windows-msvc/QnnHtpV*Stub.dll` (Windows stub); an arch needs
-  both. v75 (8 Gen 3) and v79 (8 Elite) ship a skel but no Windows stub -- they
-  are Android parts -- and are reported as skipped rather than silently
-  offered. `GENIE_HEXAGON_ARCH=v81` pins one arch.
+  both. On QAIRT 2.45 that yields **v68, v73 and v81** -- the Hexagons with a
+  Windows stub, covering 8cx Gen 3 through X2 Elite. The skels with no stub
+  here (v66, v69, v75, v79) are Android parts and are reported as skipped
+  rather than silently offered. `GENIE_HEXAGON_ARCH=v81` pins one arch.
+
+  Do not read that list as a constant: it is whatever the installed SDK
+  supports, which is the point of deriving it. This doc claimed "v73 and v81,
+  the two Windows-on-Snapdragon parts" until a real startup log showed three --
+  the mechanism was right and the hand-written example beside it was not.
 - A bundle is locked to one arch AND one QAIRT version; a mismatch fails at
   `GenieDialog_create` with a message naming the archs this box can offer.
 
@@ -165,8 +170,8 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
 ## Notes / limitations
 
 - **Context window: evict, don't crash.** The compiled window is fixed (read
-  from the bundle, reported at `/props`; the two bundles here are 4096 and
-  16384) and Genie has NO sliding-window mode -- QAIRT 2.45 exposes no
+  from the bundle, reported at `/props`; the bundles here are 4096, 8192
+  single-length, 8192 multi-length -- the launcher default -- and 16384) and Genie has NO sliding-window mode -- QAIRT 2.45 exposes no
   such flag on `genie-t2t-run` and no equivalent config key, and overflowing is
   a hard `GenieDialog_query` failure, not a truncation. So the server evicts:
   oldest turns are dropped until the prompt fits, with the system turn and tool
@@ -230,6 +235,48 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   (`GenieDialog_save`/`restore` also exist and work -- measured ~75 KB/token on
   disk, ~128 MB at 1711 tokens -- but they are not used: in-memory continuation
   is free and this server serves one conversation at a time.)
+
+- **The sampler ships with NO repetition penalty, and that is what a
+  degenerate loop looks like.** Genie's `token-penalty` block is optional and
+  every field in it defaults to 0 (`penalize-last-n`, `repetition-penalty`,
+  `presence-penalty`, `frequency-penalty` -- read off
+  `examples/Genie/Genie/src/qualla/include/qualla/detail/sampler-utils.hpp`),
+  so a bundle without it samples at temp 0.8 with nothing suppressing a repeat.
+  Every bundle here arrived that way: the sampler is byte-identical to
+  Qualcomm's own reference for this stack **minus** that block. The symptom is
+  not an error -- the model answers normally and then emits the same paragraph
+  until it hits `max_tokens`, which reads as the model being broken rather than
+  as one missing config key.
+
+  Values matter more than presence. Measured on this box, same prompt, 400
+  tokens, one restart between each:
+
+  | `repetition-penalty` | repeated sentences | identifiers |
+  |---|---|---|
+  | none (as shipped) | 0 on a 400-token answer -- **the loop was NOT reproduced at this length** | intact |
+  | 2.3 (Qualcomm reference) | 0 | **corrupted** -- one answer spelled two proper nouns as `MCPWeekly` / `MPC Week` / `MP Weekly` and `YaLLABS` / `YaLLLab` |
+  | **1.15** (recommended) | 0 | intact -- `src/genie_server.py`, `build_windowed`, `MCP Weekly`, `YawLabs` all byte-exact |
+
+  So `"token-penalty": {"version": 1, "penalize-last-n": 128,
+  "repetition-penalty": 1.15, "presence-penalty": 0.0, "frequency-penalty":
+  0.3}`. The vendor reference is a starting point, not the answer -- same
+  precedent as `poll`. **For an agent workload the 2.3 failure is worse than
+  the loop it fixes**: file paths and identifiers are precisely what has to
+  survive verbatim, and this server's own eviction summariser is prompted to
+  "keep file paths, identifiers, decisions made".
+
+  Two limits worth stating plainly. The block IS honoured at load -- proven by
+  A/B, since the same prompt gave different output with and without it, which
+  is the check that would have caught it being ignored the way a post-create
+  sampler apply is. But **the deep-context loop was never reproduced here**:
+  the report that prompted this was a 6.7k-token prompt, and these probes ran
+  at ~40 tokens of context. The penalty is the mechanism that suppresses such a
+  loop and it is now active; that it fixes THAT case is inference, not
+  measurement.
+
+  The server checks this at startup and warns when the block is absent, when
+  `penalize-last-n` is 0 (the penalties beside it are then applied to an empty
+  window and do nothing), or when every penalty in it is 0.
 
 - **Sampling is server-level, not per-request.** `temperature` / `top_p` /
   `top_k` are accepted and **not honoured**. Measured directly against QAIRT

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 OpenAI-compatible HTTP server for a Qualcomm Genie NPU LLM bundle
-(Snapdragon, Hexagon HTP). Supported targets are the Windows-on-Snapdragon
-Hexagons: v73 (X Elite / X Plus) and v81 (X2 Elite). That set is DERIVED at
-startup, not hardcoded -- an arch counts only if the SDK ships both its skel
-and its Windows stub -- so a future Hexagon works without editing this file,
-and the Android-only archs (v75, v79) are excluded with a reason.
+(Snapdragon, Hexagon HTP). Targets the Windows-on-Snapdragon Hexagons, and
+that set is DERIVED at startup rather than hardcoded: an arch counts only if
+the SDK ships both its skel and its Windows stub, so a future Hexagon works
+without editing this file and the Android-only archs are excluded with a
+reason. On QAIRT 2.45 it comes out v68, v73 and v81.
 
 Loads the Genie context-binary bundle ONCE via the Genie C API (ctypes ->
 Genie.dll) so the model stays resident on the HTP; every /v1/chat/completions
@@ -156,6 +156,7 @@ _CONTEXT_LENGTHS = None
 # empty and report nothing. _pick_poll is pure and runs on a 0-2 element list,
 # so deriving it per call costs nothing worth keeping a second global for.
 _POLL_MATCHES = None
+_SAMPLER = None
 
 
 def _find_all(obj, key, path=""):
@@ -263,14 +264,73 @@ def read_context_lengths():
     return _CONTEXT_LENGTHS
 
 
+def read_sampler():
+    """The bundle's `dialog.sampler` block, or {} if it cannot be read.
+
+    {} means "no answer", never "empty sampler" -- the caller has to tell those
+    apart, because warning about a missing penalty on a config we failed to
+    open would be a claim about a file we never read.
+    """
+    global _SAMPLER
+    if _SAMPLER is None:
+        try:
+            with open(os.path.join(BUNDLE_DIR, "genie_config.json"),
+                      encoding="utf-8") as f:
+                _SAMPLER = dict(json.load(f)["dialog"]["sampler"])
+        except Exception:
+            _SAMPLER = {}
+    return _SAMPLER
+
+
+def _as_number(v):
+    """v as a float, or 0.0 if it is not one. A junk value is not a penalty."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def sampler_penalty_state(sampler):
+    """Is this sampler's repetition penalty actually going to do anything?
+
+    Genie applies four `token-penalty` fields, and the block is OPTIONAL: with
+    it absent every one defaults to 0 (sampler-utils.hpp), which means no
+    repetition suppression at all. Qualcomm's own reference config for this
+    stack sets it; the AI Hub export path emits the same sampler WITHOUT it, so
+    a bundle arrives sampling at temp 0.8 with nothing holding it back. What
+    that looks like from the outside is a model that answers normally for a
+    while and then emits the same paragraph until it hits max_tokens.
+
+    Three ways to get nothing, which is why this returns a state rather than a
+    bool -- they need different advice:
+
+      absent     no token-penalty block at all; every field defaults to 0.
+      no-window  `penalize-last-n` is 0, so the penalties below it are read
+                 and then applied to an empty window. This is the one worth
+                 catching: someone sets repetition-penalty, restarts, sees no
+                 change, and concludes the knob does not work.
+      all-zero   a window, but every penalty in it is 0.
+    """
+    pen = (sampler or {}).get("token-penalty")
+    if not isinstance(pen, dict):
+        return "absent"
+    if _as_number(pen.get("penalize-last-n")) <= 0:
+        return "no-window"
+    if not any(_as_number(pen.get(k)) for k in
+               ("repetition-penalty", "presence-penalty", "frequency-penalty")):
+        return "all-zero"
+    return "ok"
+
+
 def bundle_config_warnings():
     """Lines to print about a bundle configured to be slower than it needs to be.
 
-    Both settings below are worth more than anything else this server does, and
-    both were previously left to whoever remembered to read the docs. This
+    The settings below are worth more than anything else this server does, and
+    each was previously left to whoever remembered to read the docs. This
     repo's habit everywhere else -- placement, port, Hexagon arch -- is to
     DERIVE the fact from the artifact and say so out loud rather than hope. This
-    is that habit applied to the two it had missed.
+    is that habit applied to the ones it had missed: two that decide throughput,
+    and one that decides whether the output is usable at all.
 
     Warn, never refuse: a bundle is a large external artifact and a slow server
     is still a working one. Refusing to start would turn a performance note into
@@ -309,6 +369,46 @@ def bundle_config_warnings():
             "concurrency turned from a 1.45x gain into a 0.78x loss. Set it to "
             "false in genie_config.json and restart -- nothing measured got "
             "worse." % (where or "QnnHtp.poll", json.dumps(poll)))
+    # Only when the config was actually readable: {} here means "could not
+    # open it", which the poll note above has already said, and saying it twice
+    # in different words reads as two problems.
+    sampler = read_sampler()
+    if sampler:
+        state = sampler_penalty_state(sampler)
+        # Measured values, NOT the vendor's. Qualcomm's reference config for
+        # this stack sets repetition-penalty 2.3 / presence 0.7 / frequency
+        # 0.8, and at 2.3 this model stops repeating and starts MANGLING
+        # instead: measured here, one 400-token answer rendered the same two
+        # proper nouns as "MCPWeekly", "MPC Week", "MP Weekly", "MPWeekly" and
+        # "YaLLABS" / "YaLLLab" / "YaLLab". For an agent workload that is worse
+        # than the loop it fixes -- file paths and identifiers are exactly what
+        # must survive verbatim. At 1.15 the same probe kept
+        # src/genie_server.py, build_windowed, MCP Weekly and YawLabs all
+        # byte-exact with no repeated sentences. Same precedent as `poll`
+        # above: the vendor default is a starting point, not the answer.
+        fix = ('add "token-penalty": {"version": 1, "penalize-last-n": 128, '
+               '"repetition-penalty": 1.15, "presence-penalty": 0.0, '
+               '"frequency-penalty": 0.3} to dialog.sampler in '
+               "genie_config.json and restart. Sampling binds at "
+               "GenieDialog_create, so it cannot be set per request. "
+               "(Qualcomm's reference is 2.3/0.7/0.8, which measured here as "
+               "aggressive enough to corrupt identifiers.)")
+        if state == "absent":
+            out.append(
+                "WARNING: this bundle's sampler has no `token-penalty` block, "
+                "so every repetition penalty defaults to 0 and NOTHING "
+                "suppresses a loop. Long generations degenerate into the same "
+                "paragraph repeated to max_tokens. To fix: " + fix)
+        elif state == "no-window":
+            out.append(
+                "WARNING: `penalize-last-n` is 0, so this bundle's repetition "
+                "penalties are applied to an empty window and do nothing. Set "
+                "it (Qualcomm's reference is 64) or the penalties beside it "
+                "are decorative.")
+        elif state == "all-zero":
+            out.append(
+                "WARNING: this bundle's `token-penalty` window is set but every "
+                "penalty in it is 0, so nothing is suppressed. To fix: " + fix)
     lengths = read_context_lengths()
     if len(lengths) == 1:
         out.append(
@@ -332,14 +432,20 @@ def hexagon_search_path():
 
     This used to be hardcoded to hexagon-v73, which excluded X2 Elite (v81).
     Globbing every skel was the other extreme: QAIRT 2.45 ships skels for
-    v66..v81, but Windows stubs for only a subset, because v75 (8 Gen 3) and
-    v79 (8 Elite) are Android parts -- skel present, no way to reach it from
-    Windows. Offering those would be a promise the box cannot keep.
+    v66..v81 but Windows stubs for only a subset, because the rest are Android
+    parts -- skel present, no way to reach it from Windows. Offering those
+    would be a promise the box cannot keep.
 
     Intersecting the two halves is what makes the supported set
-    self-maintaining: v73 (X Elite / X Plus) and v81 (X2 Elite) fall out
-    today, a future Hexagon falls out the day QAIRT ships both halves for it,
-    and nothing here has to be edited.
+    self-maintaining: on QAIRT 2.45 v68, v73 and v81 fall out, a future
+    Hexagon falls out the day QAIRT ships both halves for it, and nothing here
+    has to be edited.
+
+    Which archs those are is deliberately NOT restated as fact anywhere this
+    function does not compute it. Three places in this repo claimed the answer
+    was v73 and v81; the first real startup log printed three, including v68
+    (8cx Gen 3 / Dev Kit 2023), because that stub ships too. The derivation was
+    right the whole time and the prose beside it was stale.
 
     GENIE_HEXAGON_ARCH ("v81") pins one arch if you need to force it.
     Returns (path_string, usable_archs, skel_only_archs).
@@ -1135,11 +1241,10 @@ def read_default_sampler():
     is restored to. Read rather than hardcoded, same reasoning as n_ctx: the
     values belong to the bundle, and a literal here goes quietly wrong on the
     next bundle."""
-    try:
-        with open(os.path.join(BUNDLE_DIR, "genie_config.json"), encoding="utf-8") as f:
-            return dict(json.load(f)["dialog"]["sampler"])
-    except Exception:
-        return {"version": 1}
+    # Same read as read_sampler, kept behind it so the file is opened once and
+    # the two cannot disagree. The {"version": 1} fallback stays: this value is
+    # a RESTORE BASELINE, and an empty dict would restore nothing.
+    return dict(read_sampler()) or {"version": 1}
 
 
 def _stop_sequences(req):
@@ -1305,7 +1410,8 @@ def load_engine():
         sys.exit("""no usable Hexagon under %s
 A Hexagon needs BOTH lib/hexagon-vNN/unsigned and
 lib/aarch64-windows-msvc/QnnHtpVNNStub.dll. Skels with no Windows stub
-here: %s  (v75 / v79 are Android parts and never have one.)
+here: %s  (those are Android-only Hexagons; QAIRT ships their skel but
+no Windows stub, so they cannot be driven from this OS.)
 Check GENIE_SDK_DIR, or unset GENIE_HEXAGON_ARCH if you pinned an arch."""
                  % (SDK_DIR, ", ".join(hex_skel_only) or "(none)"))
     os.environ["ADSP_LIBRARY_PATH"] = hex_path
