@@ -95,7 +95,7 @@ def _shed_round():
 def test_reporting_survives_a_fully_shed_contended_leg(monkeypatch, capsys):
     """Covers BOTH crashes: the bandwidth block's KeyError on contended[name],
     and min() over an empty ratios dict."""
-    monkeypatch.setattr(bc, "paired_sweep", lambda e, a, m: (_shed_round(), [99.0]))
+    monkeypatch.setattr(bc, "paired_sweep", lambda e, a, m: (_shed_round(), [99.0], None))
     monkeypatch.setattr(bc, "free_physical_gb", lambda: 32.0)
     monkeypatch.setattr(bc.be, "n_ctx", lambda b: 4096)
     monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"ok": True})
@@ -116,7 +116,7 @@ def test_reporting_survives_when_no_pair_completes(monkeypatch):
         "GPU": {"solo": [18.0], "contended": [], "ratios": [], "shed": 3, "served": 0},
         "NPU": {"solo": [18.5], "contended": [], "ratios": [], "shed": 9, "served": 0},
     }
-    monkeypatch.setattr(bc, "paired_sweep", lambda e, a, m: (both_shed, [99.0]))
+    monkeypatch.setattr(bc, "paired_sweep", lambda e, a, m: (both_shed, [99.0], None))
     monkeypatch.setattr(bc, "free_physical_gb", lambda: 32.0)
     monkeypatch.setattr(bc.be, "n_ctx", lambda b: 4096)
     monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"ok": True})
@@ -133,7 +133,7 @@ def test_refuses_a_loaded_box_unless_explicitly_allowed(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["bench_contention.py"])
     assert bc.main() == 2
 
-    monkeypatch.setattr(bc, "paired_sweep", lambda e, a, m: (_shed_round(), []))
+    monkeypatch.setattr(bc, "paired_sweep", lambda e, a, m: (_shed_round(), [], None))
     monkeypatch.setattr(bc.be, "n_ctx", lambda b: 4096)
     monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"ok": True})
     monkeypatch.setattr(sys, "argv", [
@@ -282,7 +282,7 @@ def test_a_suspect_leg_reaches_the_warnings_block(monkeypatch, capsys):
                       "shed": 30, "served": 0},
               "GPU": {"solo": [20.0], "contended": [19.0], "ratios": [0.95],
                       "shed": 5, "served": 5}}
-    monkeypatch.setattr(bc, "paired_sweep", lambda e, a, m: (rounds, [99.0]))
+    monkeypatch.setattr(bc, "paired_sweep", lambda e, a, m: (rounds, [99.0], None))
     monkeypatch.setattr(bc, "free_physical_gb", lambda: 32.0)
     monkeypatch.setattr(bc.be, "n_ctx", lambda b: 4096)
     monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"ok": True})
@@ -326,8 +326,135 @@ def test_the_load_generator_is_stopped_even_when_the_leg_raises(monkeypatch):
     monkeypatch.setattr(bc, "measure", boom)
     monkeypatch.setattr(bc.time, "sleep", lambda s: None)
     args = types.SimpleNamespace(repeat=1, depth=250, tokens=40, timeout=60,
-                                 ramp=0, cool_floor=None)
+                                 ramp=0, cool_floor=None,
+                                 closing_recheck=False, closing_tol=10.0)
     engines = [("NPU", "http://a", "m"), ("GPU", "http://b", "m")]
     with pytest.raises(KeyboardInterrupt):
         bc.paired_sweep(engines, args, lambda o: FakeLoad())
     assert stopped["n"] == 1, "the generator was left hammering the peer"
+
+
+# --- the closing re-check --------------------------------------------------
+# Re-runs the leg the sweep OPENED with, last, under the same gate: an A/A
+# whose only variable is elapsed time. It exists because neither control
+# already here can see decay DURING a sample -- wait_for_cool gates before one
+# and says nothing after, and drift_note needs a strictly monotonic decline
+# over 3+ solo samples, so one out-of-order sample hides a real trend and
+# --repeat 1 gives it nothing to compare.
+
+def _closing(first, final, engine="NPU"):
+    return {"engine": engine, "first": first, "final": final,
+            "retained": final / first}
+
+
+def test_a_box_that_held_is_reported_as_holding():
+    note, suspect = bc.closing_note(_closing(18.0, 17.6))
+    assert suspect is False
+    assert "held" in note and "SUSPECT" not in note
+
+
+def test_a_decayed_box_is_flagged_and_says_which_way_it_biases():
+    # Contended samples are taken AFTER the solo ones they divide, so decay
+    # lands in the numerator. Naming the direction is the difference between a
+    # warning and an actionable one.
+    note, suspect = bc.closing_note(_closing(18.0, 13.0))
+    assert suspect is True
+    assert "SUSPECT" in note and "DECAYED" in note
+    assert "overstated" in note
+
+
+def test_a_box_that_got_faster_is_equally_disqualifying():
+    # Not a nice surprise: it means the OPENING sample was the degraded one, so
+    # every baseline the ratios divide by is too low.
+    note, suspect = bc.closing_note(_closing(13.0, 18.0))
+    assert suspect is True
+    assert "FASTER" in note and "flattered" in note
+
+
+def test_the_check_reports_both_ends_and_the_percentage():
+    # A reader has to be able to judge it without re-deriving the arithmetic.
+    note, _ = bc.closing_note(_closing(20.0, 15.0))
+    assert "20.00" in note and "15.00" in note and "-25.0%" in note
+
+
+def test_the_tolerance_is_not_hair_trigger():
+    # This box moves a few percent between any two samples; a check that fires
+    # on ordinary noise is one the reader learns to skip.
+    assert bc.closing_note(_closing(18.0, 17.3))[1] is False
+    assert bc.closing_note(_closing(18.0, 18.7))[1] is False
+
+
+def test_the_tolerance_is_configurable_in_both_directions():
+    tight = bc.closing_note(_closing(18.0, 17.0), tol_pct=1.0)
+    assert tight[1] is True
+    assert bc.closing_note(_closing(18.0, 17.0), tol_pct=25.0)[1] is False
+
+
+def test_a_skipped_check_says_so_rather_than_reading_as_clean():
+    # The distinction that matters: "not checked" must not look like "checked
+    # and fine", which is the same defect this suite pins in _probe_crosscheck.
+    note, suspect = bc.closing_note(None)
+    assert suspect is False
+    assert "did not run" in note
+    # The discriminator is the CLAIM, not the word "held" -- this message says
+    # "nothing says whether the box held", which is the opposite of the
+    # confirming branch's "the ratios above stand".
+    assert "ratios above stand" not in note
+
+
+def test_the_sweep_reopens_the_first_leg_and_records_it(monkeypatch):
+    # End to end through paired_sweep: the closing measurement must be the
+    # FIRST engine's solo leg, not the last one measured.
+    rates = iter([18.0, 13.0, 17.0, 12.0, 9.0])
+    monkeypatch.setattr(bc, "measure", lambda *a, **k: next(rates))
+    monkeypatch.setattr(bc.time, "sleep", lambda s: None)
+
+    class FakeLoad:
+        busy = completed = 0
+        def start(self): pass
+        def stop(self): pass
+
+    args = types.SimpleNamespace(repeat=1, depth=250, tokens=40, timeout=60,
+                                 ramp=0, cool_floor=92.0,
+                                 closing_recheck=True, closing_tol=10.0)
+    engines = [("NPU", "http://a", "m"), ("GPU", "http://b", "m")]
+    _per, _clocks, closing = bc.paired_sweep(engines, args, lambda o: FakeLoad())
+    assert closing["engine"] == "NPU", "must reopen the leg the run STARTED on"
+    assert closing["first"] == 18.0, "compared against NPU's FIRST solo sample"
+    assert closing["final"] == 9.0
+    assert bc.closing_note(closing)[1] is True
+
+
+def test_the_recheck_can_be_turned_off(monkeypatch):
+    rates = iter([18.0, 13.0, 17.0, 12.0])
+    monkeypatch.setattr(bc, "measure", lambda *a, **k: next(rates))
+    monkeypatch.setattr(bc.time, "sleep", lambda s: None)
+
+    class FakeLoad:
+        busy = completed = 0
+        def start(self): pass
+        def stop(self): pass
+
+    args = types.SimpleNamespace(repeat=1, depth=250, tokens=40, timeout=60,
+                                 ramp=0, cool_floor=92.0,
+                                 closing_recheck=False, closing_tol=10.0)
+    engines = [("NPU", "http://a", "m"), ("GPU", "http://b", "m")]
+    _per, _clocks, closing = bc.paired_sweep(engines, args, lambda o: FakeLoad())
+    assert closing is None, "the extra leg must not be taken when disabled"
+
+
+def test_a_suspect_closing_check_reaches_the_warnings_block(monkeypatch, capsys):
+    # Same requirement as the shed note: a warning that only exists mid-output
+    # is missed by a reader skimming the tail of a twenty-minute run.
+    monkeypatch.setattr(bc, "paired_sweep",
+                        lambda e, a, m: (_shed_round(), [99.0],
+                                         _closing(18.0, 11.0)))
+    monkeypatch.setattr(bc, "free_physical_gb", lambda: 32.0)
+    monkeypatch.setattr(bc.be, "n_ctx", lambda b: 4096)
+    monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(sys, "argv", ["bench_contention.py", "--repeat", "1",
+                                      "--cool-floor", "0"])
+    assert bc.main() == 0
+    out = capsys.readouterr().out
+    assert "DECAYED" in out
+    assert "!" * 10 in out, "the warnings banner must fire"

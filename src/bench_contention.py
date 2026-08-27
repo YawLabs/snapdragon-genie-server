@@ -51,6 +51,27 @@ METHOD, AND ITS LIMITS
   * A run is only comparable to another run at the same /props n_ctx, which is
     recorded per endpoint. On Genie the COMPILED window sets throughput.
 
+THE OPENING LEG IS RE-RUN AT THE END
+
+Every sample is gated on clock recovery before it is taken, and that gate is
+structurally blind to what happens next: a leg takes a minute or two, and
+sustained load drives this box to 48.9% of base, so a figure can be gated at
+entry and decay through its own measurement. So the sweep finishes by re-running
+the leg it STARTED with, under the same gate -- an A/A whose only variable is
+elapsed time. Opening and closing within a few percent means the box held;
+anything else means the ratios above it are measuring the box, not contention.
+
+Symmetric on purpose. Slower at the end means decay landed in the numerator
+(contended samples are taken after the solo ones they divide) and contention is
+overstated. FASTER at the end means the opening sample was the degraded one, so
+every baseline the ratios divide by is too low and the retention percentages are
+flattered. Both disqualify the run.
+
+This is a different instrument from `drift_note`, which flags a strictly
+monotonic decline across 3+ solo samples: one noisy sample out of order hides a
+real trend there, and at `--repeat 1` it has nothing to compare. `--no-closing-
+recheck` skips it, at the cost of the only number that says whether the run held.
+
 THE QUIET-BOX PRECONDITION IS ENFORCED, NOT SUGGESTED
 
 Every previously recorded number on this hardware was taken on a loaded box and
@@ -437,7 +458,76 @@ def paired_sweep(engines, a, make_load):
                 print("    pair: %.2f -> %.2f t/s  (keeps %.1f%%)"
                       % (solo, cont, 100 * cont / solo), flush=True)
 
-    return per_engine, clocks
+    # THE CLOSING RE-CHECK. Re-run the leg this sweep OPENED with, last, under
+    # the same gate -- an A/A whose only variable is elapsed time.
+    #
+    # It exists because the two controls already here cannot see this. The cool
+    # gate tests the clock BEFORE a sample and says nothing during it, and a
+    # leg takes a minute or two on a box that sustained load drives to 48.9% of
+    # base -- so every sample can be gated at entry and still decay through its
+    # own measurement. drift_note catches the decay afterwards, but only as a
+    # strictly monotonic decline over 3+ solo samples: one noisy sample out of
+    # order hides a real trend, and at --repeat 1 there is nothing for it to
+    # compare at all.
+    #
+    # This produces a NUMBER instead, from the one comparison that isolates
+    # box state: same engine, same depth, same token count, same gate, ~20
+    # minutes apart.
+    closing = None
+    if a.closing_recheck and engines:
+        name, base, model = engines[0]
+        opened_with = per_engine[name]["solo"]
+        if opened_with:
+            print()
+            print("--- closing re-check: %s solo, the leg this run opened "
+                  "with ---" % name, flush=True)
+            final = measure(base, model, a.depth, a.tokens, a.timeout,
+                            "%s solo (closing)" % name, cool_floor=a.cool_floor)
+            if final:
+                closing = {"engine": name, "first": opened_with[0],
+                           "final": final, "retained": final / opened_with[0]}
+
+    return per_engine, clocks, closing
+
+
+def closing_note(closing, tol_pct=10.0):
+    """(message, suspect) comparing the reopened first leg to its first sample.
+
+    SYMMETRIC, and that is not pedantry -- the two directions disqualify a run
+    for opposite reasons and the fix differs:
+
+      slower at the end   the box decayed across the run. Every contended
+                          sample was taken later than the solo one it is
+                          divided by, so the decay sits in the numerator and
+                          contention is OVERSTATED.
+
+      faster at the end   the OPENING sample was the degraded one, so every
+                          baseline the ratios divide by is too low, and the
+                          retention percentages are flattered.
+
+    A tolerance rather than an equality: this box moves a few percent between
+    any two samples, and a check that fires on ordinary noise is one the reader
+    learns to skip -- the same reasoning as _probe_crosscheck's tol in
+    bench_endpoint, which brackets its decode probe the same way.
+    """
+    if not closing:
+        return ("note: the closing re-check did not run, so nothing says "
+                "whether the box held across this sweep."), False
+    drift = 100.0 * (closing["retained"] - 1.0)
+    shape = ("%s solo opened at %.2f t/s and closed at %.2f (%+.1f%%)"
+             % (closing["engine"], closing["first"], closing["final"], drift))
+    if abs(drift) <= tol_pct:
+        return ("closing re-check: %s -- within %.0f%%, so the box held and "
+                "the ratios above stand." % (shape, tol_pct)), False
+    if drift < 0:
+        return ("SUSPECT: %s. The box DECAYED across this run. Contended "
+                "samples were taken after the solo ones they divide, so that "
+                "decay lands in the numerator and contention is overstated. "
+                "Cool the box and re-run." % shape), True
+    return ("SUSPECT: %s. The box got FASTER, so the OPENING sample was the "
+            "degraded one -- every baseline the ratios divide by is too low "
+            "and the retention percentages above are flattered. Cool the box "
+            "and re-run." % shape), True
 
 
 def shed_note(name, shed, served):
@@ -519,6 +609,17 @@ def main():
     ap.add_argument("--peak-bw-gbs", type=float, default=None,
                     help="theoretical bus bandwidth, GB/s, to compare demand "
                          "against (X1E80100 LPDDR5x-8448 x 128-bit = 135)")
+    ap.add_argument("--no-closing-recheck", dest="closing_recheck",
+                    action="store_false",
+                    help="skip re-running the opening leg at the end. That "
+                         "re-run is the only check that sees decay DURING a "
+                         "sample -- --cool-floor gates before one and says "
+                         "nothing after -- so skipping it costs one leg and "
+                         "buys back no confidence")
+    ap.add_argument("--closing-tol", type=float, default=10.0,
+                    help="%% the closing re-check may differ from the opening "
+                         "sample before the run is called suspect, in EITHER "
+                         "direction (default %(default)s)")
     ap.add_argument("--cool-floor", type=float, default=92.0,
                     help="wait for the clock to recover to this %% of base "
                          "before each SOLO sample (0 disables). Sustained load "
@@ -584,7 +685,7 @@ def main():
 
     print("\nPAIRED SWEEP (solo and contended interleaved, per round)",
           flush=True)
-    per_engine, clocks = paired_sweep(engines, a, make_load)
+    per_engine, clocks, closing = paired_sweep(engines, a, make_load)
 
     solo = {n: statistics.median(r["solo"]) for n, r in per_engine.items() if r["solo"]}
     contended = {n: statistics.median(r["contended"])
@@ -610,6 +711,11 @@ def main():
             print("  %-4s incomplete (every measurement was skipped)" % name)
 
     warnings = list(GATE_NOTES)
+    note, suspect = closing_note(closing, a.closing_tol)
+    print()
+    print("  %s" % note)
+    if suspect:
+        warnings.append(note)
     for name, _b, _m in engines:
         w = drift_note(per_engine[name]["solo"], "%s solo decode" % name)
         if w:
@@ -733,7 +839,8 @@ def main():
                        "tokens": a.tokens, "repeat": a.repeat,
                        "solo_median": solo, "contended_median": contended,
                        "paired_ratio_median": ratios, "per_engine": per_engine,
-                       "cpu_clock_pct": clocks, "bandwidth": bw,
+                       "cpu_clock_pct": clocks, "closing_recheck": closing,
+                       "bandwidth": bw,
                        "warnings": warnings}, f, indent=2)
         print("\nwrote %s" % a.json)
     return 0

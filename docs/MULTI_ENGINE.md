@@ -441,13 +441,18 @@ each pair reproduced every backend to within 0.1-3.5%.
 
 Two things worth taking from that. The effect is a property of the BOX, not of
 either stack, since it reproduces through a completely different runtime. And
-the cheap control is one this file's harness does not implement: **repeat the
+the cheap control is one this file's harness now implements: **repeat the
 first leg last.** `bench_contention.py` interleaves solo against contended and
 flags a monotonic decline afterwards (`drift_note`), and `bench_endpoint.py`
 brackets its decode probe before and after a `--prefill-only` sweep -- but
-nothing here re-runs leg one at the end of a multi-BACKEND comparison, which is
-the single measurement that turns "the later legs look slower" from a suspicion
-into a number. Written up on that session's side in its `docs/backend/QNN.md`.
+nothing re-ran leg one at the END, which is the single measurement that turns
+"the later legs look slower" from a suspicion into a number. Added:
+`bench_contention.py` now closes every sweep by re-running the leg it opened
+with, under the same cool gate, and reports the drift both ways -- slower means
+decay landed in the numerator and contention is overstated, faster means the
+OPENING sample was the degraded one and every retention percentage above it is
+flattered. `--no-closing-recheck` skips it. Written up on that session's side in
+its `docs/backend/QNN.md`.
 
 Thermals are the half of this that is easy to miss, and on the GPU leg they are
 worth **1.64x**. The same measurement at d469, varying only the state of the
