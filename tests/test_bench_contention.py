@@ -27,6 +27,12 @@ sys.modules.setdefault("bench_endpoint", types.SimpleNamespace(
     chat=lambda *a, **k: {},
     n_ctx=lambda b: 4096,
     _post=lambda *a, **k: (None, 0.0),
+    # bench_contention delegates its power sampling here rather than keeping a
+    # second copy of the WMI query. The stub returns "unreadable", which is what
+    # a test double that cannot see hardware honestly knows -- and it keeps this
+    # file's promise of no device and no subprocess. Tests that need a specific
+    # reading patch `bc.battery_state` directly.
+    battery_state=lambda: (None, None, None),
 ))
 
 import bench_contention as bc  # noqa: E402

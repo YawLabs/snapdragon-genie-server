@@ -496,7 +496,9 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   generation. It is a spin, not drain.
 
   The decode figure is now measured four times, three of which agree. Interleaved
-  legs, single engine, no contention, AC, cool box:
+  legs, single engine, no contention, cool box, **on AC with a SETTLED pack**
+  (above ~40% and charge draw under 5 W -- see the precondition note below; bare
+  "on AC" is not enough and this line said only that until 2026-08-28):
 
   | | poll=false | poll=true | ratio |
   |---|---|---|---|
@@ -517,6 +519,36 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   interleaved pairs while `poll: true` spans 3.30. **The busy-wait costs
   predictability as well as throughput**, which matters more than the median for
   an agent workload where a slow turn is a stall a human notices.
+
+- **The measurement precondition is a SETTLED PACK, not "on AC". Plugging in is
+  not enough and the difference is 2x on prefill.** Measured across two sessions
+  on this box:
+
+  | pack | condition | CPU pp512 |
+  |---|---|---|
+  | 13-20% | on AC, charging | **58** |
+  | 33% | on AC, charging | 124 |
+  | 41.6% | on AC, charging | 113 |
+  | 100% | settled, 4.6 W draw | **132** |
+
+  Below roughly 20-25% the system protects the charge and starves compute --
+  half the prefill, while plugged in and while `PowerOnline` reads `True`. So
+  someone who plugs in at 15%, satisfies a bare "measure on AC" instruction and
+  starts, publishes a number that is 2x wrong with nothing to warn them. The
+  condition that actually holds is **on AC, above ~40%, charge draw under 5 W**.
+
+  Two things this does NOT explain, so do not reach for the pack when you see
+  them. The CPU clock oscillates 40-58 points *under load* on a fully settled
+  100% pack, and every leg converges on the same 48.9-56.2% floor band whatever
+  charging did. And a low CPU clock during a GPU-bound leg is ordinary idle
+  downclocking, not throttling -- the CPU has nothing to do.
+
+  **Decode is largely immune to all of it; prefill is not.** Genie decode
+  measured 17.70 t/s charging at 33% and 17.91 settled at 100% -- 1.2% apart --
+  while prefill separates backends 2x. Check the pack before quoting a prefill
+  figure; a decode figure survives a messier box. `bench_endpoint` and
+  `bench_contention` both record pack, draw and clock alongside their numbers
+  now, so a run's conditions are in its output rather than in someone's memory.
 
 - **The contention ABSOLUTES could not be established on this box, and that is
   a property of the hardware rather than a gap in effort.** The poll ratios are

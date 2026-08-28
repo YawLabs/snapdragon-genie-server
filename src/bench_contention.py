@@ -300,28 +300,11 @@ def battery_state():
     point mis-sorts the legs nearest it, so record the quantity and let a reader
     pick their own line afterwards.
     """
-    if sys.platform != "win32":
-        return None, None, None
-    import subprocess
-    try:
-        out = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command",
-             "$b = Get-CimInstance -Namespace root\\wmi -ClassName "
-             "BatteryStatus -ErrorAction SilentlyContinue | Select-Object "
-             "-First 1; $c = (Get-CimInstance Win32_Battery -ErrorAction "
-             "SilentlyContinue | Select-Object -First 1)"
-             ".EstimatedChargeRemaining; "
-             "'{0},{1},{2}' -f $b.PowerOnline, $c, "
-             "[math]::Round($b.ChargeRate/1000,1)"],
-            capture_output=True, text=True, timeout=30)
-        if out.returncode != 0:
-            return None, None, None
-        ac, pct, watts = out.stdout.strip().split(",")
-        return (ac.strip().lower() == "true",
-                float(pct) if pct.strip() else None,
-                float(watts) if watts.strip() else None)
-    except Exception:
-        return None, None, None
+    # Delegated rather than duplicated: bench_endpoint now samples the same
+    # four values for its own runs, and two copies of a WMI query string is two
+    # places for it to drift. The dependency direction is the one that already
+    # exists -- this module imports bench_endpoint, never the reverse.
+    return be.battery_state()
 
 
 # Below this the pack is deep enough into discharge that the system protects

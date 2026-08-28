@@ -81,6 +81,124 @@ CHARS_PER_TOKEN = 4
 FILLER = "The quick brown fox jumps over the lazy dog near the riverbank. "
 
 
+# --------------------------------------------------------------------------
+# Box state, recorded alongside every number this tool produces.
+#
+# This module had NO instrumentation at all -- no power, no clock -- while
+# producing every prefill and decode figure the docs quote. Its own docstring
+# told the OPERATOR to "record the wall-clock window with the numbers"; it
+# identified the need and then delegated it to whoever remembered.
+#
+# The cost of that is not hypothetical and was watched happening on this box: a
+# neighbouring project's headline table can no longer be explained, because the
+# CSVs behind it recorded clock and no power. Its deltas track CPU clock, and
+# WHY the clock was lower is now permanently unknowable. A number without its
+# box state is not reproducible, and nobody can go back and add the state later.
+# --------------------------------------------------------------------------
+
+_STATE_PS = (
+    "$b = Get-CimInstance -Namespace root\\wmi -ClassName BatteryStatus "
+    "-ErrorAction SilentlyContinue | Select-Object -First 1; "
+    "$c = (Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | "
+    "Select-Object -First 1).EstimatedChargeRemaining; "
+    "$k = (Get-Counter '\\Processor Information(_Total)\\% Processor "
+    "Performance' -ErrorAction SilentlyContinue).CounterSamples.CookedValue; "
+    "'{0},{1},{2},{3}' -f $b.PowerOnline, $c, "
+    "[math]::Round($b.ChargeRate/1000,1), [math]::Round($k,1)"
+)
+
+
+def battery_state():
+    """(on_ac, charge_pct, charge_watts) -- any element None if unreadable.
+
+    Magnitudes, never a boolean. Two sessions on this box independently built a
+    "charging suspended" flag and both were wrong at their cut point: a <=1 W
+    test scored 0/4 on legs that shed 92% and 97% of their draw, and a
+    25%-of-opening test scored 2/4 on the same legs. Every threshold mis-sorts
+    the legs nearest it, so record the quantity and let a reader draw the line.
+    """
+    ac, pct, watts, _clock = box_state()
+    return ac, pct, watts
+
+
+def box_state():
+    """(on_ac, charge_pct, charge_watts, clock_pct_of_base). Nones on failure.
+
+    One subprocess for all four, because this sits between measurements and the
+    alternative is three PowerShell launches per sample.
+    """
+    if sys.platform != "win32":
+        return None, None, None, None
+    import subprocess
+    try:
+        out = subprocess.run(["powershell.exe", "-NoProfile", "-Command",
+                              _STATE_PS],
+                             capture_output=True, text=True, timeout=30)
+        if out.returncode != 0:
+            return None, None, None, None
+        ac, pct, watts, clock = out.stdout.strip().split(",")
+
+        def _f(v):
+            return float(v) if v.strip() else None
+
+        return (ac.strip().lower() == "true" if ac.strip() else None,
+                _f(pct), _f(watts), _f(clock))
+    except Exception:
+        return None, None, None, None
+
+
+# One reading per measurement, so the run's artifact carries the box's
+# trajectory rather than a verdict about it.
+BOX_SAMPLES = []
+
+
+def note_box_state(label):
+    """Record the box state for one measurement. Never raises."""
+    ac, pct, watts, clock = box_state()
+    if pct is None and clock is None:
+        return
+    BOX_SAMPLES.append({"label": label, "on_ac": ac, "charge_pct": pct,
+                        "charge_w": watts, "clock_pct": clock})
+
+
+def box_state_summary():
+    """Lines describing what the box did across the run, or [] if unsampled.
+
+    Reports RANGES rather than a pass/fail, for the same reason battery_state
+    returns magnitudes: the reader picks the line. A charging pack below ~25%
+    halves prefill on this box (13-20% gives CPU pp512 ~58 against a settled
+    130) while decode barely moves, so the same run can be sound for one figure
+    and worthless for the other -- which no single verdict can express.
+    """
+    if not BOX_SAMPLES:
+        return []
+    out = []
+    charges = [s["charge_pct"] for s in BOX_SAMPLES if s["charge_pct"] is not None]
+    clocks = [s["clock_pct"] for s in BOX_SAMPLES if s["clock_pct"] is not None]
+    draws = [s["charge_w"] for s in BOX_SAMPLES if s["charge_w"] is not None]
+    on_ac = [s["on_ac"] for s in BOX_SAMPLES if s["on_ac"] is not None]
+    if charges:
+        line = "  box: pack %.0f-%.0f%%" % (min(charges), max(charges))
+        if draws:
+            line += ", draw %.1f-%.1f W" % (min(draws), max(draws))
+        if on_ac and not all(on_ac):
+            line += ", ON BATTERY for part of the run"
+        out.append(line)
+        if min(charges) < 25:
+            out.append("  WARNING: pack reached %.0f%%. Below ~25%% this box "
+                       "halves PREFILL (pp512 58 against a settled 130) while "
+                       "decode holds -- prefill figures here are not a settled "
+                       "baseline even on AC." % min(charges))
+    if clocks:
+        out.append("  clock: %.0f-%.0f%% of base across %d sample(s)"
+                   % (min(clocks), max(clocks), len(clocks)))
+        if min(clocks) < 80:
+            out.append("  WARNING: clock reached %.0f%% of base. Sampled "
+                       "BETWEEN measurements, so it brackets them rather than "
+                       "describing what happened during one." % min(clocks))
+    return out
+
+
 def _describe(err):
     """A one-line reason from a failed request, including the server's message.
 
@@ -243,6 +361,7 @@ def measure_prefill(base, model, target, timeout, per_step=0.0):
     rate = r["prompt_tokens"] / wall
     print("  prefill   prompt=%-6d wall=%7.2fs (raw %6.2fs)  %8.1f tok/s"
           % (r["prompt_tokens"], wall, raw, rate), flush=True)
+    note_box_state("prefill d%d" % r["prompt_tokens"])
     return rate
 
 
@@ -289,6 +408,7 @@ def measure_decode(base, model, target, tokens, timeout):
     rate = steps / secs
     print("  decode    depth=%-6d %3d tokens in %6.2fs   %8.2f tok/s"
           % (many["prompt_tokens"], steps, secs, rate), flush=True)
+    note_box_state("decode d%d" % many["prompt_tokens"])
     return rate
 
 
@@ -539,6 +659,19 @@ def main():
             _verdict(shallow, deep,
                      deep_flag="--repeat" if args.decode_every
                      else "--repeat-deep")
+
+    # Last, so it is the thing still on screen when the run ends. These figures
+    # are only comparable to another run taken under the same box state, and
+    # this is the only place that state is written down.
+    summary = box_state_summary()
+    if summary:
+        print("\nBOX STATE (sampled between measurements)", flush=True)
+        for line in summary:
+            print(line, flush=True)
+    elif sys.platform == "win32":
+        print("\n  (box state could not be sampled -- these numbers carry no "
+              "record of the power or clock conditions they were taken under)",
+              flush=True)
 
 
 if __name__ == "__main__":

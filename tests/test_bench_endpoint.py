@@ -393,6 +393,80 @@ def test_the_step_floor_is_tunable(be, monkeypatch):
                                                                      rel=1e-6)
 
 
+# --- box state recorded alongside the numbers -----------------------------
+# This module produced every published prefill and decode figure while
+# recording no power or clock state at all. Its docstring told the OPERATOR to
+# note the conditions, which is the same as not recording them.
+
+def test_box_state_summary_is_silent_with_no_samples(be):
+    # Nothing sampled must produce no claim -- absence of a reading is not a
+    # reading, and main() distinguishes the two in its own output.
+    be.BOX_SAMPLES.clear()
+    assert be.box_state_summary() == []
+
+
+def test_box_state_reports_ranges_not_a_verdict(be):
+    # Magnitudes, so a reader applies their own threshold. The same run can be
+    # sound for decode and worthless for prefill, which no single verdict says.
+    be.BOX_SAMPLES.clear()
+    be.BOX_SAMPLES.extend([
+        {"label": "a", "on_ac": True, "charge_pct": 62.0, "charge_w": 30.0,
+         "clock_pct": 99.0},
+        {"label": "b", "on_ac": True, "charge_pct": 64.0, "charge_w": 28.0,
+         "clock_pct": 97.0}])
+    text = "\n".join(be.box_state_summary())
+    assert "pack 62-64%" in text and "draw 28.0-30.0 W" in text
+    assert "clock: 97-99% of base" in text
+    assert "WARNING" not in text, "a healthy box must not warn"
+
+
+def test_a_low_pack_warns_about_prefill_specifically(be):
+    # The finding is asymmetric: prefill halves, decode holds. A warning that
+    # said "results unreliable" would overstate it and get ignored.
+    be.BOX_SAMPLES.clear()
+    be.BOX_SAMPLES.append({"label": "a", "on_ac": True, "charge_pct": 14.0,
+                           "charge_w": 31.0, "clock_pct": 96.0})
+    text = "\n".join(be.box_state_summary())
+    assert "WARNING" in text and "14%" in text
+    assert "PREFILL" in text and "decode holds" in text
+
+
+def test_running_on_battery_is_called_out(be):
+    be.BOX_SAMPLES.clear()
+    be.BOX_SAMPLES.extend([
+        {"label": "a", "on_ac": True, "charge_pct": 80.0, "charge_w": 0.0,
+         "clock_pct": 99.0},
+        {"label": "b", "on_ac": False, "charge_pct": 79.0, "charge_w": 0.0,
+         "clock_pct": 60.0}])
+    assert "ON BATTERY" in "\n".join(be.box_state_summary())
+
+
+def test_the_clock_warning_says_it_brackets_rather_than_covers(be):
+    # Sampled BETWEEN measurements, so it cannot describe what happened during
+    # one. Claiming otherwise is the over-read this repo keeps catching.
+    be.BOX_SAMPLES.clear()
+    be.BOX_SAMPLES.append({"label": "a", "on_ac": True, "charge_pct": 90.0,
+                           "charge_w": 0.0, "clock_pct": 58.0})
+    text = "\n".join(be.box_state_summary())
+    assert "58%" in text and "brackets" in text
+
+
+def test_an_unreadable_box_records_nothing_rather_than_zeros(be, monkeypatch):
+    # box_state returns Nones off-Windows and on any query failure. Recording
+    # a row of Nones would put a fake sample in the artifact.
+    be.BOX_SAMPLES.clear()
+    monkeypatch.setattr(be, "box_state", lambda: (None, None, None, None))
+    be.note_box_state("x")
+    assert be.BOX_SAMPLES == []
+
+
+def test_battery_state_delegates_to_the_single_sampler(be, monkeypatch):
+    # bench_contention calls this; two copies of the WMI query is two places
+    # for it to drift.
+    monkeypatch.setattr(be, "box_state", lambda: (True, 55.0, 12.0, 98.0))
+    assert be.battery_state() == (True, 55.0, 12.0)
+
+
 def test_decode_probe_returns_seconds_per_step(be):
     _stub_chat_seq(be, _run(1, 0.30), _run(9, 0.74))
     per_step = be.decode_probe("b", "m", 1, depth=500, steps=8)
