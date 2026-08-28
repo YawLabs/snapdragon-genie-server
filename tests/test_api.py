@@ -495,6 +495,34 @@ def test_a_reasoning_enabled_stream_is_not_gated(gs, handler):
     assert text == "The answer.\n</think>\n\nMore text."
 
 
+@pytest.mark.parametrize("chunks", [
+    # the orphan as observed live: tag alone on its line
+    ["A GEMM is a model.\n", "</think>\n", "\nA GEMM is a network."],
+    # the hazard: tag lands at the end of a BUFFER, and the next chunk turns out
+    # to continue that same line -- so it was an inline mention all along
+    ["The\n", "</think>", " tag is how you close it."],
+    ["The ", "</think>", " tag closes it."],       # inline, split across chunks
+    ["reasoning\n", "</think>"],                   # orphan with nothing after it
+    ["<think>r</think>\n\n", "the answer"],        # well-formed pair
+    ["just ", "an answer"],                        # no tag at all
+])
+def test_a_stream_delivers_exactly_what_the_buffered_path_would(gs, chunks):
+    """The two paths must decide the same generation the same way.
+
+    They reach the decision differently -- the buffered path sees the whole
+    output at once, the gate sees a growing prefix -- and that asymmetry is a
+    real trap: end-of-BUFFER is not end-of-OUTPUT, so a permissive anchor made
+    the stream strip a tag whose line had not finished yet. Measured, the stream
+    emitted "tag is how you close it." for a generation the buffered path kept
+    whole. Pinned as an equivalence rather than as two separate expectations,
+    because the failure is precisely that they diverge.
+    """
+    gate = gs._OrphanGate(prefilled=True)
+    streamed = "".join(x for x in (gate.feed(c) for c in chunks) if x)
+    streamed += gate.flush()
+    assert streamed == gs._maybe_strip_think("".join(chunks), True)
+
+
 def test_streamed_usage_counts_what_was_actually_sent(gs, handler):
     """Usage must describe the bytes the client received, not a different strip.
 

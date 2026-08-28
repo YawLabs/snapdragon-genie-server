@@ -1340,6 +1340,16 @@ _THINK_CLOSE = "</think>"
 # it. That is rarer than the inline mention by a wide margin, and the failure is
 # now bounded to a shape the model has to go out of its way to produce.
 _ORPHAN_CLOSE_RE = re.compile(r"(?:\A|\n)[ \t]*</think>[ \t]*(?=\n|\Z)")
+# The same anchor for use MID-STREAM, where end-of-buffer is not end-of-output.
+# The permissive form above accepts \Z, which while streaming only means "the
+# tag is the last thing received SO FAR" -- and the next chunk can continue that
+# same line, turning it into an inline mention after all. Measured: the chunks
+# ["The\n", "</think>", " tag is how you close it."] made the stream emit "tag
+# is how you close it." while the buffered path correctly kept the whole
+# sentence, so the two paths disagreed about the same generation. Requiring a
+# real newline defers the decision until the line is finished; flush() then
+# applies the permissive form, because by then the generation really has ended.
+_ORPHAN_CLOSE_MID_RE = re.compile(r"(?:\A|\n)[ \t]*</think>[ \t]*(?=\n)")
 
 
 def _strip_orphan_think(text):
@@ -1489,7 +1499,7 @@ class _OrphanGate:
         # whatever the tokenizer produced, so the tag routinely straddles two
         # callbacks and a per-chunk search would miss it.
         held = "".join(self.buf)
-        m = _ORPHAN_CLOSE_RE.search(held)
+        m = _ORPHAN_CLOSE_MID_RE.search(held)
         if m is not None:
             self.open, self.buf = True, []
             if "<think>" in held[:m.start()]:
@@ -1512,7 +1522,11 @@ class _OrphanGate:
             return ""
         held = "".join(self.buf)
         self.open, self.buf = True, []
-        return held
+        # Permissive form here: the generation is over, so a close sitting at
+        # the very end of the output has no newline after it and is structural
+        # all the same. This is also what keeps a streamed result identical to
+        # the buffered one -- feed() defers that case, flush() decides it.
+        return _strip_orphan_think(held)
 
 
 def _anthropic_text(content):
