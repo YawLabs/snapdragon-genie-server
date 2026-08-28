@@ -185,6 +185,56 @@ def test_wait_for_cool_returns_the_sample_it_gated_on(monkeypatch):
     assert bc.wait_for_cool(92.0, limit=30) == 95.0
 
 
+def _count_reads(monkeypatch, src, charge=90.0, busy=90.0):
+    """Run power_limited_note below the floor, counting each hardware read.
+
+    Every one of these is a PowerShell launch and this gate runs before every
+    sample, so the count is the thing worth pinning -- not as a micro-benchmark
+    but because it grew from two to three without anyone noticing.
+    """
+    calls = []
+
+    def rec(name, value):
+        def f(*a, **k):
+            calls.append(name)
+            return value
+        return f
+
+    monkeypatch.setattr(bc, "power_source", rec("power_source", src))
+    monkeypatch.setattr(bc, "battery_state",
+                        rec("battery_state", (True, charge, 30.0)))
+    monkeypatch.setattr(bc, "cpu_busy_pct", rec("cpu_busy_pct", busy))
+    bc.power_limited_note(45.0, 92.0)
+    return calls
+
+
+def test_the_gate_takes_only_the_readings_it_uses(monkeypatch):
+    # cpu_busy_pct's value is read ONLY in the no-battery branch, but it used to
+    # be called unconditionally -- so every AC run paid a subprocess for a
+    # number it then discarded.
+    ac = _count_reads(monkeypatch, "ac")
+    assert "cpu_busy_pct" not in ac, "AC path read a CPU figure it cannot use"
+    assert ac == ["power_source", "battery_state"]
+
+    nb = _count_reads(monkeypatch, "no-battery")
+    assert "battery_state" not in nb, "no-battery path read a pack it does not have"
+    assert nb == ["power_source", "cpu_busy_pct"]
+
+    # The two definitive answers cost one reading and stop.
+    assert _count_reads(monkeypatch, "battery") == ["power_source"]
+    assert _count_reads(monkeypatch, "unknown") == ["power_source"]
+
+
+def test_the_gate_reads_nothing_at_all_above_the_floor(monkeypatch):
+    # The common case by far: the clock is fine, so there is nothing to explain
+    # and no reason to touch the hardware.
+    calls = []
+    monkeypatch.setattr(bc, "power_source",
+                        lambda: calls.append("power_source") or "ac")
+    assert bc.power_limited_note(99.0, 92.0) == (None, False)
+    assert calls == []
+
+
 def test_a_deeply_discharged_pack_is_flagged_even_on_AC(monkeypatch):
     """AC used to fall off the end of the check and read as clean.
 

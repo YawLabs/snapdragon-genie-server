@@ -332,6 +332,16 @@ def power_limited_note(pct, floor):
     battery would mean the gate never works at all. The fingerprint is only
     sound when the CPU is BUSY, which is its own premise: a thermally limited
     box is busy.
+
+    EACH READING COSTS A POWERSHELL LAUNCH, and this runs before every sample.
+    So the branches are ordered to take only the readings they actually use:
+    `power_source` always (it is the thing that decides), then AT MOST ONE of
+    the pack state or the CPU-busy figure. It previously took all three on
+    every call -- including `cpu_busy_pct()` unconditionally, whose value is
+    read only in the no-battery branch, so every AC run paid for a number it
+    then discarded. The file already carried a comment worrying about two
+    subprocess calls here when there were two; a third was added without
+    anyone noticing, which is how that kind of cost grows.
     """
     if pct is None or pct >= floor:
         return None, False
@@ -348,23 +358,28 @@ def power_limited_note(pct, floor):
     # to report", so a box plugged in but deeply discharged read as clean. That
     # is the state that actually costs you half your prefill, and it is exactly
     # the state an operator reaches after plugging in and starting immediately.
-    _ac, charge, watts = battery_state()
-    if src == "ac" and charge is not None and charge < LOW_CHARGE_PCT:
-        return ("clock is %.0f%% of base, and the pack is at %.0f%%%s. AC is "
-                "connected, but measured on this box a pack below ~%.0f%% "
-                "halves prefill (pp512 58 against a settled 130) while decode "
-                "barely moves -- so this is not a settled-box measurement even "
-                "though it is plugged in. Advisory, not fatal: bandwidth-bound "
-                "work is largely immune. Let it charge for a clean baseline."
-                % (pct, charge,
-                   " drawing %.0f W" % watts if watts is not None else "",
-                   LOW_CHARGE_PCT)), False
-    busy = cpu_busy_pct()
-    if src == "no-battery" and busy is not None and busy < 15.0:
-        return ("clock is %.0f%% of base while the CPU is only %.0f%% busy. On "
-                "a box with no battery that is most likely ordinary idle "
-                "downclocking rather than a limit -- but if the clock stays "
-                "low once work starts, check the power budget." % (pct, busy)), False
+    if src == "ac":
+        _ac, charge, watts = battery_state()
+        if charge is not None and charge < LOW_CHARGE_PCT:
+            return ("clock is %.0f%% of base, and the pack is at %.0f%%%s. AC "
+                    "is connected, but measured on this box a pack below ~%.0f%% "
+                    "halves prefill (pp512 58 against a settled 130) while "
+                    "decode barely moves -- so this is not a settled-box "
+                    "measurement even though it is plugged in. Advisory, not "
+                    "fatal: bandwidth-bound work is largely immune. Let it "
+                    "charge for a clean baseline."
+                    % (pct, charge,
+                       " drawing %.0f W" % watts if watts is not None else "",
+                       LOW_CHARGE_PCT)), False
+        return None, False
+    if src == "no-battery":
+        busy = cpu_busy_pct()
+        if busy is not None and busy < 15.0:
+            return ("clock is %.0f%% of base while the CPU is only %.0f%% busy. "
+                    "On a box with no battery that is most likely ordinary idle "
+                    "downclocking rather than a limit -- but if the clock stays "
+                    "low once work starts, check the power budget."
+                    % (pct, busy)), False
     return None, False
 
 
