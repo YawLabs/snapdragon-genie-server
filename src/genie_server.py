@@ -82,8 +82,27 @@ WINDOW_MARGIN = int(os.environ.get("GENIE_WINDOW_MARGIN", "64"))
 # Pin the sampler seed for reproducible output; unset means a fresh seed per
 # request, which is the default and the thing that stops every answer to a
 # given prompt being the same answer. See next_seed().
-FIXED_SEED = os.environ.get("GENIE_SEED", "").strip()
-FIXED_SEED = int(FIXED_SEED) if FIXED_SEED else None
+def _int_env(name, default):
+    """An int from the environment, or `default` with a line saying why not.
+
+    Every other config reader here degrades rather than refusing to boot, and
+    these two did not: a typo in GENIE_SEED killed the process at IMPORT with a
+    bare `invalid literal for int()`, before any startup line had printed. The
+    operator gets a traceback naming neither the variable they set nor the form
+    it wanted, on a server whose whole startup banner exists to explain itself.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print("[genie] WARNING: %s=%r is not an integer; using %r instead."
+              % (name, raw, default), flush=True)
+        return default
+
+
+FIXED_SEED = _int_env("GENIE_SEED", None)
 
 
 def next_seed():
@@ -1303,6 +1322,24 @@ class GenieEngine:
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 _THINK_CLOSE = "</think>"
+# The close must stand ALONE ON ITS LINE to count as one the model emitted
+# structurally. That is the discriminator between the two ways a bare closing
+# tag reaches the output, and without it the strip cannot tell them apart:
+#
+#   reopened block   "...used for NLP.\n</think>\n\nA GEMM is..."   <- strip
+#   prose mention    "The </think> tag closes a reasoning block."   <- keep
+#
+# Gating on "did this request prefill a block" is necessary but NOT sufficient,
+# because reasoning is suppressed by DEFAULT -- so nearly every real request
+# prefills, and a bare-close test alone truncated a correct answer on the
+# overwhelmingly common path. Measured: asking the server to repeat that
+# sentence returned "tag closes a reasoning block." until this anchor landed.
+#
+# Residual risk, stated rather than hidden: an answer that puts the tag alone on
+# a line -- inside a fenced code block showing the template, say -- still trips
+# it. That is rarer than the inline mention by a wide margin, and the failure is
+# now bounded to a shape the model has to go out of its way to produce.
+_ORPHAN_CLOSE_RE = re.compile(r"(?:\A|\n)[ \t]*</think>[ \t]*(?=\n|\Z)")
 
 
 def _strip_orphan_think(text):
@@ -1327,17 +1364,32 @@ def _strip_orphan_think(text):
     reasoning the caller already asked not to receive. Removing it restores the
     contract; leaving it ships the answer twice.
     """
-    i = text.find(_THINK_CLOSE)
-    if i == -1 or "<think>" in text[:i]:
+    m = _ORPHAN_CLOSE_RE.search(text)
+    if m is None or "<think>" in text[:m.start()]:
         return text
-    return text[i + len(_THINK_CLOSE):].lstrip()
+    return text[m.end():].lstrip()
 
 
-def _maybe_strip_think(text):
-    # Orphan-stripping is NOT gated on STRIP_THINK. That flag chooses whether
-    # to show genuine reasoning; this is a broken prefill duplicating the
-    # answer, which no caller wants in either setting.
-    text = _strip_orphan_think(text)
+def _maybe_strip_think(text, prefilled=False):
+    """Strip reasoning from `text`. `prefilled` says whether THIS request sent
+    a closed think block, which is the only case an orphan close can be ours.
+
+    Orphan-stripping is not gated on STRIP_THINK -- that flag chooses whether to
+    show genuine reasoning, while this removes a DUPLICATED answer, which no
+    caller wants in either setting. It IS gated on `prefilled`, and that gate is
+    load-bearing rather than tidy: without it the strip fires on any answer
+    whose first mention of the closing tag is bare, so asking this server about
+    its own reasoning suppression returned "tag closes a reasoning block"
+    instead of "The </think> tag closes a reasoning block". Silent truncation of
+    a correct answer is a worse failure than the duplicate it was fixing, and
+    a coding agent over this repo hits exactly that text.
+
+    `prefilled` defaults to FALSE on purpose. A call site that forgets to pass
+    it then ships a visible duplicate, which someone reports; the other default
+    would silently eat content at a site nobody thought about.
+    """
+    if prefilled:
+        text = _strip_orphan_think(text)
     return _THINK_RE.sub("", text) if STRIP_THINK else text
 
 
@@ -1378,7 +1430,7 @@ def _maybe_strip_think(text):
 # The BUFFERED paths -- non-streaming, and both tool paths, which already hold
 # the whole generation before answering -- strip the duplicate always and for
 # free. This setting only governs the incremental paths.
-ORPHAN_HOLD_CHARS = int(os.environ.get("GENIE_ORPHAN_HOLD_CHARS", "-1"))
+ORPHAN_HOLD_CHARS = _int_env("GENIE_ORPHAN_HOLD_CHARS", -1)
 
 
 class _OrphanGate:
@@ -1401,28 +1453,49 @@ class _OrphanGate:
     buffered again for the rest of the generation.
     """
 
-    def __init__(self, limit=None):
+    def __init__(self, limit=None, prefilled=True):
         self.buf = []
         self.limit = ORPHAN_HOLD_CHARS if limit is None else limit
-        # Only 0 means "do not gate". A negative limit holds indefinitely, so
-        # the gate opens on the close tag or on flush() and nowhere else.
-        self.open = self.limit == 0
+        # Open from the start -- i.e. a pass-through -- when gating is disabled
+        # (limit 0) OR when this request did not prefill a closed block, since
+        # then a closing tag can only be the model's own prose and withholding
+        # the text before it would truncate a correct answer. Otherwise a
+        # negative limit holds indefinitely and the gate opens on the close tag
+        # or on flush(), nowhere else.
+        self.open = self.limit == 0 or not prefilled
+        # Set when an orphan is actually removed, and cleared once real text has
+        # gone out after it. The blank line separating the dropped block from
+        # the answer usually arrives in the NEXT chunk, after the gate has
+        # already opened -- so lstrip()ing only what was held leaves the client
+        # a reply that starts with a newline. Narrow on purpose: with no drop
+        # this is inert, so an ordinary reply's leading whitespace is untouched.
+        self._dropped = False
+
+    def _after_drop(self, text):
+        """Swallow the gap left by a removed block, then get out of the way."""
+        if not self._dropped:
+            return text
+        text = text.lstrip()
+        if text:
+            self._dropped = False
+        return text
 
     def feed(self, chunk):
         """Text that may be emitted now, possibly ""."""
         if self.open:
-            return chunk
+            return self._after_drop(chunk)
         self.buf.append(chunk)
         # Searched over the ACCUMULATION, not the chunk: Genie hands back
         # whatever the tokenizer produced, so the tag routinely straddles two
         # callbacks and a per-chunk search would miss it.
         held = "".join(self.buf)
-        i = held.find(_THINK_CLOSE)
-        if i != -1:
+        m = _ORPHAN_CLOSE_RE.search(held)
+        if m is not None:
             self.open, self.buf = True, []
-            if "<think>" in held[:i]:
+            if "<think>" in held[:m.start()]:
                 return held      # matched pair: genuine reasoning, not ours
-            return held[i + len(_THINK_CLOSE):].lstrip()
+            self._dropped = True
+            return self._after_drop(held[m.end():])
         if self.limit > 0 and len(held) >= self.limit:
             self.open, self.buf = True, []
             return held
@@ -1999,7 +2072,12 @@ def _summarize_turns(msgs, prior=""):
                      commit=False, internal=True)
     except Exception:
         return None, 0
-    text = _THINK_RE.sub("", "".join(out)).strip()
+    # prefilled=True unconditionally: this prompt is built with thinking=False
+    # a few lines up, so a closing tag in the note can only be the model
+    # reopening the block we prefilled. A retained note is the one place
+    # reasoning must never land -- it rides in the system turn and is re-read on
+    # every later request.
+    text = _THINK_RE.sub("", _strip_orphan_think("".join(out))).strip()
     if not text:
         return None, 0
     return text, _tok_count(text)
@@ -2256,9 +2334,14 @@ class Handler(BaseHTTPRequestHandler):
         tools = req.get("tools") or None
         stream = bool(req.get("stream", False))
         max_tokens = int(req.get("max_tokens") or DEFAULT_MAX_TOKENS)
+        # Resolved ONCE and threaded through, rather than re-derived downstream.
+        # It decides both what goes into the prompt and whether a closing think
+        # tag in the OUTPUT can be ours to strip, and those two answers have to
+        # come from the same call or the response path strips against a prompt
+        # it did not send.
+        thinking = _wants_thinking(req)
         prompt, dropped, fits, overhead = build_windowed(
-            messages, tools=tools, thinking=_wants_thinking(req),
-            max_tokens=max_tokens)
+            messages, tools=tools, thinking=thinking, max_tokens=max_tokens)
         if not fits:
             self._json(400, {"error": {"message": _overflow_msg(prompt, max_tokens),
                                        "type": "invalid_request_error"}})
@@ -2269,7 +2352,8 @@ class Handler(BaseHTTPRequestHandler):
         cmpl_id = "chatcmpl-%d" % created
         gen_kw = {"stop": _stop_sequences(req),
                   "sampler": _sampler_params(req, tools_active=bool(tools)),
-                  "overhead": overhead}
+                  "overhead": overhead,
+                  "prefilled": not thinking}
         if stream:
             self._stream(prompt, max_tokens, cmpl_id, created,
                          tools_active=bool(tools),
@@ -2281,7 +2365,7 @@ class Handler(BaseHTTPRequestHandler):
                            tools_active=bool(tools), **gen_kw)
 
     def _complete(self, prompt, max_tokens, cmpl_id, created, tools_active=False,
-                  stop=None, sampler=None, overhead=0):
+                  stop=None, sampler=None, overhead=0, prefilled=False):
         chunks = []
         try:
             finish = ENGINE.query(prompt, chunks.append, max_tokens=max_tokens,
@@ -2289,7 +2373,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json(500, {"error": {"message": str(e), "type": "server_error"}})
             return
-        raw = _maybe_strip_think("".join(chunks))
+        raw = _maybe_strip_think("".join(chunks), prefilled)
         content = raw
         tool_calls = []
         if tools_active:
@@ -2326,7 +2410,8 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _stream(self, prompt, max_tokens, cmpl_id, created, tools_active=False,
-                stop=None, sampler=None, overhead=0, include_usage=False):
+                stop=None, sampler=None, overhead=0, include_usage=False,
+                prefilled=False):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -2422,10 +2507,10 @@ class Handler(BaseHTTPRequestHandler):
                     break
             if res.get("error"):
                 sse(frame({"content": "[error: %s]" % res["error"]}, finish="stop"))
-                done(_maybe_strip_think("".join(buf)))
+                done(_maybe_strip_think("".join(buf), prefilled))
                 return
             finish = res.get("finish", "stop")
-            text, calls = parse_tool_calls(_maybe_strip_think("".join(buf)))
+            text, calls = parse_tool_calls(_maybe_strip_think("".join(buf), prefilled))
             if text:
                 sse(frame({"content": text}))
             for idx, c in enumerate(calls):
@@ -2439,34 +2524,44 @@ class Handler(BaseHTTPRequestHandler):
             # Strip <think> before counting, exactly as _complete does: the same
             # turn must not report different completion_tokens purely because
             # the client chose to stream.
-            done(_maybe_strip_think("".join(buf)))
+            done(_maybe_strip_think("".join(buf), prefilled))
             return
 
         res = {}
-        seen = []
-        gate = _OrphanGate()
+        # `sent` is what actually left through the gate; `seen` is everything
+        # generated. They differ exactly when the gate drops an orphan, and
+        # usage is counted off `sent` -- see the note at done() below.
+        sent = []
+        gate = _OrphanGate(prefilled=prefilled)
         for i, chunk in enumerate(ENGINE.query_stream(
                 prompt, res, max_tokens=max_tokens, stop=stop, sampler=sampler)):
-            seen.append(chunk)
             out = gate.feed(chunk)
             if out:
+                sent.append(out)
                 sse(frame({"content": out}))
-            elif i % 8 == 0:
+            elif not gate.open and i % 8 == 0:
                 # Holding, so nothing goes out and the write callback cannot
                 # fire -- probe, or a departed client is not noticed until the
-                # gate opens and the NPU stays held meanwhile.
+                # gate opens and the NPU stays held meanwhile. Conditioned on
+                # the gate rather than on `out` being falsy: an empty chunk from
+                # the callback is not a reason to probe, and once the gate is
+                # open sse() detects the disconnect on its own.
                 probe()
             if gone["v"]:
                 break
         tail = gate.flush()
         if tail:
+            sent.append(tail)
             sse(frame({"content": tail}))
         if res.get("error") and not gone["v"]:
             sse(frame({"content": "\n[error: %s]" % res["error"]}))
         sse(frame({}, finish=res.get("finish", "stop")))
-        # Counted from the stripped text, like _complete: the same turn must not
-        # report different completion_tokens purely because the client streamed.
-        done(_maybe_strip_think("".join(seen)))
+        # Counted from what was SENT, not from the raw generation. With the gate
+        # on the two are identical; with GENIE_ORPHAN_HOLD_CHARS=0 the client
+        # receives the duplicate and must be billed for it, or usage silently
+        # under-reports the bytes it just delivered -- the same lie as billing a
+        # tool turn at zero.
+        done("".join(sent))
 
     # ---- Anthropic Messages API (POST /v1/messages) -----------------------
 
@@ -2489,9 +2584,13 @@ class Handler(BaseHTTPRequestHandler):
         if dropped:
             _log_dropped(dropped)
         msg_id = "msg_%d" % int(time.time())
+        # Same resolution as the OpenAI leg. _anthropic_to_prompt derives this
+        # internally to build the prompt; asking again here is cheap and pure,
+        # and it keeps the response path from having to guess what was sent.
         gen_kw = {"stop": _stop_sequences(req),
                   "sampler": _sampler_params(req, tools_active=bool(tools)),
-                  "overhead": overhead}
+                  "overhead": overhead,
+                  "prefilled": not _wants_thinking(req)}
         if bool(req.get("stream", False)):
             self._anthropic_stream(prompt, max_tokens, model, msg_id,
                                    tools_active=bool(tools), **gen_kw)
@@ -2501,7 +2600,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _anthropic_complete(self, prompt, max_tokens, model, msg_id,
                             tools_active=False, stop=None, sampler=None,
-                            overhead=0):
+                            overhead=0, prefilled=False):
         chunks = []
         try:
             finish = ENGINE.query(prompt, chunks.append, max_tokens=max_tokens,
@@ -2509,7 +2608,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._anthropic_error(500, "api_error", str(e))
             return
-        raw = _maybe_strip_think("".join(chunks))
+        raw = _maybe_strip_think("".join(chunks), prefilled)
         content = raw
         calls = []
         if tools_active:
@@ -2534,7 +2633,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _anthropic_stream(self, prompt, max_tokens, model, msg_id,
                           tools_active=False, stop=None, sampler=None,
-                          overhead=0):
+                          overhead=0, prefilled=False):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -2586,7 +2685,7 @@ class Handler(BaseHTTPRequestHandler):
                 ev("message_stop", {"type": "message_stop"})
                 return
             finish = res.get("finish", "stop")
-            text, calls = parse_tool_calls(_maybe_strip_think("".join(buf)))
+            text, calls = parse_tool_calls(_maybe_strip_think("".join(buf), prefilled))
             idx = 0
             if text:
                 ev("content_block_start", {"type": "content_block_start", "index": idx,
@@ -2609,7 +2708,7 @@ class Handler(BaseHTTPRequestHandler):
             ev("message_delta", {"type": "message_delta",
                 "delta": {"stop_reason": reason, "stop_sequence": None},
                 "usage": _with_overhead({"output_tokens": _tok_count(
-                    _maybe_strip_think("".join(buf)))}, overhead)})
+                    _maybe_strip_think("".join(buf), prefilled))}, overhead)})
             ev("message_stop", {"type": "message_stop"})
             return
 
@@ -2617,26 +2716,31 @@ class Handler(BaseHTTPRequestHandler):
             "content_block": {"type": "text", "text": ""}})
         ev("ping", {"type": "ping"})
 
-        out = []
+        # What actually left through the gate, which is what usage is counted
+        # off -- see the note at message_delta below.
+        sent = []
         res = {}
-        gate = _OrphanGate()
+        gate = _OrphanGate(prefilled=prefilled)
         for i, chunk in enumerate(ENGINE.query_stream(
                 prompt, res, max_tokens=max_tokens, stop=stop, sampler=sampler)):
-            out.append(chunk)
             emit = gate.feed(chunk)
             if emit:
+                sent.append(emit)
                 ev("content_block_delta", {"type": "content_block_delta", "index": 0,
                     "delta": {"type": "text_delta", "text": emit}})
-            elif i % 8 == 0:
+            elif not gate.open and i % 8 == 0:
                 # Nothing goes out while the gate holds, so the write callback
                 # cannot fire and a departed client would go unnoticed with the
                 # single-flight NPU still held. `ping` is a real Anthropic
-                # event, so this needs no client-side tolerance.
+                # event, so this needs no client-side tolerance. Conditioned on
+                # the gate, not on `emit` being falsy: an empty chunk is not a
+                # reason to ping, and an open gate detects the drop via ev().
                 ev("ping", {"type": "ping"})
             if gone["v"]:
                 break
         tail = gate.flush()
         if tail:
+            sent.append(tail)
             ev("content_block_delta", {"type": "content_block_delta", "index": 0,
                 "delta": {"type": "text_delta", "text": tail}})
         if res.get("error") and not gone["v"]:
@@ -2647,11 +2751,12 @@ class Handler(BaseHTTPRequestHandler):
         ev("message_delta", {"type": "message_delta",
             "delta": {"stop_reason": _anthropic_stop_reason(finish, None, stop),
                       "stop_sequence": None},
-            # Counted from the stripped text, matching the non-streaming path:
-            # the same turn must not report different output_tokens because the
-            # client chose to stream.
+            # Counted from what was SENT. With the gate on that equals the
+            # stripped text and matches the non-streaming path; with the gate
+            # disabled the client received the duplicate and is billed for it,
+            # rather than usage under-reporting the bytes just delivered.
             "usage": _with_overhead({"output_tokens": _tok_count(
-                _maybe_strip_think("".join(out)))}, overhead)})
+                "".join(sent))}, overhead)})
         ev("message_stop", {"type": "message_stop"})
 
 

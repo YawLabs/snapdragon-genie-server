@@ -437,13 +437,94 @@ def test_the_gate_keeps_an_orphan_think_out_of_a_stream(gs, handler):
     -- so the raw generation carries the answer twice. Only the text after the
     orphan close may reach the client.
     """
-    gs.ENGINE = StubEngine(chunks=["dup answer", "</think>", "real answer"])
+    gs.ENGINE = StubEngine(chunks=["dup answer\n", "</think>\n", "\nreal answer"])
     h = handler()
-    h._stream("prompt", 100, "cid", 0, include_usage=True)
+    # prefilled=True: the gate only applies when a closed block was actually
+    # sent, which is the only case an unmatched close can be ours to drop.
+    h._stream("prompt", 100, "cid", 0, include_usage=True, prefilled=True)
     text = "".join(f["choices"][0]["delta"].get("content", "")
                    for f in h.wfile.sse_frames() if f.get("choices"))
     assert text == "real answer", (
         "orphan reasoning reached the client: %r" % text)
+
+
+def test_an_answer_that_merely_MENTIONS_the_tag_is_not_truncated(gs, handler):
+    """The orphan strip must not fire when this request enabled reasoning.
+
+    Without the prefilled gate the strip keys on nothing but an unmatched close,
+    so any answer whose first mention of the tag is bare loses everything before
+    it -- `The </think> tag closes a reasoning block` came back as `tag closes a
+    reasoning block`. A coding agent asking this server about its own
+    suppression mechanism hits exactly that string, and the truncation is
+    silent. Reasoning ON means no closed block was prefilled, so a closing tag
+    can only be the model's own prose.
+    """
+    answer = "The </think> tag closes a reasoning block."
+    gs.ENGINE = StubEngine(chunks=[answer])
+    h = handler()
+    h._complete("prompt", 100, "cid", 0, prefilled=False)
+    assert json.loads(h.wfile.text())["choices"][0]["message"]["content"] == answer
+
+    # AND with prefilled=True, which is the case that actually broke: reasoning
+    # is suppressed by DEFAULT, so nearly every real request prefills and the
+    # prefilled gate alone would not have saved this. What saves it is that an
+    # INLINE mention is not a structural close -- measured live returning "tag
+    # closes a reasoning block." before the line anchor landed.
+    gs.ENGINE = StubEngine(chunks=[answer])
+    h2 = handler()
+    h2._complete("prompt", 100, "cid", 0, prefilled=True)
+    assert json.loads(h2.wfile.text())["choices"][0]["message"]["content"] == answer
+
+
+def test_the_same_answer_IS_stripped_when_a_block_was_prefilled(gs, handler):
+    # The counterpart, so the guard cannot be "widened" into never stripping.
+    gs.ENGINE = StubEngine(chunks=["reasoning\n</think>\n\nthe answer"])
+    h = handler()
+    h._complete("prompt", 100, "cid", 0, prefilled=True)
+    assert json.loads(h.wfile.text())["choices"][0]["message"]["content"] == "the answer"
+
+
+def test_a_reasoning_enabled_stream_is_not_gated(gs, handler):
+    # Same guard on the streaming path: with reasoning ON the gate must pass
+    # every chunk through rather than withholding and then dropping a prefix.
+    gs.ENGINE = StubEngine(chunks=["The answer.\n", "</think>\n", "\nMore text."])
+    h = handler()
+    h._stream("prompt", 100, "cid", 0, include_usage=True, prefilled=False)
+    text = "".join(f["choices"][0]["delta"].get("content", "")
+                   for f in h.wfile.sse_frames() if f.get("choices"))
+    assert text == "The answer.\n</think>\n\nMore text."
+
+
+def test_streamed_usage_counts_what_was_actually_sent(gs, handler):
+    """Usage must describe the bytes the client received, not a different strip.
+
+    With the gate disabled the duplicate IS delivered, so counting the stripped
+    text would under-report what just went out -- the same lie as billing a tool
+    turn at zero, which this suite already pins one screen up.
+    """
+    gs.ORPHAN_HOLD_CHARS = 0            # gate off: raw text reaches the client
+    gs.ENGINE = StubEngine(chunks=["dup answer\n", "</think>\n", "\nreal answer"])
+    h = handler()
+    h._stream("prompt", 100, "cid", 0, include_usage=True, prefilled=True)
+    frames = h.wfile.sse_frames()
+    text = "".join(f["choices"][0]["delta"].get("content", "")
+                   for f in frames if f.get("choices"))
+    usage = next(f["usage"] for f in frames if f.get("usage"))
+    assert usage["completion_tokens"] == len(text) // 4, (
+        "counted %d tokens for %d chars actually sent"
+        % (usage["completion_tokens"], len(text)))
+
+
+def test_a_malformed_int_env_var_does_not_kill_the_server(gs, monkeypatch,
+                                                          capsys):
+    # A typo used to raise `invalid literal for int()` at IMPORT, before any
+    # startup line printed -- a traceback naming neither the variable nor the
+    # form it wanted, on a server whose banner exists to explain itself.
+    import importlib
+    monkeypatch.setenv("GENIE_SEED", "abc")
+    importlib.reload(gs)
+    assert gs.FIXED_SEED is None
+    assert "GENIE_SEED" in capsys.readouterr().out
 
 
 def test_the_gate_releases_a_short_reply_that_never_closes(gs, handler):
@@ -455,7 +536,9 @@ def test_the_gate_releases_a_short_reply_that_never_closes(gs, handler):
     """
     gs.ENGINE = StubEngine(chunks=["short ", "answer"])
     h = handler()
-    h._stream("prompt", 100, "cid", 0, include_usage=True)
+    # prefilled=True so the hold is actually exercised -- with it False the gate
+    # is a pass-through and this would pass without testing the flush at all.
+    h._stream("prompt", 100, "cid", 0, include_usage=True, prefilled=True)
     text = "".join(f["choices"][0]["delta"].get("content", "")
                    for f in h.wfile.sse_frames() if f.get("choices"))
     assert text == "short answer", "short reply was swallowed: %r" % text
