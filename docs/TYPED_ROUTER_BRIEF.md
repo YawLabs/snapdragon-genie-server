@@ -495,9 +495,20 @@ misconfigured bundle and is withdrawn.
    (Anthropic) with `"server busy; NPU is single-flight"`. It was not built for
    routing, but it is precisely the shed-to-next-engine signal a dispatcher
    needs. Treat it as "try another engine", not as an error to surface.
-4. **Health checks that survive the wedge.** `/health` answering is **not**
-   proof the device will execute -- the `1003` fault happens at execute time,
-   not at load. A real check needs a tiny generation, not a liveness ping.
+4. ~~**Health checks that survive the wedge.**~~ **DONE server-side 2026-08-24
+   -- `/health` is no longer a liveness ping.** It reports engine state and
+   returns 503 with a `state` (`failing` / `stalled` / `wedged`) and a `detail`
+   when the engine cannot serve, and it deliberately touches nothing on the
+   engine so it still answers while a wedged thread holds the lock. A stall is
+   aborted; if that does not take the process exits 75 and the launcher restarts
+   it. A dispatcher can treat 503 as "shed to another engine" and 200 as a real
+   capability claim. (`MULTI_ENGINE.md` recorded this at the time; this list did
+   not, so the item read as outstanding for three days.)
+
+   What survives of the original objection, and it is worth keeping: a 200 is a
+   claim about engine STATE, not a generation. The `1003` fault happens at
+   execute time, so a router that needs certainty still has to send a tiny
+   generation -- `/health` narrows the window, it does not close it.
 5. **Engine configuration, not just engine selection.** One setting dominates
    everything else on this hardware: `"poll": false` in the bundle's
    `genie_config.json`. Shipped as `true` it busy-waits on 2.7 cores while idle,

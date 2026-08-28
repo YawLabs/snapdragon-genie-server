@@ -1,7 +1,7 @@
 # NPU LLM Inference: Robustness Implementation Plan
 
 Living document. Status markers: [ ] todo, [~] in progress, [x] done, [!] blocked.
-Last updated: 2026-08-23. **Phases 1 and 2 are DONE and Phase 3 is substantially built.** The route that
+Last updated: 2026-08-27. **Phases 1 and 2 are DONE and Phase 3 is substantially built.** The route that
 worked was neither of the two this document spent its length on: **Qualcomm AI Hub Models** emits a
 ready-to-run Genie bundle compiled for the local chipset, which dissolved both the prebuilt-arch-mismatch
 blocker (Phase 1) and the hand-rolled converter chain (Phase 2). A Qwen3-4B w4a16 bundle has been resident
@@ -311,7 +311,7 @@ Exit criterion: a self-converted small dense model (Llama-3.2-1B / Qwen2.5-1.5B)
 
 ### Phase 3 -- serving for the agent workload [~] BUILT; benchmarking and routing outstanding
 Goal: a drop-in local endpoint the agent config can point at. Delivered as `src/genie_server.py`
-(stdlib only, ~1800 lines), documented in `docs/GENIE_SERVER.md`, covered by 78 device-free tests.
+(stdlib only, ~2850 lines), documented in `docs/GENIE_SERVER.md`, covered by 359 device-free tests.
 - [x] Genie wrapped via the C API (ctypes -> `Genie.dll`), model resident so requests skip the reload.
 - [x] OpenAI `/v1/chat/completions` **and** Anthropic `/v1/messages`, both with SSE streaming.
 - [x] `/props`, `/v1/models`, `/health` so a client can size the window and probe capability.
@@ -550,8 +550,12 @@ and record tg uplift + acceptance rate per model.
 - ~~Genie's Windows-ARM64 model artifacts must match this HTP arch (v73).~~ HANDLED: the server derives
   the archs this box can actually drive (skel AND Windows stub) at startup, and a mismatch fails at
   `GenieDialog_create` with a message naming what is on offer.
-- **What window is the right default?** 4096 and 16384 are measured; 8192 is not, and it is the most
-  likely sweet spot. An export is the only way to find out (~hours in WSL).
+- ~~**What window is the right default?** 4096 and 16384 are measured; 8192 is not.~~ **ANSWERED
+  2026-08-24, by this document's own decision log** -- 8192 measured 8.8 t/s decode (poll false)
+  against 18.0 at 4096 and 3.3 at 16384, and a MULTI-length 8192 export recovers 18.2 at shallow
+  depth. 8192 multi-length is the default. This entry outlived its answer by three days because the
+  measurement was recorded in the decision log and the open-questions list was never re-read against
+  it -- worth noting, since a stale open question costs someone a re-measurement.
 - **The GPU/CPU baselines are not like-for-like with the NPU's** -- different prompts, and taken while
   the box was loaded. Re-measure all three together on a quiet box before quoting any speedup.
 - Quantization quality: native INT4 on HTP vs the GGUF Q4/Q6 baselines -- compare perplexity

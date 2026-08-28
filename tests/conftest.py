@@ -105,12 +105,17 @@ def gs():
     # developer's GENIE_BUNDLE_DIR points at -- or nothing, and then every test
     # touching the warnings would carry a penalty warning it never asked for.
     g._CONFIG_PRESENT = True   # pinned like the readers below; see config_present
+    # The values this repo RECOMMENDS, not Qualcomm's reference. The fixture only
+    # needs sampler_penalty_state() == "ok", which both satisfy -- but it used to
+    # carry 2.3/0.7/0.8, the exact setting bundle_config_warnings() calls out as
+    # corrupting identifiers. A default fixture that models the configuration the
+    # code argues against is a quiet contradiction for the next reader.
     g._SAMPLER = {"version": 1, "seed": 42, "temp": 0.8, "top-k": 40,
                   "top-p": 0.95,
-                  "token-penalty": {"version": 1, "penalize-last-n": 64,
-                                    "repetition-penalty": 2.3,
-                                    "presence-penalty": 0.7,
-                                    "frequency-penalty": 0.8}}
+                  "token-penalty": {"version": 1, "penalize-last-n": 128,
+                                    "repetition-penalty": 1.15,
+                                    "presence-penalty": 0.0,
+                                    "frequency-penalty": 0.3}}
     g._TOK_CACHE.clear()
     g.STRIP_THINK = False
     # Pinned, not inherited. THINKING_DEFAULT is read from os.environ at import,

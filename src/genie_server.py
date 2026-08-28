@@ -1008,9 +1008,6 @@ class GenieEngine:
         # not enough: the worker can finish and re-commit AFTER the clear,
         # re-arming reuse against a generation that was cut short.
         self._aborted = False
-        # Assistant turn terminator, needed to reconstruct what the dialog
-        # holds after a generation. Filled in from the template at startup.
-        self.asst_suffix = ""
         # The bundle's own sampler block, read at startup and used as the
         # restore baseline. The dialog is RESIDENT and shared across requests,
         # so a per-request override that is never undone leaks into the next
@@ -1482,6 +1479,19 @@ def _sampler_params(req, tools_active=False):
     hook, so low temperature is the only lever we have on JSON validity. An
     explicit temperature in the request still wins -- the caller may know
     better than this default.
+
+    WHAT THIS MAPPING CURRENTLY BUYS: nothing at runtime. apply_sampler is inert
+    on QAIRT 2.45 (see its docstring), so a tool turn actually runs at whatever
+    `dialog.sampler` in the bundle sets -- 0.8 on every bundle here, not the 0.0
+    below. The "only lever we have on JSON validity" is therefore a lever that
+    is not connected, and it is worth knowing that before attributing a
+    malformed tool call to the model rather than to the temperature it was
+    really sampled at.
+
+    Kept mapping anyway, for the same reason apply_sampler is kept: the shape is
+    right and it starts working the day a QAIRT honours a post-create apply. The
+    tests here pin the MAPPING, which is all that can be pinned device-free --
+    they are not evidence that the sampling happened.
     """
     out = {}
     if "temperature" in req and req["temperature"] is not None:
@@ -1803,7 +1813,7 @@ def port_in_use(host, port, timeout=0.5):
     """Is something already accepting connections here?
 
     Checked BEFORE the model loads. The bind itself would catch this on POSIX,
-    but only after 30-50s of loading a 3 GB bundle onto the HTP -- and on
+    but only after the 11-35s of loading a 3 GB bundle onto the HTP -- and on
     Windows it would not catch it at all.
 
     A wildcard bind address is not a connectable one. GENIE_HOST=0.0.0.0 is the
@@ -2737,7 +2747,9 @@ def watchdog(engine, health, interval=5.0, on_wedge=None, iterations=None):
 
 def main():
     global ENGINE, TEMPLATE, TOOLS_OK
-    # Before the model load, not after: loading is 30-50s of work, and finding
+    # Before the model load, not after: loading is 11-35s of work (measured on
+    # the 8192 multi bundle: 10.8-15.0s warm, 34.4s after heavy disk traffic --
+    # the "30-50s" this said predated that measurement), and finding
     # out afterwards that the port is taken wastes all of it. On Windows the
     # bind would not report the collision at all -- see Server.
     if port_in_use(HOST, PORT):
@@ -2749,14 +2761,13 @@ def main():
             "port." % (HOST, PORT))
     # Before the model load, for the same reason as the port check above:
     # these two settings are worth more than everything else this server does,
-    # and finding out after 30-50s of loading that the bundle is configured to
+    # and finding out after 11-35s of loading that the bundle is configured to
     # run at half speed wastes all of it.
     for line in bundle_config_warnings():
         print("[genie] %s" % line, flush=True)
     TEMPLATE = load_chat_template()
     TOOLS_OK = probe_tool_support()
     ENGINE = load_engine()
-    ENGINE.asst_suffix = TEMPLATE.asst_suf
     ENGINE.default_sampler = read_default_sampler()
     srv = Server((HOST, PORT), Handler)
     print("[genie] endpoint on http://%s:%d  (model=%s)" % (HOST, PORT, MODEL_ID), flush=True)

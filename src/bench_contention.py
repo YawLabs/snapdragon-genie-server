@@ -660,6 +660,13 @@ def main():
                     help="overwrite --json if it already exists")
     a = ap.parse_args()
 
+    # Cleared per run, not merely appended to. GATE_NOTES is module state and
+    # main() copies it into the run's `warnings`, so a second run in the same
+    # process would inherit the first one's power notes and publish them in its
+    # JSON -- a warning attached to a run that never earned it, which is the
+    # record-vs-reality drift the rest of this harness exists to prevent.
+    GATE_NOTES.clear()
+
     free = free_physical_gb()
     shown = "unknown" if free is None else "%.2f GB" % free
     print("free physical memory: %s (need >= %.1f GB)" % (shown, a.min_free_gb))

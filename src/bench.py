@@ -127,7 +127,10 @@ def _run_pair(model_path, feeds, M, K, N, iters, warmup, verify, unit):
     try:
         npu_s = time_session(npu_sess, feeds, iters, warmup)
     except Exception as e:  # HTP execute failed; fallback is disabled
-        npu_run_error = f"{type(e).__name__}: {str(e).splitlines()[0][:180]}"
+        # `or [""]` because splitlines() on an empty message returns [] -- an
+        # exception with no text would then raise IndexError from inside this
+        # handler and replace the device error with one from the error path.
+        npu_run_error = f"{type(e).__name__}: {(str(e).splitlines() or [''])[0][:180]}"
 
     cpu_sess, _ = qnn_ep.build_session(model_path, use_npu=False, verify=False)
     cpu_s = time_session(cpu_sess, feeds, iters, warmup)

@@ -137,7 +137,7 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 | `GENIE_SDK_DIR` | scratchpad 2.45 SDK | QAIRT 2.45 root (lib/aarch64-windows-msvc, lib/hexagon-v*) |
 | `GENIE_HEXAGON_ARCH` | unset | pin one skel arch (`v81`); default offers all |
 | `GENIE_SUMMARIZE_EVICTED` | 1 | 0 disables summarising evicted turns (plain drop) |
-| (not an env var) | -- | **`poll: false` in the bundle's `genie_config.json`** -- see the poll note below. Worth up to +55% decode and frees 2.7 idle cores. The server now CHECKS this at startup (before the 30-50s load) and warns loudly if the bundle ships `true`; it also warns on a single-length bundle. Both are warnings, never refusals -- a slow server is still a working one. |
+| (not an env var) | -- | **`poll: false` in the bundle's `genie_config.json`** -- see the poll note below. Worth up to +55% decode and frees 2.7 idle cores. The server now CHECKS this at startup (before the 11-35s load) and warns loudly if the bundle ships `true`; it also warns on a single-length bundle. Both are warnings, never refusals -- a slow server is still a working one. |
 | `GENIE_SUMMARY_MAX_TOKENS` | 192 | cap on the retained note. Clamped at runtime to `n_ctx / 8` (floor 32) so the note cannot crowd out the window on a small-context bundle; the server logs the clamp when it bites. |
 | `GENIE_WINDOW_MARGIN` | 64 | headroom left between prompt and n_ctx |
 | `GENIE_MAX_INFLIGHT` | 2 | requests admitted at once (1 running + queue). Floored at 1 -- it cannot be disabled, since the NPU is single-flight and an unbounded setting only parks threads on the engine lock. Set 1 to protect KV reuse: two interleaved conversations share one resident KV and reset each other's prefix. |
@@ -152,7 +152,9 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
 | `GENIE_MAX_RESTARTS` | 5 | launcher only: rapid restarts before it gives up |
 | `GENIE_RESTART_COOLDOWN` | 25 | launcher only: seconds between restarts. Not arbitrary -- a force-killed server needs roughly 20s of settling, and restarting sooner was measured costing about half of decode throughput. |
 | `GENIE_MAX_TOKENS` | 512 | default cap when a request omits max_tokens |
-| `GENIE_STRIP_THINK` | 0 | 1 strips `<think>...</think>` from non-streamed content |
+| `GENIE_STRIP_THINK` | 0 | 1 strips a well-formed `<think>...</think>` pair from non-streamed content. Unrelated to the orphan-close strip below, which is always on because it removes a DUPLICATED answer rather than the model's reasoning. |
+| `GENIE_SEED` | unset | pins the sampler seed. Unset means a fresh seed per PROCESS, which is what stops every fresh prompt replaying the same answer -- the bundles ship a fixed `42` and Genie re-seeds from it on every dialog reset. Pin it for reproducibility (comparing bundles, bisecting a bad generation); throughput does not depend on it. Per-REQUEST variation is not available -- see the note below. |
+| `GENIE_ORPHAN_HOLD_CHARS` | -1 | how much of a STREAM to withhold while deciding whether the model is about to close a `<think>` block the prefill opened. `-1` holds until that is settled (so a streamed reply arrives as one frame at the end -- correct, not incremental). `0` streams every chunk as it arrives and ships the occasional doubled answer. A positive value is a bounded hold, which was measured LEAKING. Non-streaming and tool paths are unaffected; they buffer anyway and always strip. |
 | `GENIE_THINKING` | **0** | Qwen3's reasoning block is **suppressed by default** -- it costs 10-17x on an agent turn (see the tool-calling note below). `1` re-enables it server-wide. Per request either way: `chat_template_kwargs.enable_thinking`, `reasoning_effort` (`"none"` / `"high"`), or `thinking:{"type":"disabled"|"enabled"}` -- an explicit request always beats the server default. |
 
 ## Supervision: what happens when the HTP wedges
@@ -300,6 +302,83 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   loop and it is now active; that it fixes THAT case is inference, not
   measurement.
 
+  **That inference turned out to be WRONG for the repetition users actually
+  report, and this is the correction (2026-08-27).** The complaint was "it
+  repeats on every response" against a bundle that already carried the 1.15
+  block above -- so the penalty was live and the repetition continued. Raising
+  it made things worse in both directions at once: at
+  `1.3 / 0.5 / 0.5` with a 256 window, repeated word-trigrams fell only 12.1% ->
+  11.4% while `QnnHtpV73Stub.dll` came back mangled. The knob is exhausted well
+  before it fixes this, which is the strongest evidence that this was never what
+  the knob was for.
+
+  The real mechanism is in the next note (**"the answer twice"**). The penalty
+  section stands as written -- a bundle with no `token-penalty` really does
+  sample with nothing suppressing a loop, and 1.15 really is the right value --
+  but **do not reach for it when the symptom is a duplicated answer.** Two
+  different failures were being treated as one, and the visible one was never
+  the sampler's.
+
+- **The answer arrives TWICE, and it is the prefill rather than the sampler.**
+  With reasoning suppressed the prompt ends in a CLOSED, empty `<think></think>`
+  so the model should answer directly. Qwen3 does not always accept that: it
+  writes its reasoning anyway, emits a bare closing tag, and then answers
+  properly. The response then carries the answer twice with a stray `</think>`
+  between them. **Measured at 1 request in 6** on the shipped 8192 multi bundle,
+  and again at 1 in 12 on a second sample -- frequent enough to read as "every
+  response" to anyone not counting.
+
+  `GENIE_STRIP_THINK` could never catch it: that pattern needs a MATCHED
+  `<think>...</think>` pair, and the opening tag is in the PROMPT rather than in
+  the output, so the orphan close never matched and the duplicate shipped.
+  `_strip_orphan_think` now drops a leading run ending in a close that was never
+  opened, and leaves well-formed pairs to `GENIE_STRIP_THINK`, which is the
+  caller's choice rather than the stripper's. Verified: 0 in 6 after, against 1
+  in 6 before.
+
+  **Streaming needed a different answer, and it costs something.** SSE cannot
+  retract a frame, so a duplicate can only be kept out of a stream by not
+  sending it yet -- which means holding the START of every response until the
+  orphan is ruled in or out. A bounded hold was tried and LEAKED: set to 1024
+  characters, already wide margin over an orphan observed at offset 405, the
+  next sample closed at 1080 and went out anyway. Two offsets that far apart are
+  not a threshold you can fit, so `GENIE_ORPHAN_HOLD_CHARS` defaults to `-1` and
+  holds until the question is answered -- the close tag, or the end of the
+  generation.
+
+  The honest statement of that default: **a streamed reply arrives as one frame
+  at the end.** Correct, but not incremental. For the agent traffic this server
+  exists to serve that is invisible, since the client consumes the finished
+  message either way; for a human watching tokens appear it is not, and that
+  reader should set `GENIE_ORPHAN_HOLD_CHARS=0` and accept the occasional
+  doubled answer. The non-streaming and tool paths already buffer the whole
+  generation, so they strip it always and for free regardless of this setting.
+
+- **Every fresh prompt replayed the same answer, because the seed is reset per
+  request.** Genie re-seeds its RNG from the config's `seed` on every
+  `GenieDialog_reset` (qualla `Sampler::reset` -- "just need to reinit rng"),
+  and the server resets whenever a prompt does not continue the resident KV. The
+  AI Hub bundles ship `"seed": 42`, so at temp 0.8 the model was nominally
+  sampling while the dice were reset before every roll: identical prompt in,
+  byte-identical answer out, measured three times running and again across
+  separate server processes.
+
+  That is why re-asking never escaped a bad answer, and no repetition penalty
+  could have fixed it -- the problem was not which tokens were penalised, it was
+  that the same draw was taken every time. The server now writes a fresh seed
+  into the config TEXT it hands `GenieDialogConfig_createFromJson`, leaving the
+  bundle on disk untouched. `GENIE_SEED` pins it when reproducibility is what
+  you want.
+
+  **Limit, because it is a real one:** the seed varies per PROCESS, not per
+  request. Inside one server run an identical prompt still replays its identical
+  answer. A per-request seed was tried first and is inert on QAIRT 2.45 -- three
+  identical generations with a fresh seed on each -- which is the same wall the
+  sampling note below describes. And `"seed": -1` does not work either, though
+  it looks like it should: the constructor reads -1 as "seed from the clock",
+  but `reset()` re-seeds with `_seed` unconditionally, so -1 casts to a fixed
+  uint32 and every generation after the first is deterministic again.
+
   The server checks this at startup and warns when the block is absent, when
   `penalize-last-n` is 0 (the penalties beside it are then applied to an empty
   window and do nothing), or when every penalty in it is 0. It says nothing
@@ -325,13 +404,26 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   `dialog.sampler` in `genie_config.json` before the server loads it. The
   server prints this limitation at startup rather than letting it be silent.
 
+  Re-confirmed 2026-08-27 from the other direction: a per-request seed applied
+  through the same call sequence produced three byte-identical generations. So
+  the finding is not "seeds specifically are ignored" -- the whole post-create
+  apply is inert, and `_sampler_params`' temp-0-for-tool-turns is mapped but
+  never actually reaches the sampler either.
+
+  **The one thing the server now DOES change is the seed, and it does it at
+  create time rather than per request** -- by rewriting `dialog.sampler.seed` in
+  the config TEXT passed to `GenieDialogConfig_createFromJson`, never on disk.
+  That is the only window in which sampling is settable at all, which is exactly
+  why it happens there. See the seed note above for what it fixes and what it
+  cannot.
+
   Two JSON shapes worth knowing, both found by probing: the sampler config
   must be wrapped as `{"sampler": {...}}` (a bare object returns -8 "Missing
   field"), and stop sequences must be `{"stop-sequence": [...]}` (a bare array
   returns -8 "Top level config is not an object" and is silently ignored).
 
 - **It will not start on a port something else is already serving.** Checked
-  before the model loads, so a collision costs 0.3s rather than 30-50s of
+  before the model loads, so a collision costs 0.3s rather than the 11-35s of
   loading followed by a failure. The check exists because on Windows the bind
   does NOT fail: `HTTPServer` sets `allow_reuse_address`, which on POSIX means
   "rebind a TIME_WAIT socket" but on Windows lets a second process bind a port
