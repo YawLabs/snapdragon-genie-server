@@ -288,6 +288,52 @@ def cpu_busy_pct():
         return None
 
 
+def battery_state():
+    """(on_ac, charge_pct, charge_watts) -- any element None if unreadable.
+
+    Sampled as MAGNITUDES rather than folded into a boolean, which is the
+    lesson from four legs measured across two sessions on this box. A counter
+    keyed to "is charging suspended" with an absolute near-zero threshold
+    reported 0 suspended samples for legs that shed 92% and 97% of their charge
+    draw, because the minima (3.0 W, 1.1 W) cleared a <=1 W test. A later
+    threshold at 25% of opening draw scored 2 of the same 4 legs. Every cut
+    point mis-sorts the legs nearest it, so record the quantity and let a reader
+    pick their own line afterwards.
+    """
+    if sys.platform != "win32":
+        return None, None, None
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             "$b = Get-CimInstance -Namespace root\\wmi -ClassName "
+             "BatteryStatus -ErrorAction SilentlyContinue | Select-Object "
+             "-First 1; $c = (Get-CimInstance Win32_Battery -ErrorAction "
+             "SilentlyContinue | Select-Object -First 1)"
+             ".EstimatedChargeRemaining; "
+             "'{0},{1},{2}' -f $b.PowerOnline, $c, "
+             "[math]::Round($b.ChargeRate/1000,1)"],
+            capture_output=True, text=True, timeout=30)
+        if out.returncode != 0:
+            return None, None, None
+        ac, pct, watts = out.stdout.strip().split(",")
+        return (ac.strip().lower() == "true",
+                float(pct) if pct.strip() else None,
+                float(watts) if watts.strip() else None)
+    except Exception:
+        return None, None, None
+
+
+# Below this the pack is deep enough into discharge that the system protects
+# the charge and starves compute, whether or not AC is connected. Measured on
+# this box across two sessions: legs run at 13-20% gave pp512 58.14 / 57.88
+# against a settled baseline of 130.20 -- HALF -- while legs at 33% and 41.6%
+# came back at 124.53 and 112.58, near baseline and stable. The hazard is the
+# depth of discharge, not the act of charging, which is the opposite of what
+# both sessions assumed before pooling their legs.
+LOW_CHARGE_PCT = float(os.environ.get("GENIE_LOW_CHARGE_PCT", "25"))
+
+
 def power_limited_note(pct, floor):
     """Why the clock is low, when it is low for a reason waiting cannot fix.
 
@@ -315,6 +361,21 @@ def power_limited_note(pct, floor):
     if src == "unknown":
         return ("clock is %.0f%% of base and the power source could not be "
                 "read, so it is not known whether waiting can help." % pct), False
+    # AC used to fall straight off the end of this function and return "nothing
+    # to report", so a box plugged in but deeply discharged read as clean. That
+    # is the state that actually costs you half your prefill, and it is exactly
+    # the state an operator reaches after plugging in and starting immediately.
+    _ac, charge, watts = battery_state()
+    if src == "ac" and charge is not None and charge < LOW_CHARGE_PCT:
+        return ("clock is %.0f%% of base, and the pack is at %.0f%%%s. AC is "
+                "connected, but measured on this box a pack below ~%.0f%% "
+                "halves prefill (pp512 58 against a settled 130) while decode "
+                "barely moves -- so this is not a settled-box measurement even "
+                "though it is plugged in. Advisory, not fatal: bandwidth-bound "
+                "work is largely immune. Let it charge for a clean baseline."
+                % (pct, charge,
+                   " drawing %.0f W" % watts if watts is not None else "",
+                   LOW_CHARGE_PCT)), False
     busy = cpu_busy_pct()
     if src == "no-battery" and busy is not None and busy < 15.0:
         return ("clock is %.0f%% of base while the CPU is only %.0f%% busy. On "
@@ -327,6 +388,12 @@ def power_limited_note(pct, floor):
 # Notes raised inside wait_for_cool, drained into the run's warnings so they
 # reach the JSON as well as the terminal.
 GATE_NOTES = []
+
+# One (on_ac, charge_pct, charge_watts) reading per round, so the artifact
+# carries the power TRAJECTORY rather than a verdict about it. A run taken while
+# the pack climbed from 20% to 60% is a different run from one taken at a steady
+# 95%, and nothing else in the record distinguishes them.
+POWER_SAMPLES = []
 
 
 def wait_for_cool(floor, limit=300):
@@ -420,6 +487,14 @@ def paired_sweep(engines, a, make_load):
         if pct is not None:
             clocks.append(pct)
             print("  cpu clock %.1f%% of base" % pct, flush=True)
+        ac, charge, watts = battery_state()
+        if charge is not None:
+            POWER_SAMPLES.append({"round": i + 1, "on_ac": ac,
+                                  "charge_pct": charge, "charge_w": watts})
+            print("  power     %s, pack %.0f%%%s"
+                  % ("AC" if ac else "BATTERY", charge,
+                     ", drawing %.1f W" % watts if watts is not None else ""),
+                  flush=True)
 
         for name, base, model in engines:
             # cool_floor is threaded through explicitly. It used to default to
@@ -666,6 +741,7 @@ def main():
     # JSON -- a warning attached to a run that never earned it, which is the
     # record-vs-reality drift the rest of this harness exists to prevent.
     GATE_NOTES.clear()
+    POWER_SAMPLES.clear()
 
     free = free_physical_gb()
     shown = "unknown" if free is None else "%.2f GB" % free
@@ -753,6 +829,45 @@ def main():
             "the package was power- or thermally-limited, so part of any "
             "measured slowdown is not contention."
             % (min(clocks), ", ".join("%.0f" % c for c in clocks)))
+    if POWER_SAMPLES:
+        charges = [s["charge_pct"] for s in POWER_SAMPLES]
+        lo, hi = min(charges), max(charges)
+        if lo < LOW_CHARGE_PCT:
+            warnings.append(
+                "the pack was at %.0f%% during this run (range %.0f-%.0f%%). "
+                "Below ~%.0f%% this box halves prefill while decode holds, so "
+                "a prefill-sensitive comparison taken here is not a settled "
+                "baseline even on AC."
+                % (lo, lo, hi, LOW_CHARGE_PCT))
+        elif hi - lo >= 20:
+            # Not about the level but the MOVEMENT: a run spanning 30% to 60%
+            # was measured under two different power regimes, and averaging
+            # across them hides that as ordinary noise.
+            #
+            # Reports the EXTREMES the condition actually fired on, not the
+            # first and last readings. Those differ whenever the trajectory is
+            # not monotonic, and the endpoint version had the message
+            # contradicting its own trigger -- "moved 60% -> 62%" printed above
+            # a warning raised because the run spanned 40-62%.
+            warnings.append(
+                "the pack spanned %.0f%%-%.0f%% across this run (opened %.0f%%, "
+                "closed %.0f%%). Charge state changed under the measurement, so "
+                "legs taken early and late are not strictly comparable."
+                % (lo, hi, charges[0], charges[-1]))
+        draws = [s["charge_w"] for s in POWER_SAMPLES if s["charge_w"] is not None]
+        if draws and max(draws) - min(draws) >= 8:
+            # Recorded per round but previously never read, which made it dead
+            # weight in the artifact. It needs a frame, because the charge
+            # controller moves a LOT on its own: measured on this box at a
+            # roughly constant charge level, draw ranged 28-41.9 W across
+            # minutes while read-to-read noise was ~1 W. Any percentage anchored
+            # to one sample of this is biased by which sample it happened to
+            # anchor on, so report the range and let the reader choose.
+            warnings.append(
+                "charge draw ranged %.1f-%.1f W during this run (opened %.1f). "
+                "That is the charge controller moving, not the workload -- do "
+                "not anchor a shed percentage to any single reading of it."
+                % (min(draws), max(draws), draws[0]))
 
     bw = {}
     if a.npu_weights_gb or a.gpu_weights_gb:
@@ -868,6 +983,10 @@ def main():
                        "paired_ratio_median": ratios, "per_engine": per_engine,
                        "cpu_clock_pct": clocks, "closing_check": closing,
                        "bandwidth": bw,
+                       # Magnitudes, not a verdict. A consumer can apply its own
+                       # threshold later; it cannot recover a reading the
+                       # harness discarded at write time.
+                       "power_samples": POWER_SAMPLES,
                        "warnings": warnings}, f, indent=2)
         print("\nwrote %s" % a.json)
     return 0

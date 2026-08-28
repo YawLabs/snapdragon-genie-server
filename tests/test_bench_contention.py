@@ -179,6 +179,174 @@ def test_wait_for_cool_returns_the_sample_it_gated_on(monkeypatch):
     assert bc.wait_for_cool(92.0, limit=30) == 95.0
 
 
+def test_a_deeply_discharged_pack_is_flagged_even_on_AC(monkeypatch):
+    """AC used to fall off the end of the check and read as clean.
+
+    That is the state an operator reaches by plugging in and starting
+    immediately, and it is the one that actually costs prefill: measured across
+    two sessions on this box, legs at 13-20% gave pp512 ~58 against a settled
+    130, while 33% and 41.6% came back near baseline. The hazard is depth of
+    discharge, not charging -- the opposite of what was assumed before the legs
+    were pooled.
+    """
+    monkeypatch.setattr(bc, "power_source", lambda: "ac")
+    monkeypatch.setattr(bc, "battery_state", lambda: (True, 14.0, 30.0))
+    msg, abort = bc.power_limited_note(45.0, 92.0)
+    assert msg is not None and "14%" in msg
+    assert abort is False, "advisory only -- bandwidth-bound work is immune"
+    assert "not a settled-box measurement" in msg
+
+
+def test_a_healthy_pack_on_AC_stays_silent(monkeypatch):
+    # The counterpart. Warning on a charged box is how the real warning gets
+    # skipped.
+    monkeypatch.setattr(bc, "power_source", lambda: "ac")
+    monkeypatch.setattr(bc, "battery_state", lambda: (True, 88.0, 2.0))
+    monkeypatch.setattr(bc, "cpu_busy_pct", lambda: 90.0)
+    assert bc.power_limited_note(45.0, 92.0) == (None, False)
+
+
+def test_an_unreadable_pack_does_not_invent_a_charge_warning(monkeypatch):
+    # battery_state returns Nones off-Windows and on any query failure. Absence
+    # of a reading must not become a claim about the reading.
+    monkeypatch.setattr(bc, "power_source", lambda: "ac")
+    monkeypatch.setattr(bc, "battery_state", lambda: (None, None, None))
+    monkeypatch.setattr(bc, "cpu_busy_pct", lambda: 90.0)
+    assert bc.power_limited_note(45.0, 92.0) == (None, False)
+
+
+def test_power_samples_reach_the_json_as_magnitudes(monkeypatch, tmp_path):
+    """The artifact must carry the quantity, not a verdict about it.
+
+    Four legs across two sessions showed every boolean cut point mis-sorting the
+    legs nearest it -- a <=1 W test scored 0/4 on legs that shed 92% and 97%,
+    and a 25%-of-opening test scored 2/4. A reader can apply a threshold to a
+    recorded magnitude; nobody can recover a reading the harness threw away.
+    """
+    bc.POWER_SAMPLES.clear()
+    bc.POWER_SAMPLES.extend([
+        {"round": 1, "on_ac": True, "charge_pct": 22.0, "charge_w": 30.0},
+        {"round": 2, "on_ac": True, "charge_pct": 24.0, "charge_w": 29.0}])
+    out = tmp_path / "run.json"
+    rounds = _both_ran(18.0, 13.4, 18.0, 13.5)
+    monkeypatch.setattr(bc, "paired_sweep",
+                        lambda e, a, m: (rounds, [99.0], {"state": "disabled"}))
+    monkeypatch.setattr(bc, "free_physical_gb", lambda: 32.0)
+    monkeypatch.setattr(bc.be, "n_ctx", lambda b: 4096)
+    monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(bc, "battery_state", lambda: (True, 22.0, 30.0))
+    monkeypatch.setattr(sys, "argv", ["bench_contention.py", "--repeat", "1",
+                                      "--cool-floor", "0", "--json", str(out)])
+    assert bc.main() == 0
+    body = json.loads(out.read_text())
+    # main() clears POWER_SAMPLES at entry, so what lands is what the run itself
+    # recorded -- empty here, since paired_sweep is stubbed out and never
+    # samples. The KEY still has to exist, or a consumer cannot tell "no
+    # readings taken" from "this harness does not report power at all".
+    assert "power_samples" in body
+    assert body["power_samples"] == [], (
+        "a stubbed sweep records nothing, so anything here leaked from a "
+        "previous run -- the same cross-run bleed GATE_NOTES had")
+
+
+def test_a_low_pack_warns_in_the_run_summary(monkeypatch, capsys):
+    rounds = _both_ran(18.0, 13.4, 18.0, 13.5)
+
+    def sweep(e, a, m):
+        bc.POWER_SAMPLES.extend([
+            {"round": 1, "on_ac": True, "charge_pct": 18.0, "charge_w": 31.0}])
+        return rounds, [99.0], {"state": "disabled"}
+
+    monkeypatch.setattr(bc, "paired_sweep", sweep)
+    monkeypatch.setattr(bc, "free_physical_gb", lambda: 32.0)
+    monkeypatch.setattr(bc.be, "n_ctx", lambda b: 4096)
+    monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(sys, "argv", ["bench_contention.py", "--repeat", "1",
+                                      "--cool-floor", "0"])
+    assert bc.main() == 0
+    out = capsys.readouterr().out
+    assert "pack was at 18%" in out
+    assert "halves prefill" in out
+
+
+def test_the_drift_warning_reports_the_span_it_fired_on(monkeypatch, capsys):
+    """A warning must not contradict its own trigger.
+
+    The condition is on the EXTREMES (max - min >= 20), so reporting first and
+    last readings instead printed "moved 60% -> 62%" above a warning raised
+    because the run spanned 40-62%. Non-monotonic trajectories are the norm here
+    -- the pack can dip under load and recover -- so the two differ routinely.
+    """
+    rounds = _both_ran(18.0, 13.4, 18.0, 13.5)
+
+    def sweep(e, a, m):
+        # Dips to 40 and recovers: endpoints are 2 points apart, span is 22.
+        for i, pct in enumerate((60.0, 40.0, 62.0), 1):
+            bc.POWER_SAMPLES.append({"round": i, "on_ac": True,
+                                     "charge_pct": pct, "charge_w": 30.0})
+        return rounds, [99.0], {"state": "disabled"}
+
+    monkeypatch.setattr(bc, "paired_sweep", sweep)
+    monkeypatch.setattr(bc, "free_physical_gb", lambda: 32.0)
+    monkeypatch.setattr(bc.be, "n_ctx", lambda b: 4096)
+    monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(sys, "argv", ["bench_contention.py", "--repeat", "1",
+                                      "--cool-floor", "0"])
+    assert bc.main() == 0
+    out = capsys.readouterr().out
+    assert "spanned 40%-62%" in out, "reported endpoints instead of the span"
+    assert "opened 60%, closed 62%" in out, "endpoints are still worth showing"
+
+
+def test_charge_draw_variation_is_surfaced_not_left_dead(monkeypatch, capsys):
+    """charge_w was recorded and never read, which is dead weight in the record.
+
+    It needs a frame rather than a raw list: measured on this box, draw ranged
+    28-41.9 W at a roughly constant charge level while read-to-read noise was
+    ~1 W. A reader who anchors a shed percentage to one sample of that is biased
+    by which sample they happened to pick.
+    """
+    rounds = _both_ran(18.0, 13.4, 18.0, 13.5)
+
+    def sweep(e, a, m):
+        for i, w in enumerate((28.0, 41.9, 33.0), 1):
+            bc.POWER_SAMPLES.append({"round": i, "on_ac": True,
+                                     "charge_pct": 70.0, "charge_w": w})
+        return rounds, [99.0], {"state": "disabled"}
+
+    monkeypatch.setattr(bc, "paired_sweep", sweep)
+    monkeypatch.setattr(bc, "free_physical_gb", lambda: 32.0)
+    monkeypatch.setattr(bc.be, "n_ctx", lambda b: 4096)
+    monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(sys, "argv", ["bench_contention.py", "--repeat", "1",
+                                      "--cool-floor", "0"])
+    assert bc.main() == 0
+    out = capsys.readouterr().out
+    assert "28.0-41.9 W" in out
+    assert "not the workload" in out, "must say what the variation IS"
+
+
+def test_a_steady_draw_says_nothing(monkeypatch, capsys):
+    # The counterpart: a stable controller must not produce a warning, or the
+    # real one gets skipped.
+    rounds = _both_ran(18.0, 13.4, 18.0, 13.5)
+
+    def sweep(e, a, m):
+        for i in (1, 2, 3):
+            bc.POWER_SAMPLES.append({"round": i, "on_ac": True,
+                                     "charge_pct": 70.0, "charge_w": 30.0})
+        return rounds, [99.0], {"state": "disabled"}
+
+    monkeypatch.setattr(bc, "paired_sweep", sweep)
+    monkeypatch.setattr(bc, "free_physical_gb", lambda: 32.0)
+    monkeypatch.setattr(bc.be, "n_ctx", lambda b: 4096)
+    monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(sys, "argv", ["bench_contention.py", "--repeat", "1",
+                                      "--cool-floor", "0"])
+    assert bc.main() == 0
+    assert "charge draw ranged" not in capsys.readouterr().out
+
+
 def test_power_limited_note_is_silent_when_the_clock_is_fine(monkeypatch):
     assert bc.power_limited_note(99.0, 92.0) == (None, False)
     assert bc.power_limited_note(None, 92.0) == (None, False)

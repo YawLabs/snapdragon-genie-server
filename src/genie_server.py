@@ -2406,7 +2406,21 @@ class Handler(BaseHTTPRequestHandler):
         # Count what the MODEL produced, not what survives parsing: the
         # <tool_call> block is real generated output, and billing/budgeting a
         # tool turn as 0 tokens is a lie the client cannot detect.
-        pt, ct = _tok_count(prompt), _tok_count(raw)
+        #
+        # Counted from the RAW generation rather than from `raw`, which is
+        # post-strip. That distinction did not matter while the only stripper
+        # was GENIE_STRIP_THINK (off by default, and an explicit opt-in when
+        # on) -- but the orphan strip runs on EVERY request, so counting after
+        # it silently deducted the reasoning the model had genuinely produced.
+        #
+        # Measured 2026-08-28: the same prompt and cap took ~5.5s under two
+        # different seeds and reported 51 tokens in one and 103 in the other.
+        # The wall was the same because the WORK was the same; half the tokens
+        # had been stripped out of the count. Anything dividing tokens by time
+        # then reads half rate -- bench_endpoint reported 9.25 t/s against a
+        # true 17.7, and its own probe cross-check missed it at 1.94x against a
+        # 2.0x threshold.
+        pt, ct = _tok_count(prompt), _tok_count("".join(chunks))
         usage = {"prompt_tokens": pt, "completion_tokens": ct,
                  "total_tokens": pt + ct}
         if overhead:
@@ -2521,7 +2535,7 @@ class Handler(BaseHTTPRequestHandler):
                     break
             if res.get("error"):
                 sse(frame({"content": "[error: %s]" % res["error"]}, finish="stop"))
-                done(_maybe_strip_think("".join(buf), prefilled))
+                done("".join(buf))
                 return
             finish = res.get("finish", "stop")
             text, calls = parse_tool_calls(_maybe_strip_think("".join(buf), prefilled))
@@ -2546,9 +2560,11 @@ class Handler(BaseHTTPRequestHandler):
         # generated. They differ exactly when the gate drops an orphan, and
         # usage is counted off `sent` -- see the note at done() below.
         sent = []
+        seen = []          # the raw generation, which is what usage counts
         gate = _OrphanGate(prefilled=prefilled)
         for i, chunk in enumerate(ENGINE.query_stream(
                 prompt, res, max_tokens=max_tokens, stop=stop, sampler=sampler)):
+            seen.append(chunk)
             out = gate.feed(chunk)
             if out:
                 sent.append(out)
@@ -2570,12 +2586,11 @@ class Handler(BaseHTTPRequestHandler):
         if res.get("error") and not gone["v"]:
             sse(frame({"content": "\n[error: %s]" % res["error"]}))
         sse(frame({}, finish=res.get("finish", "stop")))
-        # Counted from what was SENT, not from the raw generation. With the gate
-        # on the two are identical; with GENIE_ORPHAN_HOLD_CHARS=0 the client
-        # receives the duplicate and must be billed for it, or usage silently
-        # under-reports the bytes it just delivered -- the same lie as billing a
-        # tool turn at zero.
-        done("".join(sent))
+        # Counted from the RAW generation, like every other path here. `sent` is
+        # what survived the gate, which is the right thing to have DELIVERED and
+        # the wrong thing to have BILLED: the model produced the rest too, and
+        # spent the time doing it.
+        done("".join(seen))
 
     # ---- Anthropic Messages API (POST /v1/messages) -----------------------
 
@@ -2641,7 +2656,8 @@ class Handler(BaseHTTPRequestHandler):
             "stop_reason": reason,
             "stop_sequence": None,
             "usage": _with_overhead({"input_tokens": _tok_count(prompt),
-                                     "output_tokens": _tok_count(raw)},
+                                     "output_tokens": _tok_count(
+                                         "".join(chunks))},
                                     overhead),
         })
 
@@ -2722,7 +2738,7 @@ class Handler(BaseHTTPRequestHandler):
             ev("message_delta", {"type": "message_delta",
                 "delta": {"stop_reason": reason, "stop_sequence": None},
                 "usage": _with_overhead({"output_tokens": _tok_count(
-                    _maybe_strip_think("".join(buf), prefilled))}, overhead)})
+                    "".join(buf))}, overhead)})
             ev("message_stop", {"type": "message_stop"})
             return
 
@@ -2730,13 +2746,13 @@ class Handler(BaseHTTPRequestHandler):
             "content_block": {"type": "text", "text": ""}})
         ev("ping", {"type": "ping"})
 
-        # What actually left through the gate, which is what usage is counted
-        # off -- see the note at message_delta below.
-        sent = []
+        sent = []          # what left through the gate -- what the client sees
+        out = []           # the raw generation -- what usage counts
         res = {}
         gate = _OrphanGate(prefilled=prefilled)
         for i, chunk in enumerate(ENGINE.query_stream(
                 prompt, res, max_tokens=max_tokens, stop=stop, sampler=sampler)):
+            out.append(chunk)
             emit = gate.feed(chunk)
             if emit:
                 sent.append(emit)
@@ -2765,12 +2781,10 @@ class Handler(BaseHTTPRequestHandler):
         ev("message_delta", {"type": "message_delta",
             "delta": {"stop_reason": _anthropic_stop_reason(finish, None, stop),
                       "stop_sequence": None},
-            # Counted from what was SENT. With the gate on that equals the
-            # stripped text and matches the non-streaming path; with the gate
-            # disabled the client received the duplicate and is billed for it,
-            # rather than usage under-reporting the bytes just delivered.
+            # Counted from the RAW generation, matching every other path: the
+            # model produced what the gate withheld and spent the time on it.
             "usage": _with_overhead({"output_tokens": _tok_count(
-                "".join(sent))}, overhead)})
+                "".join(out))}, overhead)})
         ev("message_stop", {"type": "message_stop"})
 
 

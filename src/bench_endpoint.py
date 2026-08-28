@@ -67,6 +67,7 @@ another run at the same /props n_ctx.
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
@@ -245,6 +246,24 @@ def measure_prefill(base, model, target, timeout, per_step=0.0):
     return rate
 
 
+# Fewest decode steps a delta may rest on. Below this the subtraction is
+# measuring per-request overhead rather than decode: connection setup, template
+# rendering and the tokenizer round-trip do NOT cancel perfectly between the two
+# runs, and dividing their residue by three or four tokens produces a number
+# with the shape of a rate and none of the meaning.
+#
+# Measured 2026-08-27: a prompt whose answer ran to 5 tokens gave a 4-step
+# window and reported **0.60 tok/s against a true 17.6** -- off by 29x, printed
+# in the same column as a real measurement. The existing `steps <= 0` guard did
+# not fire, because 4 is not 0.
+#
+# This is easy to hit by accident now that the server seeds per process: answer
+# LENGTH varies run to run where the shipped fixed seed made it constant. Same
+# prompt, three seeds, measured: 105, 53 and 5 tokens -- all three at the same
+# ~17.6 tok/s, so it is the WINDOW that moves, never the rate.
+MIN_DECODE_STEPS = int(os.environ.get("GENIE_MIN_DECODE_STEPS", "16"))
+
+
 def measure_decode(base, model, target, tokens, timeout):
     """Decode rate at a given context depth, prefill subtracted out."""
     r = _delta_run(base, model, prompt_of(target), tokens, timeout)
@@ -257,6 +276,15 @@ def measure_decode(base, model, target, tokens, timeout):
         # derived from one or two tokens.
         print("  decode    depth=%-6d SKIPPED (model stopped before the cap)"
               % many["prompt_tokens"], flush=True)
+        return None
+    if steps < MIN_DECODE_STEPS:
+        # Refused rather than reported. A short window is not a slow engine, and
+        # the two are indistinguishable once the number is in a table -- which
+        # is the whole reason this prints the step count beside every rate.
+        print("  decode    depth=%-6d REFUSED: %d-step window (min %d). The "
+              "model answered before the cap, so this delta is overhead, not "
+              "decode -- raise --tokens or use a prompt that generates."
+              % (many["prompt_tokens"], steps, MIN_DECODE_STEPS), flush=True)
         return None
     rate = steps / secs
     print("  decode    depth=%-6d %3d tokens in %6.2fs   %8.2f tok/s"
@@ -476,7 +504,13 @@ def main():
             # every prefill number in the run, and nothing else would reveal it.
             if probe_rate:
                 med = statistics.median(allr)
-                if med and (med / probe_rate > 2 or probe_rate / med > 2):
+                # 1.5, not 2. A real 1.94x understatement slipped through the
+                # 2.0 threshold on 2026-08-28 -- decode read 9.25 t/s against a
+                # true 17.7 and this check stayed silent, which is the one
+                # moment it exists for. Decode on this engine is stable to a few
+                # percent run to run, so anything past 1.5x is already far
+                # outside the noise the tolerance was meant to absorb.
+                if med and (med / probe_rate > 1.5 or probe_rate / med > 1.5):
                     print("  WARNING: the decode probe read %.2f t/s but decode "
                           "measured %.2f t/s -- the probe was not representative, "
                           "so treat the corrected prefill figures above as "

@@ -359,6 +359,40 @@ def test_delta_run_reports_no_window_when_the_delta_time_is_negative(be):
 # once -- and a failed probe must read as "no correction available" rather
 # than as a correction of zero-ish size.
 
+def test_a_window_too_small_to_be_a_rate_is_refused(be, capsys):
+    """steps <= 0 was the only guard, and 4 is not 0.
+
+    Measured 2026-08-27: a prompt whose answer ran to 5 tokens gave a 4-step
+    window and reported 0.60 tok/s against a true 17.6 -- off by 29x, printed in
+    the same column as a real measurement. Per-request overhead does not cancel
+    perfectly between the two runs, and dividing its residue by four tokens
+    produces something shaped like a rate with none of the meaning.
+    """
+    _stub_chat_seq(be, _run(1, 0.30), _run(5, 6.98))
+    assert be.measure_decode("b", "m", 250, 120, 1) is None
+    out = capsys.readouterr().out
+    assert "REFUSED" in out and "4-step" in out
+    assert "overhead, not decode" in out, "must say WHY, not just that it skipped"
+
+
+def test_a_full_window_is_still_measured(be, capsys):
+    # The counterpart: the floor must not swallow real samples. 104 steps is the
+    # shape a healthy run produces at the same prompt and cap.
+    _stub_chat_seq(be, _run(1, 0.28), _run(105, 6.17))
+    rate = be.measure_decode("b", "m", 250, 120, 1)
+    assert rate == pytest.approx(104 / 5.89, rel=1e-6)
+    assert "REFUSED" not in capsys.readouterr().out
+
+
+def test_the_step_floor_is_tunable(be, monkeypatch):
+    # A caller deliberately measuring short generations needs a way down; the
+    # default protects the common case rather than forbidding the rare one.
+    monkeypatch.setattr(be, "MIN_DECODE_STEPS", 2)
+    _stub_chat_seq(be, _run(1, 0.30), _run(5, 6.98))
+    assert be.measure_decode("b", "m", 250, 120, 1) == pytest.approx(4 / 6.68,
+                                                                     rel=1e-6)
+
+
 def test_decode_probe_returns_seconds_per_step(be):
     _stub_chat_seq(be, _run(1, 0.30), _run(9, 0.74))
     per_step = be.decode_probe("b", "m", 1, depth=500, steps=8)

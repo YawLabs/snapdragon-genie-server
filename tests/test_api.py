@@ -603,24 +603,56 @@ def test_explicit_top_p_and_top_k_are_mapped(gs):
     assert gs._sampler_params({"temperature": 0}) == {"temp": 0.0, "top-k": 1}
 
 
-def test_streamed_usage_counts_what_was_actually_sent(gs, handler):
-    """Usage must describe the bytes the client received, not a different strip.
+def test_usage_counts_what_the_model_GENERATED_not_what_survived(gs, handler):
+    """The house rule, applied to the orphan strip that broke it.
 
-    With the gate disabled the duplicate IS delivered, so counting the stripped
-    text would under-report what just went out -- the same lie as billing a tool
-    turn at zero, which this suite already pins one screen up.
+    `_complete` already said "count what the MODEL produced, not what survives
+    parsing" for tool blocks. The orphan strip then ran on every request and the
+    count was taken AFTER it, so reasoning the model genuinely produced was
+    deducted. Measured 2026-08-28: the same prompt and cap took ~5.5s under two
+    seeds and reported 51 tokens under one, 103 under the other -- the wall was
+    the same because the WORK was the same. Anything dividing tokens by time
+    then reads half rate, which is exactly what bench_endpoint did.
+
+    Both paths, because they had drifted apart: streaming counted what it sent,
+    non-streaming counted what survived, and neither counted the generation.
     """
-    gs.ORPHAN_HOLD_CHARS = 0            # gate off: raw text reaches the client
-    gs.ENGINE = StubEngine(chunks=["dup answer\n", "</think>\n", "\nreal answer"])
+    raw = "dup answer\n</think>\nreal answer"
+    chunks = ["dup answer\n", "</think>\n", "real answer"]
+
+    gs.ENGINE = StubEngine(chunks=chunks)
     h = handler()
-    h._stream("prompt", 100, "cid", 0, include_usage=True, prefilled=True)
-    frames = h.wfile.sse_frames()
-    text = "".join(f["choices"][0]["delta"].get("content", "")
-                   for f in frames if f.get("choices"))
-    usage = next(f["usage"] for f in frames if f.get("usage"))
-    assert usage["completion_tokens"] == len(text) // 4, (
-        "counted %d tokens for %d chars actually sent"
-        % (usage["completion_tokens"], len(text)))
+    h._complete("prompt", 100, "cid", 0, prefilled=True)
+    body = json.loads(h.wfile.text())
+    assert body["choices"][0]["message"]["content"] == "real answer", \
+        "the client should still receive only the answer"
+    assert body["usage"]["completion_tokens"] == len(raw) // 4, \
+        "billed %d for a %d-char generation" % (
+            body["usage"]["completion_tokens"], len(raw))
+
+    gs.ENGINE = StubEngine(chunks=chunks)
+    h2 = handler()
+    h2._stream("prompt", 100, "cid", 0, include_usage=True, prefilled=True)
+    usage = next(f["usage"] for f in h2.wfile.sse_frames() if f.get("usage"))
+    assert usage["completion_tokens"] == len(raw) // 4, \
+        "streaming and non-streaming must bill the same turn identically"
+
+
+def test_the_anthropic_paths_bill_the_generation_too(gs, handler):
+    # Same rule, other API. These drifted independently once already.
+    chunks = ["dup answer\n", "</think>\n", "real answer"]
+    raw = "".join(chunks)
+
+    gs.ENGINE = StubEngine(chunks=chunks)
+    h = handler()
+    h._anthropic_complete("prompt", 100, "m", "mid", prefilled=True)
+    assert json.loads(h.wfile.text())["usage"]["output_tokens"] == len(raw) // 4
+
+    gs.ENGINE = StubEngine(chunks=chunks)
+    h2 = handler()
+    h2._anthropic_stream("prompt", 100, "m", "mid", prefilled=True)
+    deltas = [f for f in h2.wfile.sse_frames() if f.get("type") == "message_delta"]
+    assert deltas and deltas[-1]["usage"]["output_tokens"] == len(raw) // 4
 
 
 def test_a_malformed_int_env_var_does_not_kill_the_server(gs, monkeypatch,
