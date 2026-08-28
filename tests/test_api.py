@@ -523,6 +523,86 @@ def test_a_stream_delivers_exactly_what_the_buffered_path_would(gs, chunks):
     assert streamed == gs._maybe_strip_think("".join(chunks), True)
 
 
+def test_a_model_emitted_think_block_survives_the_gate_intact(gs):
+    """The INVERSE of the duplicate bug, and the equivalence test cannot see it.
+
+    A model can ignore the prefill and emit its own COMPLETE block. Qwen3's real
+    blocks are multi-line, so the close sits at a line start and the anchor
+    matches -- the gate then has to notice the matching open before it and pass
+    everything through. If that branch regressed, a caller who set
+    GENIE_THINKING=1 and explicitly asked for reasoning would have it silently
+    deleted, which is the same silent-content-loss failure as the truncation,
+    pointed the other way.
+
+    The equivalence test's pair is single-line, so its close is not at a line
+    start and the anchor never fires -- that case skips this branch entirely.
+    """
+    chunks = ["<think>\n", "reasoning\n", "</think>\n", "\nthe answer"]
+    gate = gs._OrphanGate(prefilled=True)
+    sent = "".join(x for x in (gate.feed(c) for c in chunks) if x) + gate.flush()
+    assert sent == "".join(chunks), "a well-formed block was mangled: %r" % sent
+
+
+def test_a_positive_hold_releases_at_the_cap(gs):
+    """The bounded mode, which is the escape hatch the default replaced.
+
+    GENIE_ORPHAN_HOLD_CHARS>0 keeps the old behaviour, and it is DOCUMENTED as
+    leaking -- an orphan past the cap goes out. That is precisely why it needs a
+    test: it is the setting someone reaches for in an incident, and an untested
+    escape hatch already measured failing is the worst thing to find broken then.
+    Pinned here is the release itself, not the leak: nothing may be withheld
+    forever just because no tag ever arrived.
+    """
+    gate = gs._OrphanGate(limit=20, prefilled=True)
+    out = [x for x in (gate.feed(c) for c in ["x" * 15, "y" * 15, "zzz"]) if x]
+    assert "".join(out) + gate.flush() == "x" * 15 + "y" * 15 + "zzz"
+    assert gate.open, "the cap must open the gate permanently, not per chunk"
+
+
+def test_the_seed_is_bounded_to_what_genie_can_parse(gs, monkeypatch):
+    """next_seed's only caller is device-gated, so nothing exercised it.
+
+    The int32 bound is load-bearing rather than tidy: Genie parses `seed` into
+    an int32_t, so a value past that wraps to something arbitrary instead of
+    erroring -- and the symptom is silent non-determinism nobody traces back to
+    a seed.
+    """
+    import importlib
+    monkeypatch.delenv("GENIE_SEED", raising=False)
+    importlib.reload(gs)
+    assert gs.FIXED_SEED is None
+    for _ in range(50):
+        assert 1 <= gs.next_seed() < 2 ** 31 - 1
+
+    monkeypatch.setenv("GENIE_SEED", "1234")
+    importlib.reload(gs)
+    # Pinned means pinned: every call, not a fresh draw seeded once.
+    assert [gs.next_seed(), gs.next_seed()] == [1234, 1234]
+
+
+def test_an_anthropic_user_turn_keeps_its_text_beside_a_tool_result(gs):
+    # A client that comments on a result ("that failed, try X") sends BOTH
+    # blocks in one turn. Dropping the comment reads as the model ignoring the
+    # user, and it is the half of the turn that carries the new instruction.
+    prompt, _dropped, fits, _overhead = gs._anthropic_to_prompt({"messages": [
+        {"role": "user", "content": "run it"},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "exit 1"},
+            {"type": "text", "text": "that failed, try X"}]}]})
+    assert fits
+    assert "<tool_response>\nexit 1\n</tool_response>" in prompt
+    assert "that failed, try X" in prompt, "the user's own words were dropped"
+
+
+def test_explicit_top_p_and_top_k_are_mapped(gs):
+    # Inert on QAIRT 2.45 (see apply_sampler), so this pins the MAPPING only --
+    # which is what has to still be right on the day a runtime honours it.
+    assert gs._sampler_params({"top_p": 0.5, "top_k": 7}) == {"top-p": 0.5,
+                                                              "top-k": 7}
+    # temp 0 from the REQUEST, not from the tool default, still implies greedy.
+    assert gs._sampler_params({"temperature": 0}) == {"temp": 0.0, "top-k": 1}
+
+
 def test_streamed_usage_counts_what_was_actually_sent(gs, handler):
     """Usage must describe the bytes the client received, not a different strip.
 

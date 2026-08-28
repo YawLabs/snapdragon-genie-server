@@ -236,6 +236,85 @@ def test_summarisation_can_be_disabled(gs):
     assert fits and dropped and gs.SUMMARY_MARKER not in p and gs.ENGINE.calls == []
 
 
+def test_the_note_creates_a_system_turn_when_there_is_none(gs):
+    """A client that sends no system prompt is entirely ordinary.
+
+    The note rides in the system turn because that is the one thing eviction
+    never touches -- so with no system turn to fold into, one has to be made.
+    Every fixture here supplies one (convo() always does), so this branch had
+    never run: the summary would have been spent on an NPU call and then
+    dropped on the floor.
+    """
+    out = gs._apply_note([{"role": "user", "content": "hi"}], "the note")
+    assert out[0]["role"] == "system"
+    assert gs.SUMMARY_MARKER in out[0]["content"] and "the note" in out[0]["content"]
+    # ...and the original turns survive after it, in order.
+    assert [m["role"] for m in out] == ["system", "user"]
+
+
+def test_summarisation_degrades_when_the_note_comes_back_empty(gs):
+    """The summariser SUCCEEDING with useless output, not raising.
+
+    The docs promise a summary is never allowed to break a request, and that
+    promise was only tested for the exception path. A model that returns
+    whitespace -- or a think block that strips to nothing -- takes a different
+    route: no error, no note, and the caller must fall back to plain eviction.
+    """
+    gs.ENGINE = StubEngine(chunks=["   \n  "])
+    assert gs._summarize_turns([{"role": "user", "content": "real content"}]) == (None, 0)
+
+    # And the other early exit: nothing worth summarising in the first place,
+    # which must not spend an NPU call at all.
+    gs.ENGINE = StubEngine(chunks=["a note"])
+    assert gs._summarize_turns([{"role": "user", "content": "   "}]) == (None, 0)
+    assert gs.ENGINE.calls == [], "paid for a summary of nothing"
+
+
+def test_an_evicted_tool_call_is_named_in_the_transcript(gs):
+    """Evicting a tool-using conversation is the COMMON case for an agent.
+
+    Without the annotation the note says the assistant went silent exactly where
+    it acted, so the model re-reads a file it already read -- which is the
+    behaviour summarisation exists to prevent.
+    """
+    t = gs._transcript([{"role": "assistant", "content": "looking",
+                         "tool_calls": [{"function": {"name": "read_file"}}]}])
+    assert t == "assistant: looking [called read_file]"
+
+    # The shape that actually dominates: a turn whose whole output WAS the call,
+    # so content is empty and the annotation is the only thing left to keep.
+    t2 = gs._transcript([{"role": "assistant", "content": "",
+                          "tool_calls": [{"function": {"name": "ls"}}]}])
+    assert t2 == "assistant: [called ls]"
+
+
+def test_an_unparseable_metadata_claims_nothing_and_does_not_raise(gs, tmp_path):
+    # The sibling reader for genie_config.json has exactly this test; without it
+    # here, a corrupt metadata.json takes a different and unverified route. It
+    # runs at startup, so raising would turn a bad bundle file into a server
+    # that will not boot.
+    (tmp_path / "metadata.json").write_text('{"genie": {"context_lengths"',
+                                            encoding="utf-8")
+    gs.BUNDLE_DIR = str(tmp_path)
+    gs._CONTEXT_LENGTHS = None
+    assert gs.read_context_lengths() == []
+    # [] rather than None: cached as "asked and got nothing", so the broken file
+    # is not re-opened and re-parsed on every request that reaches /props.
+    assert gs._CONTEXT_LENGTHS == []
+
+
+def test_a_metadata_without_a_genie_block_claims_nothing(gs, tmp_path):
+    # Valid JSON, no genie key -- a bundle from a tool that does not write one.
+    # Must read as "unknown", never as single-length, which would put a
+    # SINGLE-length warning in front of a bundle nobody can characterise.
+    (tmp_path / "metadata.json").write_text('{"other": 1}', encoding="utf-8")
+    gs.BUNDLE_DIR = str(tmp_path)
+    gs._CONTEXT_LENGTHS = None
+    gs._POLL_MATCHES = [(False, "QnnHtp.poll")]
+    assert gs.read_context_lengths() == []
+    assert gs.bundle_config_warnings() == []
+
+
 # --- config clamps ---------------------------------------------------------
 
 @pytest.mark.parametrize("ctx,requested,expected", [
