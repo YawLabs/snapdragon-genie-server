@@ -410,10 +410,55 @@ def test_a_dead_stream_stops_writing_entirely(gs, handler):
 
 def test_a_healthy_stream_writes_every_frame(gs, handler):
     # The counterpart: the latch must not suppress on a LIVE connection.
+    #
+    # Asserted on frame KINDS and on the delivered text rather than on a write
+    # COUNT. The orphan-think gate coalesces the opening of a short stream into
+    # one content frame, so a count here would encode the current hold size and
+    # break on any change to it -- while saying nothing about the latch, which
+    # is what this test is for. What must hold regardless of the hold: every
+    # frame kind arrives, and no generated text is dropped on the way.
     gs.ENGINE = StubEngine(chunks=["a", "b", "c"])
     h = handler()
     h._stream("prompt", 100, "cid", 0, include_usage=True)
-    assert h.wfile.writes >= 7, "role + 3 tokens + finish + usage + [DONE]"
+    frames = h.wfile.sse_frames()
+    text = "".join(f["choices"][0]["delta"].get("content", "")
+                   for f in frames if f.get("choices"))
+    assert text == "abc", "generated text lost or reordered: %r" % text
+    assert any(f.get("usage") for f in frames), "no usage frame on a live socket"
+    assert any(f.get("choices") and f["choices"][0].get("finish_reason")
+               for f in frames), "no finish frame on a live socket"
+    assert h.wfile.text().rstrip().endswith("[DONE]"), "stream not terminated"
+
+
+def test_the_gate_keeps_an_orphan_think_out_of_a_stream(gs, handler):
+    """The duplicate the gate exists to remove, end to end through _stream.
+
+    The model writes reasoning, closes a block the PREFILL opened, then answers
+    -- so the raw generation carries the answer twice. Only the text after the
+    orphan close may reach the client.
+    """
+    gs.ENGINE = StubEngine(chunks=["dup answer", "</think>", "real answer"])
+    h = handler()
+    h._stream("prompt", 100, "cid", 0, include_usage=True)
+    text = "".join(f["choices"][0]["delta"].get("content", "")
+                   for f in h.wfile.sse_frames() if f.get("choices"))
+    assert text == "real answer", (
+        "orphan reasoning reached the client: %r" % text)
+
+
+def test_the_gate_releases_a_short_reply_that_never_closes(gs, handler):
+    """A reply shorter than the hold must still be delivered, not swallowed.
+
+    Without the end-of-generation flush the gate would turn a rare duplicate
+    into a routine EMPTY response, which is a far worse failure than the one it
+    is fixing.
+    """
+    gs.ENGINE = StubEngine(chunks=["short ", "answer"])
+    h = handler()
+    h._stream("prompt", 100, "cid", 0, include_usage=True)
+    text = "".join(f["choices"][0]["delta"].get("content", "")
+                   for f in h.wfile.sse_frames() if f.get("choices"))
+    assert text == "short answer", "short reply was swallowed: %r" % text
 
 
 def test_a_dead_stream_emits_no_usage_frame(gs, handler):

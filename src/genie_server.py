@@ -32,6 +32,7 @@ import ctypes as C
 import json
 import os
 import queue
+import random
 import re
 import socket
 import sys
@@ -78,6 +79,58 @@ THINKING_DEFAULT = os.environ.get("GENIE_THINKING", "0") in ("1", "true", "yes")
 # it does not truncate -- so the margin is what stands between a long session
 # and a 500.
 WINDOW_MARGIN = int(os.environ.get("GENIE_WINDOW_MARGIN", "64"))
+# Pin the sampler seed for reproducible output; unset means a fresh seed per
+# request, which is the default and the thing that stops every answer to a
+# given prompt being the same answer. See next_seed().
+FIXED_SEED = os.environ.get("GENIE_SEED", "").strip()
+FIXED_SEED = int(FIXED_SEED) if FIXED_SEED else None
+
+
+def next_seed():
+    """The sampler seed to load this process with.
+
+    Why this is needed at all: Genie re-seeds its RNG from the config's `seed`
+    on every GenieDialog_reset (qualla Sampler::reset -- "just need to reinit
+    rng"), and _plan calls reset on every request that does not continue the
+    resident KV. The AI Hub bundles ship `"seed": 42`, so each fresh prompt
+    replays the SAME pseudo-random stream and the model walks an identical
+    sampling trajectory. Identical prompt in, byte-identical answer out --
+    measured here three times running, and again across separate server
+    processes.
+
+    That is not a cosmetic determinism note. It is why a prompt that lands on a
+    repetitive answer lands there EVERY time, and why re-asking never escapes
+    it: at temp 0.8 the model is nominally sampling, but the dice are reset
+    before every roll. No repetition penalty can fix that -- the problem is not
+    which tokens are penalised, it is that the same draw is taken every time.
+
+    Why it is applied HERE, at create, and not per request: a per-request
+    GenieSamplerConfig apply was tried and is inert on QAIRT 2.45 (three
+    identical generations with a fresh seed on each) -- see apply_sampler.
+    Sampling binds at GenieDialog_create, so the config text is the only thing
+    that can carry it.
+
+    And `"seed": -1` in the bundle does NOT work either, though it looks like
+    it should: the constructor reads -1 as "seed from the clock", but reset()
+    re-seeds with `_seed` unconditionally, so -1 casts to a fixed uint32 and
+    every generation after the first is deterministic again.
+
+    LIMIT, because this is a real one: the seed varies per PROCESS, not per
+    request. Within one server run an identical prompt still replays its
+    identical answer. Fixing that needs a QAIRT that honours a post-create
+    sampler apply.
+
+    GENIE_SEED pins it when reproducibility is what you want (comparing two
+    bundles, bisecting a bad generation). The benchmarks do not need it --
+    throughput does not depend on the seed.
+    """
+    if FIXED_SEED is not None:
+        return FIXED_SEED
+    # Bounded to int32: Genie parses `seed` into an int32_t, so a larger value
+    # would wrap to something arbitrary rather than be rejected.
+    return random.randrange(1, 2 ** 31 - 1)
+
+
 # Plain eviction drops the oldest turns outright, so the agent forgets it
 # already read a file and reads it again -- burning the window a second time on
 # information it had. Summarising the turns on their way out keeps the facts and
@@ -1252,10 +1305,144 @@ class GenieEngine:
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+_THINK_CLOSE = "</think>"
+
+
+def _strip_orphan_think(text):
+    """Drop a leading run that ends in a `</think>` we never opened.
+
+    THE PREFILL CONTRACT, AND HOW THE MODEL BREAKS IT. With reasoning
+    suppressed the prompt ends in a CLOSED, empty block (_NO_THINK), so the
+    model should simply answer. Qwen3 does not always accept that: it writes
+    its reasoning anyway, emits a bare closing tag, and then answers properly.
+    The output is then the answer TWICE with a stray tag between -- measured
+    here at 1 request in 6 on the shipped bundle, and it is the most visible
+    "it repeats itself" complaint against this server.
+
+    _THINK_RE cannot catch it. That pattern needs a MATCHED pair, and the
+    opening tag is in the PROMPT rather than the output, so the orphan close
+    never matches and the duplicate survives into the response.
+
+    Only an UNMATCHED close is touched. A well-formed <think>...</think> is the
+    model reasoning normally -- that belongs to STRIP_THINK, which is the
+    caller's choice to make, not this function's. An unmatched close can only
+    be the model closing the block the prefill opened, so what precedes it is
+    reasoning the caller already asked not to receive. Removing it restores the
+    contract; leaving it ships the answer twice.
+    """
+    i = text.find(_THINK_CLOSE)
+    if i == -1 or "<think>" in text[:i]:
+        return text
+    return text[i + len(_THINK_CLOSE):].lstrip()
 
 
 def _maybe_strip_think(text):
+    # Orphan-stripping is NOT gated on STRIP_THINK. That flag chooses whether
+    # to show genuine reasoning; this is a broken prefill duplicating the
+    # answer, which no caller wants in either setting.
+    text = _strip_orphan_think(text)
     return _THINK_RE.sub("", text) if STRIP_THINK else text
+
+
+# How much text to withhold at the start of a stream while deciding whether an
+# orphan close is coming. 0 disables the hold and streams every chunk as it
+# arrives, at the cost of shipping the duplicate to streaming clients.
+#
+# WHAT THIS COSTS, MEASURED, because the number is a real trade and not a
+# tuning knob. SSE cannot retract a frame, so a duplicate can only be kept out
+# of a stream by not sending it yet -- which means holding the START of every
+# response until the orphan is ruled in or out. There is no cheap value:
+# sampled over 12 streamed replies on this bundle, the one orphan closed at
+# offset 405, while 7 of the 12 replies were shorter than 600 characters
+# end-to-end. So any hold big enough to catch an orphan also delivers a typical
+# short reply as a SINGLE frame. Buffering is not a side effect of the setting;
+# at these lengths it essentially IS the setting.
+#
+# A bounded hold was tried first and LEAKED, which is why the default is now
+# unbounded. Set to 1024 -- already wide margin over that 405 -- the very next
+# sample produced an orphan closing at offset 1080: the gate released at its
+# limit and the duplicate went out anyway. Two observed offsets, 405 and 1080,
+# is not a distribution you can fit a threshold to, and a threshold high enough
+# to cover the larger one exceeds most whole replies, so the bound was buying
+# nothing while still looking like protection.
+#
+# So: -1 (the default) holds until the question is actually ANSWERED -- an
+# orphan close, or the end of the generation. 0 disables the gate and streams
+# every chunk as it arrives. A positive value keeps the old bounded behaviour
+# for anyone who wants it, with the leak above as the known cost.
+#
+# The honest statement of the default is that a streamed reply arrives as one
+# frame at the end: correct, but not incremental. For the agent traffic this
+# server exists to serve that is invisible, since the client consumes the
+# finished message either way. For a human watching tokens appear it is not --
+# that reader should set 0 and accept the occasional doubled answer. Memory is
+# bounded by max_tokens, so holding the whole generation costs nothing else.
+#
+# The BUFFERED paths -- non-streaming, and both tool paths, which already hold
+# the whole generation before answering -- strip the duplicate always and for
+# free. This setting only governs the incremental paths.
+ORPHAN_HOLD_CHARS = int(os.environ.get("GENIE_ORPHAN_HOLD_CHARS", "-1"))
+
+
+class _OrphanGate:
+    """Withholds the START of a stream until an orphan </think> is ruled in or out.
+
+    The buffered paths can strip the duplicate after the fact because they hold
+    the whole generation before answering. A stream cannot: once reasoning has
+    gone out as content there is no frame that retracts it, and the client
+    renders the answer twice -- so for streaming clients the fix has to happen
+    BEFORE the first byte, not after the last.
+
+    So the opening of a stream is held until one of two things is known:
+
+      * an unmatched </think> arrives -- everything before it was reasoning, so
+        drop it and emit from after the tag.
+      * the hold limit passes without one -- this generation is not going to
+        close a block it never opened, so release the buffer and stream on.
+
+    The cost is bounded and paid once: after the gate opens, nothing is ever
+    buffered again for the rest of the generation.
+    """
+
+    def __init__(self, limit=None):
+        self.buf = []
+        self.limit = ORPHAN_HOLD_CHARS if limit is None else limit
+        # Only 0 means "do not gate". A negative limit holds indefinitely, so
+        # the gate opens on the close tag or on flush() and nowhere else.
+        self.open = self.limit == 0
+
+    def feed(self, chunk):
+        """Text that may be emitted now, possibly ""."""
+        if self.open:
+            return chunk
+        self.buf.append(chunk)
+        # Searched over the ACCUMULATION, not the chunk: Genie hands back
+        # whatever the tokenizer produced, so the tag routinely straddles two
+        # callbacks and a per-chunk search would miss it.
+        held = "".join(self.buf)
+        i = held.find(_THINK_CLOSE)
+        if i != -1:
+            self.open, self.buf = True, []
+            if "<think>" in held[:i]:
+                return held      # matched pair: genuine reasoning, not ours
+            return held[i + len(_THINK_CLOSE):].lstrip()
+        if self.limit > 0 and len(held) >= self.limit:
+            self.open, self.buf = True, []
+            return held
+        return ""
+
+    def flush(self):
+        """Whatever is still held when the generation ends.
+
+        A short answer can finish inside the hold window, so without this the
+        entire response would be buffered and then dropped -- the gate would
+        turn a rare duplicate into a routine empty reply.
+        """
+        if self.open or not self.buf:
+            return ""
+        held = "".join(self.buf)
+        self.open, self.buf = True, []
+        return held
 
 
 def _anthropic_text(content):
@@ -1493,6 +1680,30 @@ Check GENIE_SDK_DIR, or unset GENIE_HEXAGON_ARCH if you pinned an arch."""
     os.chdir(BUNDLE_DIR)
     with open(os.path.join(BUNDLE_DIR, "genie_config.json"), "rb") as f:
         cfg_json = f.read()
+
+    # Override the bundle's fixed `seed` in the config TEXT, not on disk. The
+    # bundle is a large external artifact shared with other tools and other
+    # sessions on this box; rewriting someone else's file to change our own
+    # sampling would be a side effect nobody asked for. Genie only ever sees
+    # this string, so patching it here is sufficient and leaves the artifact
+    # untouched. See next_seed() for why the shipped 42 has to go.
+    seed = next_seed()
+    try:
+        _cfg = json.loads(cfg_json)
+        _cfg["dialog"]["sampler"]["seed"] = seed
+        cfg_json = json.dumps(_cfg).encode("utf-8")
+        print("[genie] sampler seed: %d%s" % (seed, " (pinned by GENIE_SEED)"
+                                              if FIXED_SEED is not None else
+                                              " (fresh per process; the bundle "
+                                              "ships a fixed 42)"), flush=True)
+    except Exception as e:
+        # A config we cannot parse is not a reason to refuse to start -- Genie
+        # is about to parse it itself and will give a better error than we can.
+        # Say what was lost, though, because the symptom of losing it silently
+        # is "every answer is the same answer", which reads as a model problem.
+        print("[genie] WARNING: could not set the sampler seed (%s); the "
+              "bundle's fixed seed stands, so identical prompts will return "
+              "identical answers." % e, flush=True)
 
     cfg = ConfigHandle()
     st = lib.GenieDialogConfig_createFromJson(cfg_json, C.byref(cfg))
@@ -2132,6 +2343,26 @@ class Handler(BaseHTTPRequestHandler):
                     "model": MODEL_ID,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
+        def probe():
+            """An SSE comment: ignored by every client, but a FAILED write is
+            the only way to learn the caller is gone while we are emitting
+            nothing. Without it an abandoned turn runs to max_tokens holding
+            the single-flight NPU against everyone else.
+
+            Needed on BOTH branches now. The tool path emits nothing because it
+            buffers a whole tool call; the plain path emits nothing while the
+            orphan gate holds the opening of the stream. Same silence, same
+            hazard, so one probe rather than two that can drift.
+            """
+            if gone["v"]:
+                return
+            try:
+                self.wfile.write(b": keep-alive" + _SSE_GAP)
+                self.wfile.flush()
+            except (ConnectionError, OSError):
+                gone["v"] = True
+                ENGINE.signal_abort()
+
         # NOTE: with STRIP_THINK we cannot cleanly strip mid-stream, so streamed
         # output is always faithful (includes <think>); non-stream honors the flag.
         sse(frame({"role": "assistant"}))
@@ -2168,23 +2399,6 @@ class Handler(BaseHTTPRequestHandler):
             # So generate fully, then emit well-formed frames: still SSE (the
             # client asked for SSE), just not incremental. Buffering is the
             # honest trade; a partial tool call is not.
-            def probe():
-                """An SSE comment: ignored by every client, but a FAILED write
-                is the only way to learn the caller is gone while we are
-                buffering and therefore emitting nothing. Without it a client
-                that walks away from a tool turn leaves the generation running
-                to max_tokens, holding the single-flight NPU against everyone
-                else -- the exact hazard signal_abort exists to prevent on the
-                plain path."""
-                if gone["v"]:
-                    return
-                try:
-                    self.wfile.write(b": keep-alive" + _SSE_GAP)
-                    self.wfile.flush()
-                except (ConnectionError, OSError):
-                    gone["v"] = True
-                    ENGINE.signal_abort()
-
             # query_stream (not query) so the generation runs on a worker
             # thread and signal_abort can actually reach it.
             buf, res = [], {}
@@ -2220,16 +2434,29 @@ class Handler(BaseHTTPRequestHandler):
 
         res = {}
         seen = []
-        for chunk in ENGINE.query_stream(prompt, res, max_tokens=max_tokens,
-                                        stop=stop, sampler=sampler):
+        gate = _OrphanGate()
+        for i, chunk in enumerate(ENGINE.query_stream(
+                prompt, res, max_tokens=max_tokens, stop=stop, sampler=sampler)):
             seen.append(chunk)
-            sse(frame({"content": chunk}))
+            out = gate.feed(chunk)
+            if out:
+                sse(frame({"content": out}))
+            elif i % 8 == 0:
+                # Holding, so nothing goes out and the write callback cannot
+                # fire -- probe, or a departed client is not noticed until the
+                # gate opens and the NPU stays held meanwhile.
+                probe()
             if gone["v"]:
                 break
+        tail = gate.flush()
+        if tail:
+            sse(frame({"content": tail}))
         if res.get("error") and not gone["v"]:
             sse(frame({"content": "\n[error: %s]" % res["error"]}))
         sse(frame({}, finish=res.get("finish", "stop")))
-        done("".join(seen))
+        # Counted from the stripped text, like _complete: the same turn must not
+        # report different completion_tokens purely because the client streamed.
+        done(_maybe_strip_think("".join(seen)))
 
     # ---- Anthropic Messages API (POST /v1/messages) -----------------------
 
@@ -2382,13 +2609,26 @@ class Handler(BaseHTTPRequestHandler):
 
         out = []
         res = {}
-        for chunk in ENGINE.query_stream(prompt, res, max_tokens=max_tokens,
-                                        stop=stop, sampler=sampler):
+        gate = _OrphanGate()
+        for i, chunk in enumerate(ENGINE.query_stream(
+                prompt, res, max_tokens=max_tokens, stop=stop, sampler=sampler)):
             out.append(chunk)
-            ev("content_block_delta", {"type": "content_block_delta", "index": 0,
-                "delta": {"type": "text_delta", "text": chunk}})
+            emit = gate.feed(chunk)
+            if emit:
+                ev("content_block_delta", {"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": emit}})
+            elif i % 8 == 0:
+                # Nothing goes out while the gate holds, so the write callback
+                # cannot fire and a departed client would go unnoticed with the
+                # single-flight NPU still held. `ping` is a real Anthropic
+                # event, so this needs no client-side tolerance.
+                ev("ping", {"type": "ping"})
             if gone["v"]:
                 break
+        tail = gate.flush()
+        if tail:
+            ev("content_block_delta", {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": tail}})
         if res.get("error") and not gone["v"]:
             ev("content_block_delta", {"type": "content_block_delta", "index": 0,
                 "delta": {"type": "text_delta", "text": "\n[error: %s]" % res["error"]}})
@@ -2397,8 +2637,11 @@ class Handler(BaseHTTPRequestHandler):
         ev("message_delta", {"type": "message_delta",
             "delta": {"stop_reason": _anthropic_stop_reason(finish, None, stop),
                       "stop_sequence": None},
-            "usage": _with_overhead({"output_tokens": _tok_count("".join(out))},
-                                    overhead)})
+            # Counted from the stripped text, matching the non-streaming path:
+            # the same turn must not report different output_tokens because the
+            # client chose to stream.
+            "usage": _with_overhead({"output_tokens": _tok_count(
+                _maybe_strip_think("".join(out)))}, overhead)})
         ev("message_stop", {"type": "message_stop"})
 
 
