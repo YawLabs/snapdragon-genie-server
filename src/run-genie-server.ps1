@@ -69,6 +69,15 @@ if ($arch -notmatch "ARM64|aarch64") {
 # Without something to act on that exit, the detection is only a better error
 # message; this loop is what turns it into recovery.
 #
+# A wedge is not the only way the device takes the server down, though, and it
+# was not the one actually observed. The driver can fault instead of hang: WER
+# on this box records python.exe dying with 0xC0000005 inside QnnHtp.dll at the
+# identical offset twice (2026-08-24 and 2026-08-27), alongside the same crash
+# from test-qnn-lifecycle.exe. A crash is a wedge by another name -- the engine
+# is gone and only a fresh process brings it back -- but it exits with an
+# NTSTATUS, not 75, so treating "not 75" as "deliberate" made this loop give up
+# on precisely the failure it exists to recover from.
+#
 # Restarts are rate-limited and capped. A device that wedges immediately on
 # every load is not going to be fixed by looping on it, and a tight restart
 # loop against a sick NPU is worse than being down: it keeps the HTP busy and
@@ -82,6 +91,29 @@ $maxRestarts = if ($env:GENIE_MAX_RESTARTS) { [int]$env:GENIE_MAX_RESTARTS } els
 $cooldown    = if ($env:GENIE_RESTART_COOLDOWN) { [int]$env:GENIE_RESTART_COOLDOWN } else { 25 }
 $restarts = 0
 
+# Ctrl-C arrives as an NTSTATUS too (STATUS_CONTROL_C_EXIT), so it has to be
+# carved out by hand or the operator's own stop becomes a restart -- the one
+# way this change could make things worse than the bug it fixes.
+$STATUS_CONTROL_C_EXIT = -1073741510   # 0xC000013A
+
+function Test-NativeCrash([int]$code) {
+    # What separates a crash from a deliberate failure is MAGNITUDE, not sign.
+    # An exception code carries a severity, a facility and a code field, so it
+    # is always enormous: 0xC0000005 access violation, 0xC0000409 stack buffer
+    # overrun, 0xE06D7363 unhandled C++ exception, 0x80000003 breakpoint. A
+    # program that means to fail writes exit(1), or sloppily exit(-1), and -1
+    # arrives as 0xFFFFFFFF -- numerically inside any "negative means crash"
+    # window while meaning the exact opposite. So the window stops at -65536,
+    # well above every deliberate small negative and far below every real
+    # exception code.
+    #
+    # Written in decimal deliberately: PowerShell 5.1 parses the literal
+    # 0xC0000000 as a SIGNED Int32 (-1073741824), so the obvious hex spelling
+    # of a bound like this silently matches every code including 0 and 75.
+    if ($code -eq $STATUS_CONTROL_C_EXIT) { return $false }
+    return ($code -le -65536)
+}
+
 while ($true) {
     Write-Host "[run] starting Genie server (python $arch) on $($env:GENIE_HOST):$($env:GENIE_PORT)"
     $started = Get-Date
@@ -89,7 +121,8 @@ while ($true) {
     $code = $LASTEXITCODE
     $ranFor = ((Get-Date) - $started).TotalSeconds
 
-    if ($code -ne 75) {
+    $crashed = Test-NativeCrash $code
+    if ($code -ne 75 -and -not $crashed) {
         # Anything else is a deliberate exit: Ctrl-C, a config error the server
         # already explained, a port collision. Restarting would just repeat it.
         Write-Host "[run] server exited $code -- not a wedge, not restarting."
@@ -102,14 +135,26 @@ while ($true) {
     # simply had a long uptime.
     if ($ranFor -lt 120) { $restarts++ } else { $restarts = 1 }
 
+    # Name which of the two happened. They need different next steps from the
+    # operator -- a crash left a WER report and a faulting module to look up, a
+    # wedge left nothing but a stuck thread -- and "wedged" printed over a crash
+    # sends them hunting for a hang that never happened.
+    $what = if ($crashed) { "crashed" } else { "wedged" }
+    if ($crashed) {
+        $hex = [BitConverter]::ToUInt32([BitConverter]::GetBytes($code), 0)
+        Write-Host ("[run] server crashed: exit 0x{0:X8}. The faulting module is in" -f $hex)
+        Write-Host "[run] Event Viewer (Application, Windows Error Reporting) -- if it"
+        Write-Host "[run] names QnnHtp.dll the fault was inside the QNN driver, not here."
+    }
+
     if ($restarts -gt $maxRestarts) {
-        Write-Host "[run] the engine wedged $restarts times in quick succession."
+        Write-Host "[run] the engine $what $restarts times in quick succession."
         Write-Host "[run] Giving up rather than looping on a sick device. The HTP"
         Write-Host "[run] may need a reset (reboot, or reload the driver) before"
         Write-Host "[run] this will come back. Raise GENIE_MAX_RESTARTS to retry more."
         exit 75
     }
 
-    Write-Host "[run] engine wedged after ${ranFor}s -- restart $restarts/$maxRestarts in ${cooldown}s."
+    Write-Host "[run] engine $what after ${ranFor}s -- restart $restarts/$maxRestarts in ${cooldown}s."
     Start-Sleep -Seconds $cooldown
 }

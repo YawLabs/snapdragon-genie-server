@@ -184,14 +184,33 @@ Escalation, in order:
 2. **Wedged** -- the abort did not take within `GENIE_WEDGE_GRACE`. Nothing
    in-process can help, so the server exits **75** (`EX_TEMPFAIL`) and asks to
    be replaced. `GENIE_WEDGE_EXIT=0` keeps it up and reporting 503 instead.
-3. **Restarted** -- `run-genie-server.ps1` restarts on exit 75 and only on 75;
-   any other code is a deliberate exit (Ctrl-C, a config error it already
-   explained) and repeating it would be pointless. Restarts are capped and
-   rate-limited, because looping on a device that wedges every time keeps the
-   HTP busy and buries the original failure under identical log stanzas. Only
-   restarts following a short life count toward the cap, so a server that ran
-   for hours and wedged once does not share a budget with one wedging at
+3. **Restarted** -- `run-genie-server.ps1` restarts on exit 75 **and on a native
+   crash**; any other code is a deliberate exit (Ctrl-C, a config error it
+   already explained) and repeating it would be pointless. Restarts are capped
+   and rate-limited, because looping on a device that wedges every time keeps
+   the HTP busy and buries the original failure under identical log stanzas.
+   Only restarts following a short life count toward the cap, so a server that
+   ran for hours and wedged once does not share a budget with one wedging at
    startup.
+
+   The crash case is not hypothetical and is why "75 and only 75" was wrong:
+   the driver can fault instead of hang, and WER on the dev box records
+   `python.exe` dying with `0xC0000005` inside `QnnHtp.dll` at the same offset
+   twice (2026-08-24, 2026-08-27). That is a wedge by another name -- the
+   engine is gone and only a fresh process brings it back -- but it exits with
+   an NTSTATUS rather than 75, so the old rule gave up on precisely the failure
+   the loop exists to recover from. A crash is recognised by MAGNITUDE, not by
+   sign: an exception code carries a severity, a facility and a code field, so
+   it is always enormous (`0xC0000005` access violation, `0xC0000409` stack
+   buffer overrun, `0xE06D7363` unhandled C++ exception, `0x80000003`
+   breakpoint), while a deliberate failure is `exit(1)` or a sloppy `exit(-1)`.
+   That `-1` arrives as `0xFFFFFFFF` -- inside any "negative means crash"
+   window while meaning the opposite -- so the test is `$LASTEXITCODE <=
+   -65536`, above every deliberate small negative and below every real
+   exception code. `STATUS_CONTROL_C_EXIT` is carved out on top of that, so the
+   operator's own Ctrl-C never becomes a restart. The log line names which of the two happened, since
+   a crash leaves a WER report and a faulting module to look up and a wedge
+   leaves nothing but a stuck thread.
 
 Separately, `consecutive_failures` reaching `GENIE_FAIL_THRESHOLD` reports
 `failing` on `/health` **without** restarting: the engine is answering, just
