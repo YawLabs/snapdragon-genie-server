@@ -311,7 +311,7 @@ Exit criterion: a self-converted small dense model (Llama-3.2-1B / Qwen2.5-1.5B)
 
 ### Phase 3 -- serving for the agent workload [~] BUILT; benchmarking and routing outstanding
 Goal: a drop-in local endpoint the agent config can point at. Delivered as `src/genie_server.py`
-(stdlib only, ~2850 lines), documented in `docs/GENIE_SERVER.md`, covered by 359 device-free tests.
+(stdlib only, ~2980 lines), documented in `docs/GENIE_SERVER.md`, covered by 401 device-free tests.
 - [x] Genie wrapped via the C API (ctypes -> `Genie.dll`), model resident so requests skip the reload.
 - [x] OpenAI `/v1/chat/completions` **and** Anthropic `/v1/messages`, both with SSE streaming.
 - [x] `/props`, `/v1/models`, `/health` so a client can size the window and probe capability.
