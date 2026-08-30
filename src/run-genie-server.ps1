@@ -90,6 +90,9 @@ $maxRestarts = if ($env:GENIE_MAX_RESTARTS) { [int]$env:GENIE_MAX_RESTARTS } els
 # every number it produces is wrong.
 $cooldown    = if ($env:GENIE_RESTART_COOLDOWN) { [int]$env:GENIE_RESTART_COOLDOWN } else { 25 }
 $restarts = 0
+# Which kinds the current streak has seen, for the give-up summary below.
+$sawCrash = $false
+$sawWedge = $false
 
 # Ctrl-C arrives as an NTSTATUS too (STATUS_CONTROL_C_EXIT), so it has to be
 # carved out by hand or the operator's own stop becomes a restart -- the one
@@ -133,13 +136,21 @@ while ($true) {
     # and then wedged once is a different animal from one wedging on startup,
     # and folding them together would exhaust the budget on a healthy box that
     # simply had a long uptime.
-    if ($ranFor -lt 120) { $restarts++ } else { $restarts = 1 }
+    if ($ranFor -lt 120) { $restarts++ } else { $restarts = 1; $sawCrash = $false; $sawWedge = $false }
 
     # Name which of the two happened. They need different next steps from the
     # operator -- a crash left a WER report and a faulting module to look up, a
     # wedge left nothing but a stuck thread -- and "wedged" printed over a crash
     # sends them hunting for a hang that never happened.
-    $what = if ($crashed) { "crashed" } else { "wedged" }
+    #
+    # Tracked as two flags rather than one label because a streak can MIX. The
+    # summary below covers every failure in the streak, not just the last one,
+    # and reporting "wedged 5 times" over three wedges and two crashes would
+    # send the operator looking for a hang on the strength of which kind
+    # happened to come last. The flags reset with the counter, since a fresh
+    # streak is a fresh question.
+    if ($crashed) { $what = "crashed"; $sawCrash = $true }
+    else          { $what = "wedged";  $sawWedge = $true }
     if ($crashed) {
         $hex = [BitConverter]::ToUInt32([BitConverter]::GetBytes($code), 0)
         Write-Host ("[run] server crashed: exit 0x{0:X8}. The faulting module is in" -f $hex)
@@ -148,7 +159,10 @@ while ($true) {
     }
 
     if ($restarts -gt $maxRestarts) {
-        Write-Host "[run] the engine $what $restarts times in quick succession."
+        $summary = if ($sawCrash -and $sawWedge) { "crashed and wedged" }
+                   elseif ($sawCrash)            { "crashed" }
+                   else                          { "wedged" }
+        Write-Host "[run] the engine $summary $restarts times in quick succession."
         Write-Host "[run] Giving up rather than looping on a sick device. The HTP"
         Write-Host "[run] may need a reset (reboot, or reload the driver) before"
         Write-Host "[run] this will come back. Raise GENIE_MAX_RESTARTS to retry more."

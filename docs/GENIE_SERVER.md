@@ -208,9 +208,10 @@ Escalation, in order:
    window while meaning the opposite -- so the test is `$LASTEXITCODE <=
    -65536`, above every deliberate small negative and below every real
    exception code. `STATUS_CONTROL_C_EXIT` is carved out on top of that, so the
-   operator's own Ctrl-C never becomes a restart. The log line names which of the two happened, since
-   a crash leaves a WER report and a faulting module to look up and a wedge
-   leaves nothing but a stuck thread.
+   operator's own Ctrl-C never becomes a restart. The log line names which of
+   the two happened, since a crash leaves a WER report and a faulting module to
+   look up and a wedge leaves nothing but a stuck thread. A streak that mixed
+   both is reported as both, rather than as whichever kind happened last.
 
 Separately, `consecutive_failures` reaching `GENIE_FAIL_THRESHOLD` reports
 `failing` on `/health` **without** restarting: the engine is answering, just
