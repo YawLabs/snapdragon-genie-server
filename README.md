@@ -242,7 +242,11 @@ a full model is **smaller** than the NPU-vs-ORT-CPU-EP ratios above.
 - **A full LLM runs on the NPU and serves HTTP.** A Qwen3-4B w4a16 Genie bundle
   sits resident on the HTP behind `src/genie_server.py`, answering both the
   OpenAI and Anthropic APIs with streaming, tool calls, stop sequences and
-  context eviction. See [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md).
+  context eviction. See [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md). A
+  Qwen3-8B tier serves the same way (`-Model qwen3-8b`); Qwen3.5-9B cannot be
+  a Genie bundle today and serves via `src/run-llama-server.ps1` on the CPU
+  or Adreno instead -- the model matrix and the reasons are in
+  [docs/MODEL_OPTIONS.md](docs/MODEL_OPTIONS.md).
 - **Full-model prefill and decode, measured** across three compiled windows via
   `src/bench_endpoint.py`: **1157 / 458 / 176 tok/s prefill** and
   **18.0 / 8.8 / 3.3 tok/s decode** at 4096 / 8192 / 16384. Decode is
@@ -277,12 +281,15 @@ src/bench.py              CLI GEMM benchmark (FP16 / INT8 QDQ / prompt-length sw
 src/genie_server.py       OpenAI + Anthropic HTTP server over a resident Genie bundle
 src/bench_endpoint.py     prefill/decode benchmark against any OpenAI-compatible server
 src/genie_smoke.py        minimal one-shot Genie generation, for isolating server bugs
-src/run-genie-server.ps1  launcher + supervisor; finds the bundle/SDK itself
+src/bench_contention.py   two engines at once: solo vs contended, cool-gated sampling
+src/run-genie-server.ps1  launcher + supervisor; finds the bundle/SDK itself (-Model picks 4B/8B)
+src/run-llama-server.ps1  Qwen3.5-9B llama-server legs: CPU (Q8_0) / Adreno (Q4_K_M)
 tests/                    401 device-free tests (no NPU, no bundle, no SDK needed)
 
 docs/GENIE_SERVER.md      the server: endpoints, env vars, and its measured limits
 docs/IMPLEMENTATION_PLAN.md  living plan + decision log; start here for the why
 docs/MODEL_CONVERSION.md  full-LLM path: Olive / AI Hub / Foundry Local + genai caveat
+docs/MODEL_OPTIONS.md     the model matrix: what serves where (4B/8B NPU, 9B llama.cpp) and why
 docs/MULTI_ENGINE.md      running NPU + GPU + CPU at once -- 1.45x measured, and why
 docs/TYPED_ROUTER_BRIEF.md  self-contained handoff for the routing work in typed
 requirements.txt          onnxruntime-qnn, onnx, numpy (genai is separate/optional)

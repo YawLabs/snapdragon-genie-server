@@ -341,9 +341,17 @@ all in that build. There is no error to notice; the request is answered, just by
 the wrong engine at CPU speed. `llama-bench` from the *same* directory against
 the *same* DLLs drives the Adreno correctly, which is why the contention
 measurement above had to drive the GPU leg through `llama-bench` and only the
-NPU leg over HTTP. Until a build ships whose `llama-server` initialises OpenCL,
-"GPU -> `llama-server`" is a plan, not a working path -- verify the backend line
-in the server's own startup log before trusting any GPU number taken over HTTP.
+NPU leg over HTTP.
+
+**RESOLVED 2026-09-03: a build now ships whose `llama-server` initialises
+OpenCL.** `llama-qnn-fork/build-arm64-windows-llvm-release` (build 10672)
+serves the Adreno over HTTP -- `using device GPUOpenCL`, `offloaded 33/33
+layers to GPU`, GPU engine counter 59% during decode, smoke-verified through
+`src/run-llama-server.ps1 -Leg gpu` (see `MODEL_OPTIONS.md`). The build-3way
+failure above is a property of THAT build, not of llama-server -- and the
+advice survives the fix: verify the backend line in the server's own startup
+log before trusting any GPU number taken over HTTP, because the failure mode
+is silent.
 
 So most of it exists. The missing piece is dispatch, and **that belongs in
 typed, not here**:

@@ -75,15 +75,20 @@ strength of a measurement that turned out to have been taken on a misconfigured
 bundle, and reinstates it here with numbers behind it -- see the concurrency
 section.
 
-**`llama-server` cannot drive the Adreno.** The build in
-`llama-qnn-fork/build-3way` silently loads on CPU (`kleidiai`, `n_threads=12`,
-zero OpenCL init) even with `-ngl 99 --device GPUOpenCL --fit off`, and
-`--list-devices` prints nothing. Nothing errors -- requests are answered, at CPU
-speed, by the wrong engine. `llama-bench` from the same directory and the same
-DLLs drives the GPU correctly. So the GPU numbers here were taken through
-`llama-bench`, and **"GPU -> `llama-server` over HTTP" is not a working path
-until a build ships whose server initialises OpenCL.** Check the backend line in
-the server's own startup log before believing any GPU figure taken over HTTP.
+**One specific `llama-server` build cannot drive the Adreno -- scope this to
+`llama-qnn-fork/build-3way`.** That build silently loads on CPU (`kleidiai`,
+`n_threads=12`, zero OpenCL init) even with `-ngl 99 --device GPUOpenCL
+--fit off`, and `--list-devices` prints nothing. Nothing errors -- requests
+are answered, at CPU speed, by the wrong engine. `llama-bench` from the same
+directory and the same DLLs drives the GPU correctly. So the GPU numbers here
+were taken through `llama-bench`. **Resolved 2026-09-03:**
+`llama-qnn-fork/build-arm64-windows-llvm-release` (build 10672) serves the
+Adreno over HTTP normally (`using device GPUOpenCL`, `offloaded 33/33 layers
+to GPU`, GPU engine counter busy during decode), launched via
+`snapdragon-npu-llm/src/run-llama-server.ps1 -Leg gpu` on port 8124 -- that
+endpoint is registrable. The lesson outlives the fix: the failure mode is
+silent, so check the backend line in the server's own startup log before
+believing any GPU figure taken over HTTP.
 
 **Where the GPU figures come from.** Measured on a cooled, quiet box 2026-08-23
 with `src/bench_contention.py` in `snapdragon-npu-llm`; Qwen3-4B Q4_K_M
@@ -471,8 +476,9 @@ Three rules fall out for the router:
 Reproduce any of this with `src/bench_contention.py` in `snapdragon-npu-llm`
 (`--npu` / `--gpu` base URLs, `--depth`, `--repeat`; it refuses to run on a
 loaded box unless you pass `--allow-loaded`, which stamps every result LOADED).
-Note that it expects both legs over HTTP, so the GPU leg needs the
-`llama-server` problem above solved first, or driving by hand.
+Note that it expects both legs over HTTP; since 2026-09-03 the GPU leg is
+servable over HTTP from the `build-arm64-windows-llvm-release` build (see the
+placement note above) -- only the retired `build-3way` needs driving by hand.
 
 ## Why route at all
 
@@ -611,8 +617,9 @@ These are properties of the NPU endpoint that a router must not assume away:
   2026-08-23: 0.78x, and the cause is not the memory bus.~~ **Answered
   2026-08-24: 1.45x, and the cause is the memory bus.** Numbers and caveats in
   the concurrency section above -- one pair of engines, one model, one depth,
-  n=3, the GPU leg driven by `llama-bench` because `llama-server` cannot reach
-  the Adreno.
+  n=3, the GPU leg driven by `llama-bench` because the `build-3way`
+  `llama-server` of the day could not reach the Adreno (a newer build can --
+  see the placement note above).
 - **Confirm the `poll` A/B deliberately.** The whole reversal above rests on a
   flag a third party changed on disk between the two halves of the measurement,
   not on a controlled experiment. It is ~15 minutes -- flip it back, re-run

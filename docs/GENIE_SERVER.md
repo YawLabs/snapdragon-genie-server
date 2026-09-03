@@ -220,8 +220,9 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
 ## Notes / limitations
 
 - **Context window: evict, don't crash.** The compiled window is fixed (read
-  from the bundle, reported at `/props`; the bundles here are 4096, 8192
-  single-length, 8192 multi-length -- the launcher default -- and 16384) and Genie has NO sliding-window mode -- QAIRT 2.45 exposes no
+  from the bundle, reported at `/props`; the 4B bundles here are 4096, 8192
+  single-length, 8192 multi-length -- the launcher default -- and 16384, plus
+  the 8B prebuilt at 4096 multi-length) and Genie has NO sliding-window mode -- QAIRT 2.45 exposes no
   such flag on `genie-t2t-run` and no equivalent config key, and overflowing is
   a hard `GenieDialog_query` failure, not a truncation. So the server evicts:
   oldest turns are dropped until the prompt fits, with the system turn and tool
@@ -757,7 +758,15 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   so a large resident model elsewhere (e.g. a 26 GB llama-server) will slow it.
 - **`finish_reason`** reports `length` only on context-limit; a `max_tokens` cap
   currently reports `stop` (Genie signals a normal sentence-end at the cap).
-- Model swaps: point `GENIE_BUNDLE_DIR` at the 1.7B bundle for lower latency, or
-  any other X-Elite Genie bundle. Note that the bundle's **compiled window** is
-  as big a latency lever as its parameter count -- see the window-tax note
-  above before assuming a larger-context bundle is strictly better.
+- Model swaps: `run-genie-server.ps1 -Model qwen3-8b` serves the Qwen3-8B
+  w4a16 prebuilt (multi-length 4096, id `qwen3-8b-npu`; expect roughly half
+  the 4B's decode -- bandwidth-bound, ~2x the weight bytes per token). For
+  anything else, point `GENIE_BUNDLE_DIR` at the bundle -- e.g. the 1.7B for
+  lower latency. Note that the bundle's **compiled window** is as big a
+  latency lever as its parameter count -- see the window-tax note above
+  before assuming a larger-context bundle is strictly better. Qwen3.5-9B
+  deliberately has NO entry here: it cannot be a Genie bundle today (no
+  upstream export; different architecture) and serves through
+  `run-llama-server.ps1` instead -- the whole model matrix, and a
+  box-state failure mode that can make any Genie bundle crawl at ~0.3 t/s
+  under `poll: false`, is in `MODEL_OPTIONS.md`.
