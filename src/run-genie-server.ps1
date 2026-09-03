@@ -55,16 +55,25 @@ if ($modelExplicit) {
 # Env-path id hygiene: with no -Model and no GENIE_MODEL_ID, the server falls
 # back to its own default id (qwen3-4b-npu) whatever bundle the env points at
 # -- the right bundle advertised under the wrong id. Fill the id in when the
-# bundle dir is one this map knows; say so out loud when it is not.
-if (-not $modelExplicit -and -not $env:GENIE_MODEL_ID) {
+# bundle dir is one this map knows; say so out loud when it is not. And when
+# an id IS set but disagrees with what the map says the bundle is, warn --
+# env still wins, but a stale export serving the right bundle under the wrong
+# id is exactly the silent failure this block exists to catch.
+if (-not $modelExplicit) {
     $leaf = Split-Path -Leaf $env:GENIE_BUNDLE_DIR
     $known = $Bundles.GetEnumerator() | Where-Object { $_.Value.dir -eq $leaf } | Select-Object -First 1
-    if ($known) {
-        $env:GENIE_MODEL_ID = $known.Value.id
-    } elseif ($leaf -notmatch "qwen3_4b") {
-        Write-Host "[run] note: GENIE_MODEL_ID is unset, so the server will advertise its"
-        Write-Host "[run] default id (qwen3-4b-npu) for bundle '$leaf'. Set GENIE_MODEL_ID"
-        Write-Host "[run] if anything routes on the reported model id."
+    if (-not $env:GENIE_MODEL_ID) {
+        if ($known) {
+            $env:GENIE_MODEL_ID = $known.Value.id
+        } elseif ($leaf -notmatch "qwen3_4b") {
+            Write-Host "[run] note: GENIE_MODEL_ID is unset, so the server will advertise its"
+            Write-Host "[run] default id (qwen3-4b-npu) for bundle '$leaf'. Set GENIE_MODEL_ID"
+            Write-Host "[run] if anything routes on the reported model id."
+        }
+    } elseif ($known -and $env:GENIE_MODEL_ID -ne $known.Value.id) {
+        Write-Host "[run] note: GENIE_MODEL_ID '$($env:GENIE_MODEL_ID)' does not match bundle"
+        Write-Host "[run] '$leaf' (this launcher knows it as '$($known.Value.id)'). The env value"
+        Write-Host "[run] wins and will be advertised -- unset GENIE_MODEL_ID if it is stale."
     }
 }
 
@@ -213,9 +222,12 @@ while ($true) {
                    elseif ($sawCrash)            { "crashed" }
                    else                          { "wedged" }
         Write-Host "[run] the engine $summary $restarts times in quick succession."
-        Write-Host "[run] Giving up rather than looping on a sick device. The HTP"
-        Write-Host "[run] may need a reset (reboot, or reload the driver) before"
-        Write-Host "[run] this will come back. Raise GENIE_MAX_RESTARTS to retry more."
+        Write-Host "[run] Giving up rather than looping on a sick device. The HTP may"
+        Write-Host "[run] need a reset before this comes back: from an elevated"
+        Write-Host "[run] PowerShell,  pnputil /restart-device ""ACPI\QCOM0D0A\2&DABA3FF&0"""
+        Write-Host "[run] (the Hexagon NPU node; verified fix for the interrupt-delivery"
+        Write-Host "[run] crawl -- see docs/MODEL_OPTIONS.md), or reboot. Raise"
+        Write-Host "[run] GENIE_MAX_RESTARTS to retry more."
         exit 75
     }
 

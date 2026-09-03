@@ -87,12 +87,23 @@ if ($gguf -and -not (Test-Path $gguf)) {
     exit 1
 }
 $bindHost = if ($env:LLAMA_HOST) { $env:LLAMA_HOST } else { "127.0.0.1" }
-# The bind address is not always a dialable address: probing 0.0.0.0 fails on
-# Windows, which would make the port pre-check inert AND the health loop blind
-# -- ending with this launcher killing a perfectly healthy server at timeout.
+# The bind address is not always a dialable address: the health probe cannot
+# dial 0.0.0.0 on Windows, so probe loopback when binding wildcard.
 $probeHost = if ($bindHost -eq "0.0.0.0" -or $bindHost -eq "::") { "127.0.0.1" } else { $bindHost }
 $ctx     = if ($env:LLAMA_CTX)     { $env:LLAMA_CTX }     else { "64000" }
 $threads = if ($env:LLAMA_THREADS) { $env:LLAMA_THREADS } else { "6" }
+# Health timeout: parsed and clamped HERE, before any child process exists. A
+# junk value used to throw at the [int] cast AFTER Start-Process -- the
+# launcher died and the just-started server was orphaned, unsupervised. And a
+# 0 could never mean "no wait": PS ranges descend (1..0 is TWO iterations),
+# so it produced a ~2s wait and a kill. Floor of 1s; junk falls back loudly.
+$timeout = 0
+if ($env:LLAMA_HEALTH_TIMEOUT) {
+    if (-not [int]::TryParse($env:LLAMA_HEALTH_TIMEOUT, [ref]$timeout) -or $timeout -lt 1) {
+        Write-Host "[run] WARNING: LLAMA_HEALTH_TIMEOUT='$($env:LLAMA_HEALTH_TIMEOUT)' is not a positive integer (seconds); using 1800."
+        $timeout = 1800
+    }
+} else { $timeout = 1800 }
 # Slot KV cache on disk, one dir per leg (slots from different models must not
 # mix). Anchored under genie-npu rather than the CWD-relative `cache_slots` of
 # the original hand-run command.
@@ -102,29 +113,39 @@ if (-not (Test-Path $slotDir)) { New-Item -ItemType Directory -Force $slotDir | 
 # Refuse a port something is already serving, for the same reason the Genie
 # server does: on Windows two processes can both hold a port and the OLD one
 # keeps answering, so a clean startup log proves nothing about who your
-# requests reach (it happened -- see GENIE_SERVER.md). This names the PID
-# instead of fighting it.
-$busy = $false
-try {
-    $c = New-Object Net.Sockets.TcpClient
-    $c.Connect($probeHost, [int]$port)
-    $busy = $true; $c.Close()
-} catch { }
-if ($busy) {
-    $owner = (Get-NetTCPConnection -LocalPort ([int]$port) -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess
-    Write-Host "[run] something is already serving ${probeHost}:${port} (pid $owner) -- refusing to double-bind."
-    Write-Host "[run] Stop it first (Stop-Process $owner) or set LLAMA_PORT."
+# requests reach (it happened -- see GENIE_SERVER.md). Checked via the
+# listener table, not a dial: a dial to loopback cannot see a listener bound
+# to a single non-loopback interface, and a wildcard bind coexists with such
+# a listener silently. A conflict is: we bind wildcard and ANYTHING listens
+# on the port, or something listens on wildcard, or on our exact address.
+$wildcards = @("0.0.0.0", "::")
+$conflict = Get-NetTCPConnection -LocalPort ([int]$port) -State Listen -ErrorAction SilentlyContinue |
+    Where-Object { ($bindHost -in $wildcards) -or ($_.LocalAddress -in $wildcards) -or ($_.LocalAddress -eq $bindHost) } |
+    Select-Object -First 1
+if ($conflict) {
+    Write-Host "[run] something is already listening on $($conflict.LocalAddress):${port} (pid $($conflict.OwningProcess)) -- refusing to double-bind."
+    Write-Host "[run] Stop it first (Stop-Process $($conflict.OwningProcess)) or set LLAMA_PORT."
     exit 1
 }
 
 $logDir = Join-Path $root "logs"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory $logDir | Out-Null }
-$log = Join-Path $logDir "llama-server-qwen3.5-9b-$Leg.log"
+# Port in the name, not just the leg: the refusal above says "set LLAMA_PORT"
+# to run a second instance, and two same-leg instances sharing one log file
+# would have the second TRUNCATE the first's live log (verified: the redirect
+# open succeeds against the in-use file).
+$log = Join-Path $logDir "llama-server-qwen3.5-9b-$Leg-$port.log"
 
 # Start-Process -ArgumentList under PS 5.1 joins elements with spaces and NO
 # quoting, so a path containing a space shatters into two argv entries
-# (probe-verified on this box). Quote anything path-shaped on its way in.
-function Add-Quotes([string]$s) { if ($s -match "\s") { '"' + $s + '"' } else { $s } }
+# (probe-verified on this box). Quote anything path-shaped on its way in --
+# and double any TRAILING backslashes first, because '...\' + '"' reaches the
+# child CRT as an escaped quote: the region never closes and every following
+# flag is swallowed into the value (also probe-verified).
+function Add-Quotes([string]$s) {
+    if ($s -notmatch "\s") { return $s }
+    '"' + ($s -replace '(\\+)$', '$1$1') + '"'
+}
 
 $srvArgs = @(
     "--jinja",
@@ -169,8 +190,11 @@ if ($Leg -eq "cpu") {
     # attention ops back to the CPU. Let the backend pick.
     #
     # -lv 5 because the placement check below reads the log, and at default
-    # verbosity this build prints NO device line at all -- the check would
-    # report "CPU-only" against a perfectly placed load.
+    # verbosity this build prints NO device line at all (verified: a default-
+    # verbosity launch had no 'using device' line to find) -- the check would
+    # report "CPU-only" against a perfectly placed load. The debug flood this
+    # buys is kept OUT of the console by the D-line filter in the streamer;
+    # the log file keeps everything for forensics.
     $srvArgs += @("--device", "GPUOpenCL", "-ngl", "99", "--flash-attn", "auto", "-lv", "5")
 }
 if ($alias) { $srvArgs += @("-a", (Add-Quotes $alias)) }
@@ -180,7 +204,7 @@ if ($env:LLAMA_EXTRA_ARGS) { $srvArgs += ($env:LLAMA_EXTRA_ARGS -split " ") }
 
 Write-Host "[run] starting llama-server ($Leg leg) on ${bindHost}:${port}"
 Write-Host "[run] model: $(if ($gguf) { $gguf } else { $hf + ' (HF cache; ~9.5 GB on first fetch)' })"
-Write-Host "[run] log:   $log"
+Write-Host "[run] log:   $log(.err)"
 $proc = Start-Process -FilePath $server -ArgumentList $srvArgs `
     -RedirectStandardOutput $log -RedirectStandardError ($log + ".err") `
     -NoNewWindow -PassThru
@@ -194,7 +218,11 @@ try { $null = $proc.Handle } catch { }
 # Reads share-tolerantly (FileShare ReadWrite) because the redirect writer
 # still holds the files -- [IO.File]::ReadAllText here threw "in use by
 # another process", killed the streaming loop, and the finally then stopped a
-# HEALTHY server. llama-server logs to STDERR, so both files are streamed.
+# HEALTHY server. Returns the POSITION ReadToEnd actually consumed, not a
+# pre-read Length snapshot: Length is sampled before the read while ReadToEnd
+# drains to the live EOF, so a mid-read append came back inside the text AND
+# below the returned position -- and was printed twice on the next poll
+# (probe-verified). llama-server logs to STDERR, so both files are streamed.
 function Read-NewText([string]$path, [long]$pos) {
     try {
         $fs = [IO.FileStream]::new($path, [IO.FileMode]::Open,
@@ -203,18 +231,49 @@ function Read-NewText([string]$path, [long]$pos) {
             if ($fs.Length -le $pos) { return @($pos, "") }
             $fs.Position = $pos
             $sr = [IO.StreamReader]::new($fs)
-            return @($fs.Length, $sr.ReadToEnd())
+            $text = $sr.ReadToEnd()
+            return @($fs.Position, $text)
         } finally { $fs.Dispose() }
     } catch { return @($pos, "") }
 }
 
-# Wait for health. Generous by default because a first -hf run downloads the
-# model before loading it. LLAMA_HEALTH_TIMEOUT (seconds) overrides.
-$timeout = if ($env:LLAMA_HEALTH_TIMEOUT) { [int]$env:LLAMA_HEALTH_TIMEOUT } else { 1800 }
+# Console streamer over both log files, line-buffered so the gpu leg's
+# debug-level filter sees whole lines (a chunk boundary mid-line would
+# otherwise leak fragments). At -lv 5 the server writes 15-20 "D"-severity
+# lines per decoded token; those stay in the file and out of the console.
+$stream = @{ outPos = 0L; errPos = 0L; outCarry = ""; errCarry = "" }
+$filterDebug = ($Leg -eq "gpu")
+function Drain-Logs {
+    foreach ($k in @("out", "err")) {
+        $path = if ($k -eq "out") { $log } else { $log + ".err" }
+        $r = Read-NewText $path $stream["${k}Pos"]
+        $stream["${k}Pos"] = $r[0]
+        if (-not $r[1]) { continue }
+        $data = $stream["${k}Carry"] + $r[1]
+        $nl = $data.LastIndexOf("`n")
+        if ($nl -lt 0) { $stream["${k}Carry"] = $data; continue }
+        $stream["${k}Carry"] = $data.Substring($nl + 1)
+        $lines = $data.Substring(0, $nl + 1)
+        if ($filterDebug) { $lines = $lines -replace '(?m)^\S+ D .*\r?\n', '' }
+        if ($lines) { Write-Host $lines -NoNewline }
+    }
+}
+function Flush-Carry {
+    foreach ($k in @("out", "err")) {
+        if ($stream["${k}Carry"]) { Write-Host $stream["${k}Carry"]; $stream["${k}Carry"] = "" }
+    }
+}
+
+# Wait for health on a wall-clock deadline (an iteration-counted loop ran up
+# to ~3x the stated timeout: each pass is 1s of sleep PLUS up to 2s of probe
+# timeout). The server's own output streams throughout, so a first -hf run's
+# ~9.5 GB download and the model load are visible progress, not silence.
+$deadline = (Get-Date).AddSeconds($timeout)
 $up = $false
-foreach ($i in 1..$timeout) {
+while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 1000
     if ($proc.HasExited) { break }
+    Drain-Logs
     try {
         $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 `
              "http://${probeHost}:${port}/health"
@@ -222,18 +281,18 @@ foreach ($i in 1..$timeout) {
     } catch { }
 }
 if (-not $up) {
-    # Two different failures, two different messages: a server that DIED gets
-    # its exit code and its last stderr lines surfaced (a bad -hf spec dies in
-    # seconds -- calling that "not healthy after 1800s" sends the operator
-    # hunting a timeout that never ran); one that is genuinely still silent
-    # after the full window gets the timeout message.
+    # Everything the server said is already on the console (streamed above);
+    # distinguish the two failures and name the knob instead of misreporting
+    # a death-in-seconds as an expired timeout.
+    Drain-Logs; Flush-Carry
     if ($proc.HasExited) {
-        Write-Host "[run] llama-server exited $($proc.ExitCode) during startup. Last stderr:"
-        $tail = Read-NewText ($log + ".err") 0
-        if ($tail[1]) { ($tail[1] -split "`n") | Select-Object -Last 8 | ForEach-Object { Write-Host "  $_" } }
-        Write-Host "[run] full logs: $log(.err)"
+        $code = $proc.ExitCode
+        if ($null -eq $code) { $code = 1 }
+        Write-Host "[run] llama-server exited $code during startup -- see its stderr above; full logs: $log(.err)"
     } else {
-        Write-Host "[run] server not healthy after ${timeout}s -- see $log"
+        Write-Host "[run] server not healthy after ${timeout}s (LLAMA_HEALTH_TIMEOUT, default 1800)."
+        Write-Host "[run] If the lines above show a first-run -hf download still in progress, raise"
+        Write-Host "[run] LLAMA_HEALTH_TIMEOUT or pre-download with 'hf download'. Stopping the server; logs: ${log}.err"
         Stop-Process -Id $proc.Id -Force -Confirm:$false
     }
     exit 1
@@ -259,21 +318,17 @@ Write-Host "[run] up: http://${probeHost}:${port}/v1/chat/completions  (Ctrl-C s
 
 # Stream the logs until the server exits or the operator Ctrl-Cs. finally runs
 # on Ctrl-C in PowerShell, so the child does not outlive the launcher. One
-# more drain after the loop, because a crash lands its most important lines --
-# the reason -- in the gap between the last poll and the exit.
+# more drain after the exit flag is seen, because a crash lands its most
+# important lines -- the reason -- in the gap between the last poll and the
+# exit; the carry flush gets a final unterminated line out too.
 try {
-    $posOut = 0L; $posErr = 0L
     while ($true) {
         $exited = $proc.HasExited
-        foreach ($pair in @(@($log, "out"), @(($log + ".err"), "err"))) {
-            $pos = if ($pair[1] -eq "out") { $posOut } else { $posErr }
-            $r = Read-NewText $pair[0] $pos
-            if ($r[1]) { Write-Host $r[1] -NoNewline }
-            if ($pair[1] -eq "out") { $posOut = $r[0] } else { $posErr = $r[0] }
-        }
+        Drain-Logs
         if ($exited) { break }
         Start-Sleep -Milliseconds 500
     }
+    Flush-Carry
     $code = $proc.ExitCode
     if ($null -eq $code) { $code = 1 }   # unreadable exit code is not success
     Write-Host "[run] llama-server exited $code."

@@ -45,8 +45,9 @@ should apply unchanged. Until then the 9B serves through llama.cpp.
 (fork build `llama-qnn-fork\build-arm64-windows-llvm-release` -- it carries
 the agent-mode flags and its llama-server initialises OpenCL; an earlier
 build's server could not reach the Adreno at all). Env overrides: `LLAMA_HF`
-/ `LLAMA_GGUF`, `LLAMA_PORT`, `LLAMA_CTX`, `LLAMA_THREADS`, `LLAMA_ALIAS`,
-`LLAMA_SLOT_DIR`, `LLAMA_BIN_DIR`, `LLAMA_EXTRA_ARGS`, `LLAMA_HEALTH_TIMEOUT`.
+/ `LLAMA_GGUF`, `LLAMA_HOST`, `LLAMA_PORT`, `LLAMA_CTX`, `LLAMA_THREADS`,
+`LLAMA_ALIAS`, `LLAMA_SLOT_DIR`, `LLAMA_BIN_DIR`, `LLAMA_EXTRA_ARGS`,
+`LLAMA_HEALTH_TIMEOUT`.
 
 **The quant is per-leg, and the ranking inverts between legs.**
 
@@ -134,10 +135,11 @@ degraded, not that the bundle or the model is bad.** Not memory pressure
 fast on the same warm box), not load (CPU mostly idle).
 
 **The fix is a driver restart, no reboot needed -- verified same day.** From
-an elevated shell:
+an elevated **PowerShell** (double-quoted so it also survives cmd.exe, where
+single quotes are literal and the bare `&`s split the command):
 
 ```
-pnputil /restart-device 'ACPI\QCOM0D0A\2&DABA3FF&0'
+pnputil /restart-device "ACPI\QCOM0D0A\2&DABA3FF&0"
 ```
 
 (the "Snapdragon X Elite - Hexagon NPU" ComputeAccelerator node; enumerate
