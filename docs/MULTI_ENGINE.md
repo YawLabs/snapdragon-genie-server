@@ -294,6 +294,73 @@ GPU through the same host-core mechanism the busy-wait demonstrated at 60%.
 Open question, not a closed exclusion. CPU also still matters far beyond this
 box: it is the fallback every non-Snapdragon user lands on.
 
+## The controlled poll A/B (2026-09-03) -- and a measurement bug it exposed
+
+The reversal above was never a controlled experiment: a third party flipped
+`poll` on disk between the two halves, and which half a sample belonged to was
+inferred from file mtimes. Run deliberately now -- same box, same two engines,
+same command, flag flipped between arms, nothing else touched:
+
+| | `poll: false` | `poll: true` | ratio |
+|---|---|---|---|
+| NPU solo | **18.46** t/s | 13.52 | 1.37x |
+| NPU contended | 17.00 (keeps 90.4%) | 12.23 (keeps 94.7%) | |
+| GPU solo | 18.20 | 18.47 | **1.00x** |
+| GPU contended | 14.37 (keeps 79.2%) | 11.04 (keeps 64.0%) | |
+| **aggregate, both hot** | **31.37 t/s** | **23.27 t/s** | **1.35x** |
+| vs best single engine | 1.70x | 1.26x | |
+
+**What is confirmed.** `poll: false` is worth **1.35x on aggregate
+throughput**, and the NPU's own solo rate is 1.37x -- squarely inside the
+1.45x/1.55x this repo has claimed. The arm assignment is no longer inferred:
+`poll: true` was verified live by its own signature, **291.6% CPU (2.9 cores)
+burned while completely idle**, against 0% on the other arm. That is the
+control the 08-24 measurement lacked.
+
+**What is REFUTED: the net loss.** This file and the router brief both say
+`poll: true` turns concurrency into a **0.78x loss**. It does not reproduce.
+Both arms are a GAIN over the best single engine -- 1.70x and **1.26x**. Two
+hot engines are worth running under either setting; `poll: true` just wastes
+about a quarter of the win. Prefer the aggregate row above to the
+"speedup vs best single engine" column, for exactly the reason this file
+already gives: that denominator moves with the variable under test.
+
+**The GPU solo row is the internal control, and it also corrects a claim.**
+18.20 against 18.47 is unchanged, confirming "nothing about the GPU changed".
+But that same row is measured with an IDLE `poll: true` NPU server resident,
+so the reported 25-32% penalty an idle busy-wait imposes on the GPU **does not
+appear here either** -- 2.9 spinning cores cost the GPU leg nothing measurable
+on this 12-core part. The busy-wait's cost shows up when the NPU is
+GENERATING (GPU keeps 79.2% vs 64.0%), not when it merely sits there.
+
+**The measurement bug, which is the reason this took three attempts.** The
+first two runs came back flagged SUSPECT in OPPOSITE directions (box "got
+faster", then "decayed monotonically"), with NPU solo spanning 15.99-29.32
+t/s. It was not thermal. `measure_decode` runs the same prompt at 1 token and
+at 1+N and subtracts, so prefill cancels -- but **only if both calls land on
+the same compiled graph.** At the default depth 500 with 120 tokens, the
+1-token call sits in `cl512` and the 120-token call in `cl1024`: two different
+graphs, so the prefill does not cancel and the difference is garbage. Inside a
+single graph the same engine is rock steady -- 17.91 / 18.13 / 17.70 at d250,
+15.13 / 15.07 / 14.88 at d1082, same-depth noise 0.43 t/s. Moving the A/B to
+d250 (250 + 120 = 370, entirely inside `cl512`) produced a clean run on the
+first try.
+
+**So: on a multi-length bundle, choose a depth where prompt + generated
+tokens stay inside ONE compiled length.** This is the same trap this repo
+already documented once, from the other side -- a boundary sweep that forgot
+the generation and measured a plateau. It applies to the historical numbers
+too: d469 + 120 = 589 crosses 512 on the 4096 prebuilt AND on the 8192-multi,
+so the 1.45x and every d469 figure taken with this harness carries it. That
+does not overturn them -- the arms shared the confound -- but it explains
+their run-to-run spread, and new work should not repeat it.
+
+Caveat carried: the `poll: true` arm still tripped the drift check (+12.6%,
+box got faster), so its retention percentages are flattered; the aggregate
+gap it sits inside is 35%, far larger than that drift, so the direction is
+safe. The clock dipped into the 47-64% band during every run on this box,
+as it always does under sustained load.
+
 ## Why it is still worth doing
 
 Not for memory -- capacity was never the constraint -- but, now measured, for
@@ -410,20 +477,32 @@ directions were measured and retention is roughly symmetric (72% NPU, 75% GPU).
 
 ## Open questions
 
-- **Confirm the `poll` comparison deliberately.** The 0.78x -> 1.45x reversal
-  rests on a flag that a third party changed on disk between the two halves of
-  the measurement, not on a controlled experiment. The `.orig` bundle configs
-  still carry the shipped `"poll": true`, so this is a flip, a
-  `bench_contention.py` run, a flip back and another run -- roughly fifteen
-  minutes. Cheapest high-value item on the list, and it underwrites everything
-  above.
+- ~~**Confirm the `poll` comparison deliberately.**~~ **DONE 2026-09-03, and
+  the answer splits in two.** `poll: false` is confirmed better -- but the
+  *inversion* is not. See "The controlled poll A/B" below.
 - ~~**Why is CPU decode 0.2 t/s?**~~ **Answered 2026-08-24: it was not.** The
   figure was an artifact of a busy-waiting NPU server, co-tenant benchmarks and
   an all-cores thread count. Re-measured quiet at `-t 6`: 22.57 t/s at d0,
-  13.15 at d469. What is still open is narrower -- **does a CPU leg starve the
-  GPU the way the busy-wait did?** Predicted yes through the same host-core
-  mechanism, unmeasured. CPU+NPU is the pairing most likely to work, since the
-  NPU is host-load-insensitive.
+  13.15 at d469. What was still open is narrower -- **does a CPU leg starve the
+  other engine the way the busy-wait did?** **Half-answered 2026-09-03 for
+  CPU+NPU, and the prediction was right in one direction and backwards in the
+  other.** Measured on the deployed pairing (Genie 4B on the HTP, Qwen3.5-9B
+  Q4_0 on the CPU at `-t 6`), d250, both hot:
+
+  | leg | solo | contended | keeps |
+  |---|---|---|---|
+  | NPU 4B | 18.72 t/s | 17.63 | **92.6%** |
+  | CPU 9B | 11.62 t/s | 6.67 (5.32-10.24) | **~57%** |
+
+  So the NPU shrugs the CPU leg off, exactly as "host-load-insensitive"
+  predicts -- but the CPU leg pays heavily, which the host-core story does not
+  explain and bandwidth does: the 9B streams ~5.4 GB of weights per token
+  (~63 GB/s at 11.6 t/s) against the NPU's ~2.1 GB (~39 GB/s), so together
+  they ask ~100 GB/s of a bus that delivers 105-115. **The bigger model is
+  the one that starves.** Aggregate is still a gain -- 24.30 t/s against
+  18.72 for the best single engine, 1.30x. Caveats: the contended CPU samples
+  are noisy (5.32-10.24) and a closing solo re-check came back 15% low, so
+  treat ~57% as a floor on retention. CPU+GPU remains unmeasured.
 - **Does a second resident model change the NPU's `1003` rate?** Memory pressure
   is a plausible aggravator; unproven.
 - **Is there headroom for a third engine at all?** The pair already draws

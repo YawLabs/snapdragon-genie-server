@@ -14,10 +14,23 @@
 # THE QUANT IS PER-LEG, AND THE RANKING INVERTS BETWEEN THEM. Measured on this
 # box (Qwen3-4B, d0): on the Adreno OpenCL leg Q4_K_M decodes 19.39 t/s against
 # Q8_0's 9.14 -- the OpenCL SOA_Q/Adreno kernels target Q4, so the bigger file
-# is also the slower one there. On the CPU leg the KleidiAI int8 kernels favour
-# Q8_0 (the build itself warns: no KleidiAI kernel for q4_K). Hence: cpu leg =
-# Q8_0, gpu leg = Q4_K_M. Do not "upgrade" the GPU leg to Q8_0 for quality; it
-# costs half the throughput.
+# is also the slower one there. On the CPU leg the KleidiAI int8 kernels
+# accelerate Q4_0 and Q8_0 only (the build warns outright on q4_K). Hence:
+# cpu leg = Q4_0, gpu leg = Q4_K_M. Do not "upgrade" the GPU leg to Q8_0 for
+# quality; it costs half the throughput.
+#
+# THE CPU LEG IS Q4_0, NOT Q8_0, AND THAT IS A CORRECTNESS FIX (2026-09-03).
+# unsloth/Qwen3.5-9B-GGUF:Q8_0 does not GENERATE on this build: every request
+# came back empty (one token, finish_reason stop) through the chat endpoint,
+# and the raw /completion endpoint -- which bypasses the template entirely --
+# returned an immediate EOS or a run of bare newlines. It was not the
+# template, the flags, or the backend: same build, same CPU backend, same
+# minimal args, only the quant varying, gave coherent text on Q4_K_M
+# (10.40 t/s) and on Q4_0 (12.00 t/s) while Q8_0 produced newlines at a
+# physically impossible 66 t/s -- the tell that it was not computing the
+# model at all. Q4_0 is therefore both the working quant AND the
+# KleidiAI-accelerated one, so nothing is given up by the switch. The GPU
+# leg's Q4_K_M was never affected (it answered correctly throughout).
 #
 # Env vars (LLAMA_*) are INPUTS ONLY -- this script never writes them back.
 # That is deliberate: an interactive `.\run-llama-server.ps1` runs in the
@@ -51,11 +64,12 @@ if (-not (Test-Path $server)) {
 $hf = $env:LLAMA_HF
 $gguf = $env:LLAMA_GGUF
 if ($Leg -eq "cpu") {
-    # The operator's known-good CPU serving config, encoded rather than
-    # reinvented. Q8_0 via -hf: llama-server fetches into the HF cache itself
-    # (~9.5 GB once). 8080 because this leg IS typed's local endpoint; the
-    # Genie NPU server stays on 8123.
-    if (-not ($hf -or $gguf)) { $hf = "unsloth/Qwen3.5-9B-GGUF:Q8_0" }
+    # The operator's CPU serving config, with the quant corrected to Q4_0 (see
+    # the correctness note above -- Q8_0 does not generate on this build).
+    # Via -hf: llama-server fetches into the HF cache itself (~5.4 GB once).
+    # 8080 because this leg IS typed's local endpoint; the Genie NPU server
+    # stays on 8123.
+    if (-not ($hf -or $gguf)) { $hf = "unsloth/Qwen3.5-9B-GGUF:Q4_0" }
     $port  = if ($env:LLAMA_PORT) { $env:LLAMA_PORT } else { "8080" }
     # No -a by default on this leg, deliberately: without it the server
     # reports the -hf spec ("unsloth/Qwen3.5-9B-GGUF:Q8_0"), which is what
@@ -75,8 +89,14 @@ if ($Leg -eq "cpu") {
 # out loud when it lands the known-wrong quant on an engine. Warn, not refuse:
 # the operator may be measuring exactly this.
 $src = "$hf$gguf"
+if ($src -match "Q8_0") {
+    Write-Host "[run] WARNING: a Q8_0 model is selected. On this build Qwen3.5-9B Q8_0 does"
+    Write-Host "[run] NOT generate -- empty completions / bare newlines, verified against the"
+    Write-Host "[run] raw /completion endpoint. If output comes back empty, that is why; use"
+    Write-Host "[run] Q4_0 (cpu leg default) or Q4_K_M (gpu leg default) instead."
+}
 if ($Leg -eq "gpu" -and $src -match "Q8_0") {
-    Write-Host "[run] WARNING: Q8_0 on the Adreno leg -- measured HALF the throughput of Q4_K_M there. An exported LLAMA_HF/LLAMA_GGUF is overriding the gpu-leg default."
+    Write-Host "[run] WARNING: Q8_0 on the Adreno leg also measured HALF the throughput of Q4_K_M there."
 }
 if ($Leg -eq "cpu" -and $src -match "Q4_K") {
     Write-Host "[run] WARNING: Q4_K on the CPU leg -- KleidiAI has no q4_K kernel (Q4_0/Q8_0 only), so this serves unaccelerated. An exported LLAMA_HF/LLAMA_GGUF is overriding the cpu-leg default."

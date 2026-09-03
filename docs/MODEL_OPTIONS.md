@@ -37,7 +37,51 @@ Checked 2026-09-03, three independent ways:
 
 When qai-hub-models grows a `qwen3_5_9b` export target, the normal chain
 (`docs/IMPLEMENTATION_PLAN.md`, `export-8192-multi.sh` in the artifacts dir)
-should apply unchanged. Until then the 9B serves through llama.cpp.
+should apply unchanged. Until then the 9B serves through llama.cpp. A weekly
+cloud routine ("Watch Qwen3.5-9B Genie export") checks for the target
+landing, and `publish/qwen3.5-9b-genie-npu/` holds a ready-to-go Hugging
+Face model card + validated publish script so the resulting bundle can ship
+publicly the day it exists (`publish.ps1 -CardOnly` creates the private repo
+now; needs `hf auth login` with a write token first).
+
+## GenieX: Qwen3.5 DOES reach the NPU now -- it is just not worth it yet (2026-09-03)
+
+The "GenieX crashes on Qwen3.5 NPU" caveat above is STALE: qualcomm/GenieX
+issue #1178 was fixed in PR #1248 (merged 2026-08-03 -- the VLM projector was
+initialising the OpenCL backend on NPU runs), and GenieX CLI v0.5.0 carries
+the fix. Installed and verified on this box (installer:
+`qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-geniex/geniex-cli.exe`,
+lands in `%LOCALAPPDATA%\GenieX CLI`, bundles QAIRT 2.45 + a llama.cpp
+runtime with the experimental ggml-hex Hexagon backend):
+
+```
+geniex pull unsloth/Qwen3.5-9B-GGUF:Q4_0
+geniex infer unsloth/Qwen3.5-9B-GGUF:Q4_0 --compute npu --think=false -p "..."
+```
+
+Placement is real -- the debug log shows `ggml-hex: Hexagon Arch version
+v73`, an HTP0 session allocated over FastRPC, and layers assigned to HTP0.
+(No NPU perf-counter set exists on this box, so the log is the only placement
+probe.) But single-sample rates, warm loaded box, no cool gate -- indicative
+only:
+
+| Qwen3.5 Q4_0 | `--compute npu` | `--compute cpu` | `hybrid` |
+|---|---|---|---|
+| 0.8B | 28.3 t/s | **56.8** | -- |
+| 9B | 6.7 t/s | **16.0** | 9.6 |
+
+CPU beats the ggml-hex NPU path ~2.4x at both sizes, so GenieX buys no
+throughput today -- the fork llama-server legs above remain the way to serve
+this model. What the probe DID establish: Qwen3.5 executes on the Hexagon
+without crashing (fix confirmed), `hybrid` does not crash on X Elite (the
+still-open #1250 hybrid crash is a QCS9075/OpenCL issue), and the ggml-hex
+path is a second, GGUF-native road to the NPU that needs no AI Hub export --
+worth re-probing each GenieX release, since the backend is marked
+experimental and 6.7 t/s is already within 2x of what a native w4a16 Genie
+bundle of this size should do (~8 t/s by bandwidth scaling from the 8B's
+~12). Note `geniex infer` takes catalogue/HF names only -- it cannot serve a
+local GGUF path, so its cache duplicates any GGUF the llama legs already
+have.
 
 ## The Qwen3.5-9B llama-server legs
 
@@ -51,11 +95,14 @@ build's server could not reach the Adreno at all). Env overrides: `LLAMA_HF`
 
 **The quant is per-leg, and the ranking inverts between legs.**
 
-- **CPU leg (default): Q8_0.** KleidiAI's int8 kernels accelerate Q4_0 and
+- **CPU leg (default): Q4_0.** KleidiAI's int8 kernels accelerate Q4_0 and
   Q8_0 -- and nothing else. The build says so itself when handed the wrong
   one: `kleidiai: no kernel for tensor type q4_K, not accelerated by KleidiAI
   (kernels available for Q4_0 and Q8_0)`. Fetched by the server via
-  `-hf unsloth/Qwen3.5-9B-GGUF:Q8_0` (~9.5 GB, HF cache, once).
+  `-hf unsloth/Qwen3.5-9B-GGUF:Q4_0` (~5.4 GB, HF cache, once). **It was Q8_0
+  until 2026-09-03 -- see the correctness note below; Q8_0 does not generate
+  on this build, and Q4_0 is both the working quant and a KleidiAI one, so
+  the switch gives up nothing.**
 - **GPU leg (`-Leg gpu`): Q4_K_M.** The OpenCL SOA_Q / Adreno kernels target
   Q4: measured on this box (Qwen3-4B, d0), Q4_K_M decodes 19.39 t/s against
   Q8_0's 9.14 -- the bigger file is also the slower one there. Local file at
@@ -74,6 +121,31 @@ box silently serving from the CPU while asked for the GPU. Smoke-verified
 decode, server-reported **prefill 36.2 t/s, decode 5.6 t/s** -- taken on a
 warm, loaded box (the CPU 9B resident, ~4-6 GB free RAM), so treat as a
 floor, not a rate.
+
+## Qwen3.5-9B Q8_0 does not generate on this build (2026-09-03)
+
+The CPU leg served **empty completions** -- one token, `finish_reason: stop`,
+`content: ""` -- for every request. Not the chat template: the raw
+`/completion` endpoint, which bypasses the template entirely, returned
+`stop_type: eos` after one token too. Not the flags, not the backend. Same
+build, same CPU backend, same minimal args, varying only the quant:
+
+| quant | output | decode |
+|---|---|---|
+| **Q8_0** | empty, or a run of bare newlines | 66 t/s -- physically impossible for a 9.5 GB model on 6 cores, the tell that it was not computing the model |
+| Q4_K_M | coherent | 10.40 t/s |
+| **Q4_0** | coherent | **12.00 t/s** |
+
+So the CPU leg default is now Q4_0, verified end-to-end through the launcher
+with the full production flag set (11.73 t/s, coherent answer). The GPU leg's
+Q4_K_M was never affected. The launcher warns on any Q8_0 selection rather
+than silently serving nothing.
+
+Worth stating plainly because it is the kind of failure that hides: the server
+starts, reports healthy, answers every request with HTTP 200, and returns an
+empty string. `/health` and `/props` cannot see it. **A launcher smoke test
+that only checks health would pass on a server that generates nothing** --
+check for non-empty content.
 
 The CPU leg's alias is deliberately the bare `-hf` spec
 (`unsloth/Qwen3.5-9B-GGUF:Q8_0`): that is what the hand-run instances have
