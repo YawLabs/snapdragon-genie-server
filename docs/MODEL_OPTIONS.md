@@ -183,9 +183,56 @@ steady-state config (`poll: false`, interrupts healthy -- see the next
 section) 110 tokens in 9.5s end-to-end, ~12 t/s effective.
 
 Expect roughly half the 4B's decode at the same window -- decode here is
-bandwidth-bound and the 8B moves ~2x the weight bytes per token. Its window
-is 4096 (the prebuilt's); an 8192 multi-length export via the normal chain
-is the upgrade path if the window matters more than the download.
+bandwidth-bound and the 8B moves ~2x the weight bytes per token.
+
+## The 8B 8192 multi-length tier (2026-09-04)
+
+`run-genie-server.ps1 -Model qwen3-8b-8192` serves a self-exported 8192
+multi-length build (`qwen3_8b-genie-w4a16-x-elite-ctx8192-multi`, id
+`qwen3-8b-8192-npu`) -- twice the prebuilt's window, `context_lengths
+[512, 1024, 2048, 4096, 8192]` so a short prompt still runs against the
+smallest graph that fits. The 4096 prebuilt stays the default 8B: on this
+engine a bigger compiled window is a per-token tax, not a free upgrade.
+
+Measured decode, boundary-safe depths (prompt + generated tokens inside one
+compiled length):
+
+| depth | decode | note |
+|---|---|---|
+| 250 | **10.92 t/s** | same-depth noise 0.13 t/s over n=3 |
+| 978 | 10.08 t/s | flat with depth, as multi-length predicts |
+
+**Condition, because it matters:** taken with the box ON BATTERY at 33%
+pack, clock sampled 22-49% of base. Decode is largely immune to pack state
+on this hardware (17.70 charging at 33% against 17.91 settled elsewhere in
+these docs) and the samples are tight, so treat these as sound for decode
+and do NOT quote any prefill figure from that run.
+
+**Install notes.** The export's own directory name is byte-identical to the
+prebuilt's (`qwen3_8b-genie-w4a16-qualcomm_snapdragon_x_elite`), so it MUST
+be renamed on install or it silently overwrites the working 4096 bundle.
+Both per-machine fixes were applied (`poll: false`, token-penalty
+1.15/128/0.3) with `genie_config.json.orig` kept beside them.
+
+**Export provenance.** Three attempts, ~9 hours. The first died after
+uploading all five parts without creating a single AI Hub job (nothing
+recoverable). The second was killed mid-upload when WSL ITSELF restarted --
+`uptime: up 0 minutes`, no EXIT line, no traceback, dmesg gone with the VM.
+The third succeeded (`EXIT=0`, 4h40m) after capping WSL memory in
+`.wslconfig` (10 GB + 16 GB swap, against an unbounded ~15.8 GB default)
+and freeing the ~6 GB the 9B leg held. Worth knowing that `EXIT=1` alone
+does not mean failure here: the 4B's own successful export also exited 1,
+throwing at `LINKING_MODELS` after its jobs existed, and was recovered by
+job id. What separates the cases is whether AI Hub jobs were created --
+check for job ids before concluding anything is lost.
+
+**A WSL restart appears to degrade HTP interrupt delivery.** The first smoke
+test of this bundle ran at ~0.5 t/s (87 tokens in flight after three
+minutes) with `/health` reporting a healthy, generating engine. That is the
+documented interrupt-degradation signature, and
+`pnputil /restart-device "ACPI\QCOM0D0A\2&DABA3FF&0"` from an elevated
+PowerShell restored it immediately -- 107 tokens in 10.7s. Suspect the
+device, not the bundle, when a fresh export seems catastrophically slow.
 
 ## 2026-09-03: interrupt delivery can degrade, and then `poll: false` is the slow setting
 

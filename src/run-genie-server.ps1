@@ -8,7 +8,7 @@
 # feature request); it serves through src\run-llama-server.ps1 instead. See
 # docs/MODEL_OPTIONS.md for the whole model matrix.
 param(
-    [ValidateSet("qwen3-4b", "qwen3-8b")]
+    [ValidateSet("qwen3-4b", "qwen3-8b", "qwen3-8b-8192")]
     [string]$Model = "qwen3-4b"
 )
 $ErrorActionPreference = "Stop"
@@ -19,9 +19,15 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 # `qai-hub-models fetch qwen3_8b -r genie -p w4a16 -c qualcomm-snapdragon-x-elite`),
 # multi-length [512..4096] out of the box -- apply the per-machine config fixes
 # (poll: false, token-penalty) before first serve; see docs/MODEL_OPTIONS.md.
+# qwen3-8b is the AI Hub PREBUILT (4096); qwen3-8b-8192 is the self-exported
+# 8192 multi-length build (2026-09-04) -- twice the window, and multi-length
+# so a short prompt still runs against the smallest graph that fits. Both are
+# 8B w4a16; they differ only in compiled window, which on this engine is a
+# per-token tax rather than a free upgrade, so the 4096 stays the default 8B.
 $Bundles = @{
-    "qwen3-4b" = @{ dir = "qwen3_4b-genie-w4a16-x-elite-ctx8192-multi";        id = "qwen3-4b-npu" }
-    "qwen3-8b" = @{ dir = "qwen3_8b-genie-w4a16-qualcomm_snapdragon_x_elite"; id = "qwen3-8b-npu" }
+    "qwen3-4b"      = @{ dir = "qwen3_4b-genie-w4a16-x-elite-ctx8192-multi";       id = "qwen3-4b-npu" }
+    "qwen3-8b"      = @{ dir = "qwen3_8b-genie-w4a16-qualcomm_snapdragon_x_elite"; id = "qwen3-8b-npu" }
+    "qwen3-8b-8192" = @{ dir = "qwen3_8b-genie-w4a16-x-elite-ctx8192-multi";       id = "qwen3-8b-8192-npu" }
 }
 $DefaultBundle = $Bundles[$Model].dir
 # For the 4B, swap to ...qualcomm_snapdragon_x_elite (4096, also multi-length)
