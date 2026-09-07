@@ -1,0 +1,44 @@
+snapdragon-npu-llm
+Copyright 2026 Jeff Yaw
+
+This product includes software developed by Jeff Yaw, licensed under the
+Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------
+Qwen3 chat template
+--------------------------------------------------------------------------
+
+src/genie_server.py renders Qwen3's tool-calling chat template by hand
+(the server is stdlib-only and cannot run Jinja). The preamble strings, the
+tag names and their ordering are reproduced verbatim from the Qwen3 model
+bundle's own tokenizer_config.json chat_template.
+
+Qwen3 is Copyright (c) Alibaba Cloud, licensed under the Apache License,
+Version 2.0. No Qwen3 weights, tokenizer files or bundle artifacts are
+distributed with this repository.
+
+--------------------------------------------------------------------------
+Qualcomm QAIRT / Genie API declarations
+--------------------------------------------------------------------------
+
+src/genie_server.py declares a small set of constants, enum values and
+ctypes function signatures for Qualcomm's Genie C API, derived from the
+published headers (include/Genie/GenieDialog.h, GenieCommon.h, GenieSampler.h
+and GenieTokenizer.h) in the QAIRT SDK. These are interoperability declarations reimplemented in
+Python so that this program can call the library; no Qualcomm source code,
+object code, header file or other SDK material is included or redistributed
+here. The QAIRT SDK is obtained separately by the user, directly from
+Qualcomm, under Qualcomm's own license terms.
+
+--------------------------------------------------------------------------
+Trademarks
+--------------------------------------------------------------------------
+
+Snapdragon, Hexagon, Adreno and Qualcomm are trademarks or registered
+trademarks of Qualcomm Incorporated or its subsidiaries; Qualcomm AI Runtime
+(QAIRT) and Genie are Qualcomm Technologies product names. Windows and ONNX
+Runtime are trademarks of Microsoft Corporation. Qwen is a trademark of
+Alibaba Group. These marks are used here only to identify the hardware and
+software this project runs on. This project is not affiliated with,
+sponsored by, or endorsed by any of them, and no endorsement is implied by
+any measurement published here.

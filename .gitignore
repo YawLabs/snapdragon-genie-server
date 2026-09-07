@@ -10,6 +10,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 
 # generated / downloaded models
 *.onnx
@@ -23,3 +24,7 @@ htmlcov/
 
 # logs / scratch
 *.log
+
+# staging for a Hugging Face model release -- deliberately untracked, so a
+# `git add -A` cannot sweep an unpublished model card into this repo
+/publish/
