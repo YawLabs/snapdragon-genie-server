@@ -362,7 +362,7 @@ def test_context_size_falls_back_when_unreadable(gs, tmp_path, monkeypatch):
 # --- bundle configuration --------------------------------------------------
 # The two settings that decide most of this server's throughput were the two
 # nothing read. `poll: true` ships as the default, busy-waits on ~2.7 host
-# cores while idle and costs up to 55% of decode; a single-length bundle runs
+# cores while idle and costs up to 36% of decode; a single-length bundle runs
 # every token against its whole compiled window and is 2-3x slower on short
 # prompts than a multi-length one at the SAME n_ctx. Both were left to whoever
 # remembered the docs, in a server that otherwise derives and asserts every
@@ -545,7 +545,7 @@ def test_a_real_list_is_read_normally(gs, tmp_path):
 def test_poll_is_found_in_a_real_genie_config(gs, tmp_path):
     # Everything above pins _POLL_MATCHES by hand, so the search had never
     # actually run against a file. A read that silently returns nothing reports
-    # a busy-waiting bundle as unconfigured -- 2.7 idle cores and up to 55% of
+    # a busy-waiting bundle as unconfigured -- 2.7 idle cores and up to 36% of
     # decode, unremarked.
     (tmp_path / "genie_config.json").write_text(json.dumps({
         "dialog": {

@@ -146,3 +146,34 @@ def test_a_dropped_record_forces_the_next_plan_to_reset(eng):
     eng._commit("USER: hi\nhelloUSER: more\n", "x", False)
     _t, reused = eng._plan("USER: hi\nhelloUSER: more\nxUSER: again\n")
     assert reused is False, "a failed turn must force a re-prefill"
+# --- status codes -> finish_reason ----------------------------------------
+# Pinned against QAIRT 2.45's GenieCommon.h, because the constants were wrong
+# and nothing here noticed: CONTEXT_EXCEEDED was declared as 1, which is the
+# value of ABORTED. The two failures are each other's mirror image, and both
+# are invisible without hardware -- which is exactly why the mapping is worth
+# a device-free test even though the calls it decodes are not.
+
+def test_a_context_full_generation_reports_length_rather_than_raising(gs):
+    # GENIE_STATUS_WARNING_CONTEXT_EXCEEDED is 4. Declared as 1, a real
+    # context-full generation fell through to the raise and surfaced as a 500
+    # on a request that had in fact produced a complete, usable answer.
+    assert gs.GENIE_STATUS_WARNING_CONTEXT_EXCEEDED == 4
+    assert gs.GenieEngine._finish(4) == "length"
+
+
+def test_an_aborted_generation_is_not_an_error(gs):
+    # ABORTED is 1, and it is this server's OWN signal_abort landing after the
+    # client hung up -- so it reports like any other early stop. Under the old
+    # constants it returned "length", claiming the model hit the context wall
+    # when the truth was that nobody was listening any more.
+    assert gs.GENIE_STATUS_WARNING_ABORTED == 1
+    assert gs.GenieEngine._finish(1) == "stop"
+
+
+def test_a_real_error_status_still_raises(gs):
+    # The guard the two fixes above must not have widened: a genuine failure
+    # (-6 is GENIE_STATUS_ERROR_QUERY_FAILED) still raises rather than being
+    # decoded into a plausible finish_reason.
+    assert gs.GenieEngine._finish(gs.GENIE_STATUS_SUCCESS) == "stop"
+    with pytest.raises(RuntimeError, match="status=-6"):
+        gs.GenieEngine._finish(-6)

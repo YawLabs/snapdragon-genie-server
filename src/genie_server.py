@@ -53,6 +53,11 @@ HOST = os.environ.get("GENIE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("GENIE_PORT", "8080"))
 MODEL_ID = os.environ.get("GENIE_MODEL_ID", "qwen3-4b-npu")
 DEFAULT_MAX_TOKENS = int(os.environ.get("GENIE_MAX_TOKENS", "512"))
+# Ceiling on a request body, checked BEFORE the read. 8 MB is orders of
+# magnitude above any legitimate prompt at n_ctx 16384; the point is that
+# Content-Length was previously trusted and read in full, ahead of the
+# single-flight semaphore, so MAX_INFLIGHT did not bound it.
+MAX_BODY_BYTES = int(os.environ.get("GENIE_MAX_BODY_BYTES", str(8 * 1024 * 1024)))
 STRIP_THINK = os.environ.get("GENIE_STRIP_THINK", "0") == "1"
 # Qwen3 is a reasoning model: left alone it emits a <think> block before every
 # answer. Measured on this box, a single tool-calling turn spent ~280 of its
@@ -286,7 +291,7 @@ def read_poll_setting():
     most consequential thing about a bundle and it ships in the wrong state.
     `"poll": true` busy-waits: measured here, a server that has answered nothing
     but /health burns 270% CPU -- 2.7 cores -- while completely idle, and it
-    costs up to 55% of decode on top. It also decides whether running this
+    costs up to 36% of decode on top. It also decides whether running this
     engine beside a GPU one is a 1.45x gain or a 0.78x LOSS, because the OpenCL
     backend needs those same host cores to dispatch a kernel per token.
 
@@ -465,7 +470,7 @@ def bundle_config_warnings():
     elif poll:
         out.append(
             "WARNING: this bundle has %s = %s. It busy-waits: ~2.7 host "
-            "cores burned while IDLE, up to 55%% of decode lost, and NPU+GPU "
+            "cores burned while IDLE, up to 36%% of decode lost, and NPU+GPU "
             "concurrency turned from a 1.45x gain into a 0.78x loss. Set it to "
             "false in genie_config.json and restart -- nothing measured got "
             "worse." % (where or "QnnHtp.poll", json.dumps(poll)))
@@ -518,6 +523,28 @@ def bundle_config_warnings():
             "of the SAME window. Re-export with several --context-lengths "
             "(+3.8%% size, zero extra HTP memory)." % lengths)
     return out
+
+
+LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+def host_exposure_warning(host=None):
+    """One WARNING line when the bind address is not loopback, else None.
+
+    A sibling of bundle_config_warnings and the same contract: warn, never
+    refuse. Exposing this deliberately behind a proxy is a legitimate thing to
+    do, and the docs describe how. Doing it without knowing there is no auth in
+    front of it is not, and the docs used to describe that too -- 0.0.0.0 was
+    written up as a supported option with nothing attached about what it costs.
+    """
+    host = HOST if host is None else host
+    if host in LOOPBACK_HOSTS:
+        return None
+    return ("WARNING: bound to %s, which is not loopback, and this server has "
+            "NO authentication. Anyone who can reach this port can use the "
+            "NPU, read what it generates, and wedge the device for every other "
+            "client. Put something in front of it, or set "
+            "GENIE_HOST=127.0.0.1." % host)
 
 
 LIB_DIR = os.path.join(SDK_DIR, "lib", "aarch64-windows-msvc")
@@ -573,10 +600,20 @@ def hexagon_search_path():
 
 
 # ---------------------------------------------------------------------------
-# Genie C API (from include/Genie/GenieDialog.h + GenieCommon.h)
+# Genie C API (from include/Genie/GenieDialog.h, GenieCommon.h,
+# GenieSampler.h and GenieTokenizer.h)
 # ---------------------------------------------------------------------------
 GENIE_STATUS_SUCCESS = 0
-GENIE_STATUS_WARNING_CONTEXT_EXCEEDED = 1  # non-fatal (context full)
+# The four non-fatal warnings, verbatim from GenieCommon.h (QAIRT 2.45).
+# CONTEXT_EXCEEDED was declared here as 1 for a long time, which is the value
+# of ABORTED -- so a context-full generation fell through to the raise below
+# and surfaced as a 500, while an aborted one reported "length". Both are
+# wrong and they are each other's symptom, which is why the whole set is
+# declared now rather than the one constant that happened to be needed.
+GENIE_STATUS_WARNING_ABORTED = 1
+GENIE_STATUS_WARNING_BOUND_HANDLE = 2
+GENIE_STATUS_WARNING_PAUSED = 3
+GENIE_STATUS_WARNING_CONTEXT_EXCEEDED = 4
 
 # GenieDialog_SentenceCode_t
 SENTENCE_COMPLETE = 0
@@ -598,7 +635,8 @@ ALLOC_CALLBACK = C.CFUNCTYPE(None, C.c_size_t, C.POINTER(C.c_char_p))
 # Qwen3's tool convention, lifted verbatim from the bundle's own
 # tokenizer_config.json chat_template (the Jinja one). We render it by hand
 # because this server is stdlib-only -- no Jinja -- but the strings and the
-# ordering below are the template's, not invented.
+# ordering below are the template's, not invented. Qwen3 is (c) Alibaba
+# Cloud and Apache-2.0 licensed; see NOTICE.
 _TOOLS_PREAMBLE_HEAD = """# Tools
 
 You may call one or more functions to assist with the user query.
@@ -1038,11 +1076,17 @@ class GenieEngine:
 
     @staticmethod
     def _finish(status):
+        """Genie status -> OpenAI finish_reason.
+
+        ABORTED is not a failure: it is this server's own signal_abort landing
+        after the client hung up, so it reports like any other early stop
+        rather than raising into a request nobody is reading any more.
+        """
         if status == GENIE_STATUS_WARNING_CONTEXT_EXCEEDED:
             return "length"
-        if status != GENIE_STATUS_SUCCESS:
-            raise RuntimeError("GenieDialog_query failed, status=%d" % status)
-        return "stop"
+        if status in (GENIE_STATUS_SUCCESS, GENIE_STATUS_WARNING_ABORTED):
+            return "stop"
+        raise RuntimeError("GenieDialog_query failed, status=%d" % status)
 
     def set_stop_sequences(self, seqs):
         """Apply per-request stop sequences, clearing any previous ones.
@@ -1544,6 +1588,55 @@ def read_default_sampler():
     # the two cannot disagree. The {"version": 1} fallback stays: this value is
     # a RESTORE BASELINE, and an empty dict would restore nothing.
     return dict(read_sampler()) or {"version": 1}
+
+
+def _is_message_list(messages):
+    """True only for the shape both prompt builders assume: a list of objects.
+
+    `"messages": "hi"` and `["hi"]` are both truthy, so they cleared the
+    required-check and then died inside the template render -- out of do_POST,
+    with no response written at all. A client cannot tell that apart from the
+    server having died, which is the worst answer available at the one moment
+    it needs a real one.
+    """
+    return isinstance(messages, list) and all(isinstance(m, dict) for m in messages)
+
+
+def _max_tokens(req):
+    """`max_tokens`, clamped to something the engine can actually honour.
+
+    GenieDialog_setMaxNumTokens takes a c_uint32, so a negative value does not
+    error -- it wraps, and -1 reaches the HTP as 4294967295. Neither downstream
+    guard catches that: build_windowed budgets with max(0, max_tokens), so a
+    negative reads as zero there and the overflow 400 never fires either. The
+    request is admitted and then holds the single-flight NPU until it walks
+    into the context wall. Two guards each seeing a different number is the
+    reason this clamps at the door instead of trusting either.
+
+    Falsy (absent, 0, false) keeps the old default. Anything past the window is
+    clamped to it, which leaves the honest overflow 400 downstream intact.
+    """
+    raw = req.get("max_tokens")
+    if raw is None or raw == 0:
+        return DEFAULT_MAX_TOKENS
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        raise ValueError("max_tokens must be an integer, got %r" % (raw,))
+    try:
+        n = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is the one json.loads can actually produce: Infinity
+        # and NaN are accepted by the parser, and int(float('inf')) raises
+        # OverflowError rather than ValueError.
+        raise ValueError("max_tokens must be an integer, got %r" % (raw,)) from None
+    if n < 1:
+        raise ValueError("max_tokens must be >= 1, got %d" % n)
+    # NOT clamped to the window. Anything that large fails the fits check in
+    # build_windowed a few lines later and gets the honest overflow 400, which
+    # names the number the CLIENT sent and tells them to lower it -- advice
+    # that only works if the figure quoted back is theirs. Clamping here would
+    # have silently rewritten it to the window size first. The fits check is
+    # also what bounds this below 2**32 before it reaches c_uint32.
+    return n
 
 
 def _stop_sequences(req):
@@ -2297,9 +2390,44 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.rstrip("/")
         try:
             length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._request_error(400, "bad Content-Length header", path)
+            self.close_connection = True
+            return
+        # This server reads exactly Content-Length bytes, so a chunked body
+        # would leave its frames unread and desync the next request on a
+        # keep-alive connection -- answered rather than half-consumed.
+        if self.headers.get("Transfer-Encoding"):
+            self._request_error(411, "chunked bodies are not supported; "
+                                     "send Content-Length", path)
+            self.close_connection = True
+            return
+        # Both bounds BEFORE the read and before the single-flight semaphore,
+        # which is the whole point: MAX_INFLIGHT bounds generations, not bytes,
+        # so neither was reachable only via a permit. The negative half is the
+        # one that bites hardest -- rfile.read(-1) reads to EOF, which on a
+        # keep-alive socket never comes, so a single request with
+        # `Content-Length: -1` parks a handler thread for the life of the
+        # process and costs nothing to send.
+        if length < 0:
+            self._request_error(400, "negative Content-Length", path)
+            self.close_connection = True
+            return
+        if length > MAX_BODY_BYTES:
+            self._request_error(413, "request body too large: %d bytes (limit %d)"
+                                % (length, MAX_BODY_BYTES), path)
+            self.close_connection = True
+            return
+        try:
             req = json.loads(self.rfile.read(length) or b"{}")
         except Exception as e:
             self._request_error(400, "bad JSON: %s" % e, path)
+            return
+        # Valid JSON that is not an object used to reach req.get() and raise,
+        # which drops the connection with no response at all -- the one failure
+        # a client cannot distinguish from the server being dead.
+        if not isinstance(req, dict):
+            self._request_error(400, "body must be a JSON object", path)
             return
         gen = {"/v1/chat/completions": self._openai_chat,   # OpenAI Chat Completions
                "/v1/messages": self._anthropic_messages      # Anthropic Messages (typed)
@@ -2345,9 +2473,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": {"message": "messages required",
                                        "type": "invalid_request_error"}})
             return
+        if not _is_message_list(messages):
+            self._json(400, {"error": {"message": "messages must be a list of objects",
+                                       "type": "invalid_request_error"}})
+            return
         tools = req.get("tools") or None
         stream = bool(req.get("stream", False))
-        max_tokens = int(req.get("max_tokens") or DEFAULT_MAX_TOKENS)
+        try:
+            max_tokens = _max_tokens(req)
+        except ValueError as e:
+            self._request_error(400, str(e))
+            return
         # Resolved ONCE and threaded through, rather than re-derived downstream.
         # It decides both what goes into the prompt and whether a closing think
         # tag in the OUTPUT can be ours to strip, and those two answers have to
@@ -2601,8 +2737,16 @@ class Handler(BaseHTTPRequestHandler):
         if not req.get("messages"):
             self._anthropic_error(400, "invalid_request_error", "messages required")
             return
+        if not _is_message_list(req.get("messages")):
+            self._anthropic_error(400, "invalid_request_error",
+                                  "messages must be a list of objects")
+            return
         model = req.get("model") or MODEL_ID
-        max_tokens = int(req.get("max_tokens") or DEFAULT_MAX_TOKENS)
+        try:
+            max_tokens = _max_tokens(req)
+        except ValueError as e:
+            self._anthropic_error(400, "invalid_request_error", str(e))
+            return
         tools = req.get("tools") or None
         prompt, dropped, fits, overhead = _anthropic_to_prompt(
             req, tools=tools, max_tokens=max_tokens)
@@ -2904,6 +3048,9 @@ def main():
     ENGINE.default_sampler = read_default_sampler()
     srv = Server((HOST, PORT), Handler)
     print("[genie] endpoint on http://%s:%d  (model=%s)" % (HOST, PORT, MODEL_ID), flush=True)
+    _exposure = host_exposure_warning()
+    if _exposure:
+        print("[genie] %s" % _exposure, flush=True)
     print("[genie]   POST /v1/chat/completions (OpenAI)   POST /v1/messages (Anthropic)",
           flush=True)
     print("[genie]   GET /v1/models   GET /health", flush=True)

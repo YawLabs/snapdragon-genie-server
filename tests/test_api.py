@@ -1095,3 +1095,168 @@ def test_an_unknown_post_path_404s_rather_than_guessing(gs, handler):
     assert code == 404
     assert body["error"]["type"] == "invalid_request_error"
     assert gs.ENGINE.calls == []
+# --- the request door ------------------------------------------------------
+# Every guard below runs BEFORE the single-flight semaphore, which is why they
+# belong here rather than in a generic input-validation test. The NPU serves
+# one generation at a time, so a bad request that gets through does not cost
+# one slow response -- it holds the device while every other client waits.
+
+def test_a_negative_max_tokens_is_refused_instead_of_wrapping(gs, handler):
+    # GenieDialog_setMaxNumTokens takes a c_uint32, so -1 does not fail: it
+    # arrives at the HTP as 4294967295. Nothing downstream caught it either --
+    # build_windowed budgets with max(0, max_tokens), so a negative reads as
+    # zero there and the overflow 400 never fired. The request was admitted and
+    # then pinned the NPU until it walked into the context wall.
+    code, body = _post_json(gs, handler,
+                            {"messages": [{"role": "user", "content": "hi"}],
+                             "max_tokens": -1},
+                            path="/v1/chat/completions")
+    assert code == 400
+    assert "max_tokens" in body["error"]["message"]
+    assert gs.ENGINE.calls == [], "refused at the door, never reached the NPU"
+
+
+def test_the_anthropic_leg_refuses_a_negative_max_tokens_in_its_own_envelope(gs, handler):
+    # Same guard, other API. The envelope follows the endpoint or a client that
+    # cannot parse the error learns nothing at the moment it needs to.
+    code, body = _post_json(gs, handler,
+                            {"messages": [{"role": "user", "content": "hi"}],
+                             "max_tokens": -5},
+                            path="/v1/messages")
+    assert code == 400
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert gs.ENGINE.calls == []
+
+
+def test_max_tokens_past_the_window_keeps_the_number_the_client_sent(gs, handler):
+    # NOT clamped to the window. The overflow 400 downstream tells the client to
+    # "lower max_tokens", which is only actionable if the figure quoted back is
+    # theirs -- clamping first would have rewritten 99999 to 4096 and produced
+    # an error that reads as though the server refused its own value.
+    code, body = _post_json(gs, handler,
+                            {"messages": [{"role": "user", "content": "hi"}],
+                             "max_tokens": 99999},
+                            path="/v1/chat/completions")
+    assert code == 400
+    assert "99999 max_tokens" in body["error"]["message"]
+    assert gs.ENGINE.calls == []
+
+
+def test_an_infinite_max_tokens_answers_instead_of_dropping_the_connection(gs, handler):
+    # json.loads accepts Infinity, and int(float("inf")) raises OverflowError
+    # rather than ValueError -- so this slipped past the first version of the
+    # guard and died in do_POST with no response written.
+    code, _body = _post_raw(gs, handler,
+                            b'{"messages": [{"role": "user", "content": "hi"}], '
+                            b'"max_tokens": Infinity}',
+                            path="/v1/chat/completions")
+    assert code == 400
+    assert gs.ENGINE.calls == []
+
+
+def test_a_negative_content_length_is_refused_rather_than_read(gs, handler):
+    # rfile.read(-1) reads to EOF, which on a keep-alive socket never arrives:
+    # one such request parks a handler thread for the life of the process, and
+    # it sits ahead of the semaphore so it does not even need a permit.
+    # (io.BytesIO returns instead of blocking, so this pins the guard, not the
+    # hang it prevents -- the hang needs a real socket.)
+    h = handler()
+    h.path = "/v1/chat/completions"
+    sent = {}
+    h.send_response = lambda code: sent.setdefault("code", code)
+    h.headers = {"Content-Length": "-1"}
+    h.rfile = io.BytesIO(b"{}")
+    h.do_POST()
+    assert sent.get("code") == 400
+    assert h.close_connection is True
+    assert gs.ENGINE.calls == []
+
+
+def test_a_chunked_body_is_refused_instead_of_desyncing_the_connection(gs, handler):
+    # This server reads exactly Content-Length bytes. A chunked body leaves its
+    # frames in the buffer, so the NEXT request on the same connection starts
+    # parsing mid-frame -- a failure that surfaces on a request that was fine.
+    h = handler()
+    h.path = "/v1/chat/completions"
+    sent = {}
+    h.send_response = lambda code: sent.setdefault("code", code)
+    h.headers = {"Content-Length": "2", "Transfer-Encoding": "chunked"}
+    h.rfile = io.BytesIO(b"{}")
+    h.do_POST()
+    assert sent.get("code") == 411
+    assert h.close_connection is True
+
+
+def test_a_messages_value_that_is_not_a_list_of_objects_gets_an_error(gs, handler):
+    # "hi" and ["hi"] are both truthy, so they cleared the required-check and
+    # then died rendering the template -- out of do_POST, no response at all.
+    for bad in ("hi", ["hi"], [None], [[]]):
+        code, body = _post_json(gs, handler, {"messages": bad},
+                                path="/v1/chat/completions")
+        assert code == 400, bad
+        assert "list of objects" in body["error"]["message"], bad
+    code, body = _post_json(gs, handler, {"messages": "hi", "max_tokens": 10},
+                            path="/v1/messages")
+    assert code == 400
+    assert body["type"] == "error"
+    assert gs.ENGINE.calls == []
+
+
+def test_a_falsy_max_tokens_still_means_the_default(gs):
+    # Absent, 0 and null all meant DEFAULT_MAX_TOKENS before the clamp existed
+    # (`req.get(...) or DEFAULT`). A guard that quietly changed that would
+    # shorten every reply from a client that sends max_tokens: 0.
+    for payload in ({}, {"max_tokens": 0}, {"max_tokens": None}):
+        assert gs._max_tokens(payload) == gs.DEFAULT_MAX_TOKENS
+
+
+def test_a_non_numeric_max_tokens_answers_instead_of_dropping_the_connection(gs, handler):
+    # int("abc") used to raise out of do_POST with no response written at all,
+    # which a client cannot tell apart from the server being dead.
+    code, body = _post_json(gs, handler,
+                            {"messages": [{"role": "user", "content": "hi"}],
+                             "max_tokens": "abc"},
+                            path="/v1/chat/completions")
+    assert code == 400
+    assert gs.ENGINE.calls == []
+
+
+def test_an_oversized_content_length_is_refused_before_the_body_is_read(gs, handler):
+    # MAX_INFLIGHT bounds generations, not bytes, and this read sits ahead of
+    # the semaphore -- so an unbounded body never had to queue for anything.
+    h = handler()
+    h.path = "/v1/chat/completions"
+    sent = {}
+    h.send_response = lambda code: sent.setdefault("code", code)
+    h.headers = {"Content-Length": str(gs.MAX_BODY_BYTES + 1)}
+    # The body is nowhere near the declared length: the guard must answer on
+    # the HEADER alone, without waiting for bytes that are never coming.
+    h.rfile = io.BytesIO(b"{}")
+    h.do_POST()
+    assert sent.get("code") == 413
+    assert "too large" in json.loads(h.wfile.text())["error"]["message"]
+    assert h.close_connection is True
+    assert gs.ENGINE.calls == []
+
+
+def test_valid_json_that_is_not_an_object_gets_an_error(gs, handler):
+    # `[1, 2]` parses fine and then dies on req.get() -- the same silent-drop
+    # failure as the non-numeric max_tokens above, one layer earlier.
+    code, body = _post_raw(gs, handler, b"[1, 2]", path="/v1/chat/completions")
+    assert code == 400
+    assert "object" in body["error"]["message"]
+    assert gs.ENGINE.calls == []
+
+
+def test_the_host_warning_is_quiet_on_loopback_and_loud_off_it(gs):
+    # Warn, never refuse -- the same contract as bundle_config_warnings. The
+    # env-var table described 0.0.0.0 as a supported way to expose the server
+    # with nothing attached about there being no auth behind it.
+    for host in ("127.0.0.1", "::1", "localhost"):
+        assert gs.host_exposure_warning(host) is None
+    for host in ("0.0.0.0", "192.168.1.5"):
+        warning = gs.host_exposure_warning(host)
+        assert warning.startswith("WARNING:")
+        assert "NO authentication" in warning
+        assert host in warning
