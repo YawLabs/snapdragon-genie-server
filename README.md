@@ -33,9 +33,50 @@ the same AI Hub context binaries this server does, and adds LoRA, VLM and
 embeddings that this has none of. Third-party, `npurun` reaches the same Genie
 API through Rust FFI, and llama.cpp's Hexagon backend is now upstream.
 
-**None of them have been benchmarked here.** That is a gap, not a disclaimer:
-nothing in this repo has ever been run against `GenieAPIService`. Read the list
-as a map of what to evaluate, not as a comparison that happened.
+**Both Qualcomm servers have now been run here, on the byte-identical bundle**
+-- same directory, `poll: false`, `seed: 42`, `context_lengths
+[512,1024,2048,4096,8192]`, ctx 8192 -- and both serve it correctly. What
+follows is what that turned up. **No throughput comparison is published**, for
+a reason given at the end.
+
+| | this server | GenieAPIService v2.3.7 | `geniex serve` v0.5.0 |
+|---|---|---|---|
+| `max_tokens` (legacy OpenAI) | honoured | **ignored** | ignored |
+| `max_completion_tokens` (current) | honoured | **ignored** | honoured |
+| `usage` token accounting | reported | **all zeros** | reported |
+| reasoning suppressed by default | yes | no | no |
+
+**An output cap is the finding that matters.** Asked for 16 tokens,
+GenieAPIService returned 125 under *both* spellings, `finish_reason: "stop"`,
+and a `usage` block of zeros -- so a client cannot bound a generation, and
+cannot tell from the response that it failed to. On a single-flight NPU that is
+not a cosmetic gap: one caller's unbounded generation is every other caller's
+queue. `geniex serve` honours the cap, but only under the modern spelling, so
+an older SDK sending `max_tokens` gets an unbounded answer instead of an error.
+
+**This server had the mirror of geniex's gap until the same test was pointed at
+it** -- it honoured `max_tokens` and ignored `max_completion_tokens`. That is
+fixed, and the fix exists because the comparison was run rather than assumed.
+Reciprocally, the "OpenAI-compatible" claim in the row above is worth
+distrusting everywhere it appears, this repo included, until a cap is actually
+sent and the returned token count is counted.
+
+**Getting there is not a fair fight either.** The `GenieAPIService_Stable`
+package cannot load an AI Hub bundle at all: its detector tries QNN, MNN and
+GGUF and rejects a valid Genie config with no reason given. The v2.3.7 build
+loads it only with the `.bin` files sitting beside `config.json`, and only once
+the model is declared `backend: "qnn"` in `service_config.json`. Both ship a
+QAIRT 2.44 runtime against 2.45-compiled binaries, which is the unsupported
+direction, so the local 2.45 DLLs had to be grafted in. `geniex pull
+--model-hub localfs` took the same bundle in one command.
+
+**No throughput numbers, and that is deliberate.** Three runs of one identical
+prompt on the same warm server spanned 6.09, 6.30 and 9.12 tok/s -- a 48%
+spread -- on a box whose CPU was 87% busy with an ordinary desktop session.
+Any A/B taken in that state would say more about which arm ran during a quiet
+minute than about either server. A comparison worth publishing needs a settled
+pack and a quiet box; this one had neither, and the difference between
+measuring and guessing is exactly what this repo is for.
 
 What is actually different here, each verified in this tree:
 

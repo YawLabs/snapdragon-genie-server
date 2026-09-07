@@ -1203,6 +1203,22 @@ def test_a_messages_value_that_is_not_a_list_of_objects_gets_an_error(gs, handle
     assert gs.ENGINE.calls == []
 
 
+def test_the_modern_max_completion_tokens_spelling_is_honoured_too(gs):
+    # OpenAI deprecated max_tokens in favour of max_completion_tokens, so which
+    # one arrives depends on the vintage of the caller's SDK. Honouring one and
+    # ignoring the other hands a client an unbounded generation on a
+    # single-flight NPU for no reason it can see. This server honoured only the
+    # legacy spelling until the two official servers were measured for the same
+    # thing -- geniex serve has exactly this gap in mirror image.
+    assert gs._max_tokens({"max_completion_tokens": 16}) == 16
+    # legacy wins when both are sent, since it is the more explicit signal from
+    # a client old enough to send it at all
+    assert gs._max_tokens({"max_tokens": 8, "max_completion_tokens": 16}) == 8
+    # and the validation applies to both spellings, not just the one
+    with pytest.raises(ValueError):
+        gs._max_tokens({"max_completion_tokens": -1})
+
+
 def test_a_falsy_max_tokens_still_means_the_default(gs):
     # Absent, 0 and null all meant DEFAULT_MAX_TOKENS before the clamp existed
     # (`req.get(...) or DEFAULT`). A guard that quietly changed that would

@@ -1615,8 +1615,19 @@ def _max_tokens(req):
 
     Falsy (absent, 0, false) keeps the old default. Anything past the window is
     clamped to it, which leaves the honest overflow 400 downstream intact.
+
+    BOTH spellings are accepted. OpenAI deprecated `max_tokens` in favour of
+    `max_completion_tokens`, and which one a client sends now depends on how
+    old its SDK is -- so honouring one and ignoring the other means a caller
+    gets an unbounded generation on a single-flight NPU because of the vintage
+    of their library. Measured on the two official servers for these bundles:
+    GenieAPIService honours NEITHER field (a 16-token cap returned 125 tokens
+    either way) and geniex serve honours only the modern one. This server had
+    the mirror of geniex's gap until it was tested for.
     """
     raw = req.get("max_tokens")
+    if raw is None:
+        raw = req.get("max_completion_tokens")
     if raw is None or raw == 0:
         return DEFAULT_MAX_TOKENS
     if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
