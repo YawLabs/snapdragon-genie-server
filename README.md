@@ -1,14 +1,18 @@
-# snapdragon-npu-llm
+# snapdragon-genie-server
 
-Running LLM compute on the **Snapdragon X Elite Hexagon NPU (HTP)** via
-**ONNX Runtime + the QNN Execution Provider**. This is the *productized* NPU
-path -- the same silicon a llama.cpp QNN backend targets, but reached through
-Microsoft/Qualcomm's shipping runtime stack instead of a custom ggml backend.
+An OpenAI- and Anthropic-compatible HTTP server that runs a full LLM on the
+**Snapdragon X Elite Hexagon NPU (HTP)**. `src/genie_server.py` keeps a Qwen3
+w4a16 Genie bundle resident on the Hexagon and serves it over both APIs, with
+streaming, tool calls, stop sequences and context eviction. See
+[docs/GENIE_SERVER.md](docs/GENIE_SERVER.md).
 
-The concrete, reproducible thing in this repo is a **single-GEMM
-micro-benchmark** that places the LLM prefill matmul primitive on the HTP and
-compares it to the ONNX Runtime CPU EP, with **HTP placement verified on every
-run** (not assumed).
+The repo also carries the path underneath it: **ONNX Runtime + the QNN
+Execution Provider**, the *productized* NPU route -- the same silicon a
+llama.cpp QNN backend targets, but reached through Microsoft/Qualcomm's
+shipping runtime stack instead of a custom ggml backend. On that path
+`src/bench.py` is a **single-GEMM micro-benchmark** placing the LLM prefill
+matmul primitive on the HTP against the ONNX Runtime CPU EP, with **HTP
+placement verified on every run** (not assumed).
 
 ## Target
 

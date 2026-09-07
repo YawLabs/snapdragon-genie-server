@@ -1,7 +1,7 @@
 # Brief: local multi-engine routing in typed
 
 Self-contained handoff for an agent working in the **typed** repo. You do not
-need the `snapdragon-npu-llm` repo to act on this. Every number below is
+need the `snapdragon-genie-server` repo to act on this. Every number below is
 measured on a Snapdragon X Elite (X1E80100, Hexagon v73), Windows on ARM64.
 
 ## What exists today
@@ -85,13 +85,13 @@ were taken through `llama-bench`. **Resolved 2026-09-03:**
 `llama-qnn-fork/build-arm64-windows-llvm-release` (build 10672) serves the
 Adreno over HTTP normally (`using device GPUOpenCL`, `offloaded 33/33 layers
 to GPU`, GPU engine counter busy during decode), launched via
-`snapdragon-npu-llm/src/run-llama-server.ps1 -Leg gpu` on port 8124 -- that
+`snapdragon-genie-server/src/run-llama-server.ps1 -Leg gpu` on port 8124 -- that
 endpoint is registrable. The lesson outlives the fix: the failure mode is
 silent, so check the backend line in the server's own startup log before
 believing any GPU figure taken over HTTP.
 
 **Where the GPU figures come from.** Measured on a cooled, quiet box 2026-08-23
-with `src/bench_contention.py` in `snapdragon-npu-llm`; Qwen3-4B Q4_K_M
+with `src/bench_contention.py` in `snapdragon-genie-server`; Qwen3-4B Q4_K_M
 (2.32 GiB GGUF), decode at context depth 469, n=3. **Supersedes 117 / 6.0** --
 decode was understated 3.0x. Those retired figures came from the same loaded
 window as the NPU's 277, and paid whatever a resident NPU server costs on top
@@ -473,7 +473,7 @@ Three rules fall out for the router:
    speed** -- a queued request served at 72-75% of solo rate beats one waiting
    behind the single-flight lock.
 
-Reproduce any of this with `src/bench_contention.py` in `snapdragon-npu-llm`
+Reproduce any of this with `src/bench_contention.py` in `snapdragon-genie-server`
 (`--npu` / `--gpu` base URLs, `--depth`, `--repeat`; it refuses to run on a
 loaded box unless you pass `--allow-loaded`, which stamps every result LOADED).
 Note that it expects both legs over HTTP; since 2026-09-03 the GPU leg is

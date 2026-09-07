@@ -60,7 +60,7 @@ I already proved the QNN EP runtime works on this box this session: INT8 QDQ mat
 
 ## Answers to the two questions
 
-1. **Will it work with `snapdragon-npu-llm` (ONNX-RT + QNN EP)?** Yes. It is AOT, robust by
+1. **Will it work with `snapdragon-genie-server` (ONNX-RT + QNN EP)?** Yes. It is AOT, robust by
    design, and the runtime is already proven working here. This is the right home for it.
 2. **Other options, ranked:**
    - **Genie (Qualcomm's LLM runtime)** -- PRIMARY. `genie-t2t-run.exe` ships in the QAIRT SDK
@@ -76,7 +76,7 @@ I already proved the QNN EP runtime works on this box this session: INT8 QDQ mat
 
 ## Recommended approach
 
-Home project: **`snapdragon-npu-llm`**. Engine: **Genie on the QnnHtp backend** (Path B). The Genie
+Home project: **`snapdragon-genie-server`**. Engine: **Genie on the QnnHtp backend** (Path B). The Genie
 **GenAiTransformer** path (Path A composer) is DEAD on this box -- its backend DLL is x86_64-only in QAIRT 2.34
 AND it is a CPU backend, not the HTP -- so the only local NPU route is Path B: convert to v73 QnnHtp context
 binaries and run them via `genie-t2t-run.exe` (whose QnnHtp backend IS native aarch64). ONNX-RT + genai stays
