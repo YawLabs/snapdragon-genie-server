@@ -231,8 +231,17 @@ def _post(base, path, payload, timeout):
 
 
 def _get(base, path, timeout=15):
+    """GET and parse JSON, treating an EMPTY 200 body as an empty object.
+
+    Not every server answers /health with JSON -- some return 200 and no body
+    at all. Raising there made the caller report "no server", which is the one
+    diagnosis guaranteed to send you hunting a process that is running fine.
+    A non-empty body that is not JSON still raises, because that is a real
+    surprise worth surfacing.
+    """
     with urllib.request.urlopen(base + path, timeout=timeout) as r:
-        return json.loads(r.read())
+        raw = r.read()
+    return json.loads(raw) if raw.strip() else {}
 
 
 def n_ctx(base):
@@ -518,6 +527,12 @@ def main():
                     help="decode repetitions at the deep depth; each costs two "
                          "full deep prefills, hence the lower default")
     ap.add_argument("--timeout", type=float, default=1800)
+    ap.add_argument("--n-ctx", type=int, dest="n_ctx",
+                    help="the served window, when the server has no /props. "
+                         "Only a third-party endpoint needs this: without it "
+                         "the depth budget falls back to 4096 and every "
+                         "deeper depth is silently dropped, which reads as a "
+                         "short sweep rather than a missing window.")
     ap.add_argument("--prefill-only", action="store_true")
     ap.add_argument("--decode-only", action="store_true")
     ap.add_argument("--depths",
@@ -540,7 +555,7 @@ def main():
         sys.exit("no server at %s (%s) -- start genie_server.py first"
                  % (base, _describe(e)))
 
-    ctx = n_ctx(base)
+    ctx = args.n_ctx or n_ctx(base)
     print("endpoint %s   model=%s   n_ctx=%s"
           % (base, args.model, ctx if ctx else "unknown"), flush=True)
     if ctx is None:
