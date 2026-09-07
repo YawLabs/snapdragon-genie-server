@@ -138,7 +138,7 @@ Lint with the same config CI would have used, if there were CI:
 python -m ruff check src tests
 ```
 
-401 tests, and **none of them need the NPU, a Genie bundle, or the QAIRT
+416 tests, and **none of them need the NPU, a Genie bundle, or the QAIRT
 SDK** -- they drive the handlers with a fake socket and a stub engine, so they
 run anywhere.
 
@@ -166,9 +166,13 @@ the HTP in FP16.
 |---|---|---|---|
 | FP16 GEMM 512x4096x4096 | 3477 GFLOP/s | 415 GFLOP/s | 8.4x |
 | INT8 QDQ GEMM 512x4096x4096 | 2620 GOP/s | 1285 GOP/s | 2.0x |
-| FP16 sweep @ 128 tokens | -- | -- | 19.2x |
-| FP16 sweep @ 512 tokens | -- | -- | 11.8x |
-| FP16 sweep @ 2048 tokens | -- | -- | 10.3x |
+
+This table used to carry three more rows -- an FP16 sweep reporting 19.2x /
+11.8x / 10.3x at 128 / 512 / 2048 tokens, with both ms columns blank. They are
+gone. Nothing in this repo, and nothing anywhere in its history, records the
+measurements behind them: no ms, no GFLOP/s, no log, no script. A speedup ratio
+with no timings under it is not a result, and nothing else on this page is
+allowed to lean on one.
 
 ### Verified HTP reproduction (captured this session, real HTP)
 
@@ -194,13 +198,42 @@ two scripts that produced these:
    2048    20.89   215.99    10.3x
 ```
 
-The FP16 GEMM NPU advantage (~10x and up) reproduces cleanly. Absolute GOP/s and
-the exact speedup move run-to-run with thermal state and machine load (a busy
-machine gives a slower CPU EP and thus a *larger* apparent NPU win) -- so the
-numbers here differ from the reference table above, and both differ from a
-lightly-loaded box. The load-bearing, stable result is the **order-of-magnitude
-FP16 NPU advantage** with **HTP placement verified**, not the GFLOP/s to three
-digits.
+**Read the 22.0x and the 10.3x together -- they are the same GEMM.** The
+standalone FP16 case and the sweep's 512-token row are both `512x4096x4096`,
+in the run pasted above, minutes apart. Working the printed ms back through
+`ops = 2*M*K*N` (what `bench.py` computes) shows where the gap lives:
+
+| row | M | NPU ms | NPU GFLOP/s | CPU ms | CPU GFLOP/s | win |
+|---|---|---|---|---|---|---|
+| standalone | 512 | 5.81 | 2957 | 127.72 | 134.5 | 22.0x |
+| sweep | 128 | 1.23 | 3492 | 37.56 | 114.3 | 30.4x |
+| sweep | 512 | 5.21 | 3298 | 53.68 | 320.0 | 10.3x |
+| sweep | 2048 | 20.89 | 3290 | 215.99 | 318.2 | 10.3x |
+
+The NPU leg is steady -- 2957 to 3492 GFLOP/s across all four rows, a 1.18x
+spread. The CPU EP is not: the same 512-token GEMM reads 134.5 GFLOP/s
+standalone and 320.0 in the sweep, a **2.38x** move. On that same row the NPU
+shifted only 1.12x (2957 -> 3298), and 2.38 / 1.12 = 2.13 -- which is the
+22.0x-to-10.3x collapse. **It is the baseline that moved, not the NPU.** So
+22.0x is not a headline: it is one anomalously slow CPU measurement, and any
+speedup quoted here inherits whatever the ORT CPU EP is doing that minute.
+
+Thermal state and machine load do move these numbers, and a busy box gives a
+slower CPU EP and thus a *larger* apparent NPU win -- but that is not what
+happened here, and the direction is worth stating. `--all` runs the sweep
+**last** (`src/bench.py:250-256`), so a warming box predicts the sweep's CPU leg
+to be the slower of the two. It is the faster one, by 2.4x. That is unexplained.
+
+Two harness limits to know before quoting any of this: `bench.py` reports a bare
+mean over 30 iterations with no dispersion, and it always times the NPU leg
+before the CPU leg with no interleaving, so a drifting box shows up as a shifted
+ratio rather than as visible spread. Nothing here checks that the NPU's output is
+numerically *correct*, and the FP16 rows compare fp16-on-HTP against fp32-on-CPU
+-- a speed comparison, not an identical computation.
+
+The load-bearing, stable result is the **order-of-magnitude FP16 NPU advantage**
+with **HTP placement verified** -- not the GFLOP/s to three digits, and not any
+single speedup ratio.
 
 ### A real gotcha you will hit: transient HTP `Code 1003`
 
@@ -247,19 +280,38 @@ a full model is **smaller** than the NPU-vs-ORT-CPU-EP ratios above.
   a Genie bundle today and serves via `src/run-llama-server.ps1` on the CPU
   or Adreno instead -- the model matrix and the reasons are in
   [docs/MODEL_OPTIONS.md](docs/MODEL_OPTIONS.md).
-- **Full-model prefill and decode, measured** across three compiled windows via
-  `src/bench_endpoint.py`: **1157 / 458 / 176 tok/s prefill** and
-  **18.0 / 8.8 / 3.3 tok/s decode** at 4096 / 8192 / 16384. Decode is
-  bandwidth-bound and set by the window the bundle was COMPILED at rather than
-  by how much context is in use -- roughly inverse-linear to 8192 and worse
-  beyond, so 8192 is the sweet spot.
+- **Full-model prefill and decode, measured** via `src/bench_endpoint.py`. The
+  variable that matters is the bundle's LENGTH CLASS, not its window: a
+  single-length export pays for its whole compiled window on every token, while
+  a multi-length export pays only for the context actually in use. Same model,
+  same 8192 window, same HTP allocation to the byte:
+
+  | 8192 bundle | prefill t/s @ d469 / d2657 / d6157 | decode t/s @ d250 / d3300 / d6000 |
+  |---|---|---|
+  | single-length `[8192]` | 463 / 461 / 456 | 8.8 / 8.8 / 8.8 |
+  | multi-length `[512..8192]` | **1382 / 997 / 636** | **18.2 / 11.5 / 8.1** |
+
+  Those are per-depth figures, not medians. The mechanism was read off the
+  artifact rather than inferred from timings: `qnn-context-binary-utility` shows
+  **2** compiled graphs in the single-length bundle's `part2_of_4.bin` against
+  **10** in the multi-length one's (`prompt_ar128_cl<N>` and `token_ar1_cl<N>`,
+  one pair per compiled length), so a single-length bundle runs every token
+  against its full window. It costs +3.8% bundle size and **zero** extra HTP
+  memory -- both 8192 bundles allocate exactly 646,971,904 bytes. The
+  launcher's default is the multi-length 8192 bundle. Full detail, including a
+  refutation of this finding that was itself wrong and had to be retracted, in
+  [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md).
 - **`poll: false` belongs in every bundle config.** As shipped, `"poll": true`
-  busy-waits: a resident server burned 270% CPU (2.7 cores) while idle, and the
-  spinning threads slowed real work by up to 55%. Disabling it costs nothing
-  measured.
-- **Model conversion via Qualcomm AI Hub**, run end-to-end here: both bundles
-  on this box came from `qai-hub-models export` (from WSL -- the Windows path
-  dies on `fcntl`).
+  busy-waits: a resident server burned 270% CPU (2.7 cores) while completely
+  idle, against a 0.0% control, and the spinning threads compete with the work.
+  Disabling it is worth **up to +55% decode** at 4096 (11.6 -> 18.0 t/s) --
+  which is a **36%** slowdown while it is on, not a 55% one. The two framings
+  divide the same pair of numbers in opposite directions and are easy to mix up.
+  Disabling costs nothing measured.
+- **Model conversion via Qualcomm AI Hub**, run end-to-end here: the 8192 and
+  16384 bundles were built with `qai-hub-models export` (from WSL -- the Windows
+  path dies on `fcntl`). The 4096 bundles are Qualcomm prebuilts, fetched rather
+  than exported, so do not read the 4096-vs-8192 gap as an export artifact.
 
 **Untested here (documented, not measured):**
 - **The `onnxruntime-genai` path to full-model decode.** genai 0.15.2 has no
@@ -284,7 +336,7 @@ src/genie_smoke.py        minimal one-shot Genie generation, for isolating serve
 src/bench_contention.py   two engines at once: solo vs contended, cool-gated sampling
 src/run-genie-server.ps1  launcher + supervisor; finds the bundle/SDK itself (-Model picks 4B/8B)
 src/run-llama-server.ps1  Qwen3.5-9B llama-server legs: CPU (Q8_0) / Adreno (Q4_K_M)
-tests/                    401 device-free tests (no NPU, no bundle, no SDK needed)
+tests/                    416 device-free tests (no NPU, no bundle, no SDK needed)
 
 docs/GENIE_SERVER.md      the server: endpoints, env vars, and its measured limits
 docs/IMPLEMENTATION_PLAN.md  living plan + decision log; start here for the why
@@ -303,3 +355,27 @@ Olive/genai tooling, pre-converted assets). It is intentionally **separate**
 from a custom llama.cpp QNN/ggml backend, which reaches the same HTP through a
 hand-written ggml backend. Different stacks, same silicon; this repo does not
 depend on or touch that one.
+
+## License
+
+Apache-2.0 -- see [LICENSE](LICENSE). The patent grant is the reason for
+Apache over MIT here: this is accelerator code, and the surrounding silicon is
+patented territory.
+
+Third-party attributions are in [NOTICE](NOTICE) -- the Qwen3 chat template
+rendered by hand in `src/genie_server.py` (Qwen3 is (c) Alibaba Cloud,
+Apache-2.0), and the Genie C API constants and ctypes signatures derived from
+Qualcomm's published QAIRT headers, which are interoperability declarations
+rather than redistributed SDK material.
+
+**No vendor binaries or weights ship in this repo.** No model weights, no
+bundle artifacts, no QAIRT binaries -- every tracked file is text. The one
+piece of third-party text that does ship is the Qwen3 chat template named
+above. The SDK and the bundles are obtained separately, by you, from Qualcomm.
+
+Snapdragon, Hexagon, Adreno and Qualcomm are trademarks of Qualcomm
+Incorporated or its subsidiaries; Qualcomm AI Runtime (QAIRT) and Genie are
+Qualcomm Technologies product names. All are used here only to identify the
+hardware and software this runs on. This project is not affiliated with,
+sponsored by, or endorsed by Qualcomm, Microsoft or Alibaba, and no endorsement
+is implied by any measurement published here.

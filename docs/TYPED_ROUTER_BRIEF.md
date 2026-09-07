@@ -518,7 +518,7 @@ misconfigured bundle and is withdrawn.
 5. **Engine configuration, not just engine selection.** One setting dominates
    everything else on this hardware: `"poll": false` in the bundle's
    `genie_config.json`. Shipped as `true` it busy-waits on 2.7 cores while idle,
-   costs up to 55% of NPU decode, and turns concurrent GPU + NPU serving from a
+   costs up to 36% of NPU decode, and turns concurrent GPU + NPU serving from a
    1.45x gain into a 0.78x loss. If typed ever manages these bundles, assert the
    flag rather than trusting the vendor default.
 6. **Engine lifecycle -- and a hot spare is free.** This brief recommended
@@ -557,7 +557,7 @@ These are properties of the NPU endpoint that a router must not assume away:
   3.26 t/s with 469 tokens of context and 3.27 t/s with 10532 -- so the penalty
   applies to short requests too. A 10532-token prefill takes **60 seconds**.
   (All measured with `poll: false` in the bundle config; as shipped,
-  `poll: true` busy-waits and costs up to 55% of decode plus 2.7 idle cores.)
+  `poll: true` busy-waits and costs up to 36% of decode plus 2.7 idle cores.)
 
   One caveat for a router that measures its own endpoints: the 4096 PREBUILT
   bundle appears to behave differently from the self-exported ones -- its decode
