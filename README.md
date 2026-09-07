@@ -14,6 +14,75 @@ shipping runtime stack instead of a custom ggml backend. On that path
 matmul primitive on the HTP against the ONNX Runtime CPU EP, with **HTP
 placement verified on every run** (not assumed).
 
+## What else serves these bundles, and what this does differently
+
+**QAIRT ships no server.** Its whole Genie surface is one-shot CLIs
+(`genie-t2t-run` builds a dialog, runs one query, exits), the C API, and Python
+bindings; searching the 2.45 SDK on this box by filename, shipped source,
+binary strings and `Genie.dll`'s import table (which pulls in no sockets
+library) finds no HTTP anywhere. A serving layer is something you build -- and
+several people have, so "nobody else did this" is not the reason to use this
+one.
+
+**Qualcomm ships two, beside the SDK rather than in it.** `geniex serve` in the
+GenieX CLI (confirmed on this box: `serve -- Run the GenieX Server`) serves
+QAIRT bundles *and* llama.cpp GGUF from one endpoint.
+[qualcomm/qai-appbuilder](https://github.com/qualcomm/qai-appbuilder)'s
+`GenieAPIService` is OpenAI-compatible, runs QnnHtp on Windows on ARM64, eats
+the same AI Hub context binaries this server does, and adds LoRA, VLM and
+embeddings that this has none of. Third-party, `npurun` reaches the same Genie
+API through Rust FFI, and llama.cpp's Hexagon backend is now upstream.
+
+**None of them have been benchmarked here.** That is a gap, not a disclaimer:
+nothing in this repo has ever been run against `GenieAPIService`. Read the list
+as a map of what to evaluate, not as a comparison that happened.
+
+What is actually different here, each verified in this tree:
+
+- **It speaks Anthropic, not only OpenAI.** `POST /v1/messages` with real
+  Anthropic SSE, `input_schema` tools converted to the function shape Qwen3 was
+  trained on, `stop_reason` mapping, and 529 rather than 429 for backpressure --
+  so a Claude-shaped client points at it unproxied. Every option above is
+  OpenAI-only.
+- **It checks the two facts that decide your throughput BEFORE the 11-35s model
+  load.** A bundle shipping `poll: true` (267% idle CPU; +55% decode when
+  flipped) and a single-length export (2.98x slower prefill than a multi-length
+  bundle at the same window). Neither is visible in `metadata.json` -- the two
+  8192 bundles differ only in `genie.context_lengths` -- so no latency probe at
+  a single depth distinguishes them.
+- **It re-seeds per request.** The bundles ship `"seed": 42` and Genie re-seeds
+  from the config on every `GenieDialog_reset`, so a bundle loaded verbatim
+  replays byte-identical output for a repeated prompt. `"seed": -1` does not fix
+  it. This rewrites the seed in the config text at load, never on disk.
+- **It expects the NPU to wedge.** Wedges are detected by stalled token progress
+  rather than elapsed time, `/health` answers without taking the engine lock,
+  and the process exits for its supervisor instead of unwinding through a
+  `GenieDialog_free` that can itself hang on a stuck driver. 34 device-free
+  tests cover that decision layer.
+- **It handles Qwen3 reopening its own think block** -- measured at 1 request in
+  6, and 1 in 12 on a second sample, each producing the answer twice. A
+  matched-pair regex provably cannot catch it, because the opening tag is in the
+  prompt rather than in the output.
+
+Reasons to use something else, none of them hypothetical:
+
+- **You need concurrency.** This is single-flight, and worse than it sounds: the
+  dialog holds one resident KV, so two interleaved conversations reset each
+  other's prefix and both pay a full re-prefill.
+- **You need per-request sampling.** `temperature` and `top_p` are accepted and
+  do nothing -- Genie binds the sampler at dialog creation on 2.45, which this
+  says at startup rather than hiding. `GenieAPIService` drives the sampler per
+  request; this cannot.
+- **You need GGUF, CPU/GPU fallback, LoRA, VLM or embeddings.** `geniex serve`
+  and `GenieAPIService` cover those. This serves one Genie bundle, one model per
+  process.
+- **You are not on Windows on ARM64,** or you want a stack proven on more than
+  one machine. Everything here is a single X1E80100.
+- **You only wanted the findings.** `poll: false`, multi-length exports and the
+  window tax are properties of Genie and the bundle, not of this server. Read
+  [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md), make two config edits, and keep
+  whatever you are already running.
+
 ## Target
 
 | | |
@@ -351,14 +420,6 @@ docs/TYPED_ROUTER_BRIEF.md  self-contained handoff for the routing work in typed
 requirements.txt          onnxruntime-qnn, onnx, numpy (genai is separate/optional)
 requirements-dev.txt      pytest only; the server itself has NO pip dependencies
 ```
-
-## Relationship to the llama.cpp QNN backend
-
-This is the **productized** NPU path (ONNX Runtime + QNN EP: shipping runtime,
-Olive/genai tooling, pre-converted assets). It is intentionally **separate**
-from a custom llama.cpp QNN/ggml backend, which reaches the same HTP through a
-hand-written ggml backend. Different stacks, same silicon; this repo does not
-depend on or touch that one.
 
 ## License
 
