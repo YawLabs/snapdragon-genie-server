@@ -70,6 +70,28 @@ QAIRT 2.44 runtime against 2.45-compiled binaries, which is the unsupported
 direction, so the local 2.45 DLLs had to be grafted in. `geniex pull
 --model-hub localfs` took the same bundle in one command.
 
+**So why not just proxy `geniex serve`?** It is the obvious design once decode
+turns out to be a tie -- translate Anthropic to OpenAI, rename the token cap,
+strip the orphan think tag, and inherit Qualcomm's maintenance plus GGUF and
+CPU/GPU fallback. Three probes decide it:
+
+| probe | this server | `geniex serve` |
+|---|---|---|
+| identical prompt, 3 runs | replays (per-process seed) | replays |
+| prompt past the 8192 window | drops older turns first, then a 400 naming the counts | flat 400, no eviction |
+| `stop: ["four"]` | honoured | **ignored** -- byte-identical to the unstopped run |
+
+Eviction and think-tag stripping a proxy could do itself. Stop sequences it
+cannot, and that is the one that matters: a proxy can cut the stream it returns,
+but the engine behind it keeps generating to its own cap, so on a single-flight
+NPU the device stays busy producing tokens nobody is reading. Determinism is
+worse -- neither server fixes it, because the seed binds at dialog creation and
+a post-create sampler apply is inert on QAIRT 2.45, so no HTTP layer can reach
+it from outside the process.
+
+That is the honest case for the direct path: not speed, but the two places
+where being inside the process is the only way to reach the knob.
+
 **Decode is a tie, and that is the useful result.** `src/bench_servers.py`
 runs the two servers A/B/B/A/A/B, three passes each, restarting between passes
 because the Hexagon is single-flight and they cannot both hold it. Decode is a
@@ -119,10 +141,16 @@ What is actually different here, each verified in this tree:
   bundle at the same window). Neither is visible in `metadata.json` -- the two
   8192 bundles differ only in `genie.context_lengths` -- so no latency probe at
   a single depth distinguishes them.
-- **It re-seeds per request.** The bundles ship `"seed": 42` and Genie re-seeds
-  from the config on every `GenieDialog_reset`, so a bundle loaded verbatim
-  replays byte-identical output for a repeated prompt. `"seed": -1` does not fix
-  it. This rewrites the seed in the config text at load, never on disk.
+- **It re-seeds per PROCESS, which is a smaller claim than it sounds and is
+  stated that way on purpose.** The bundles ship `"seed": 42`, and Genie
+  re-seeds its RNG from the config on every `GenieDialog_reset` -- so a bundle
+  loaded verbatim replays byte-identical output for a repeated prompt, forever,
+  and `"seed": -1` does not fix it (the constructor reads -1 as "seed from the
+  clock", but `reset()` re-seeds with `_seed` unconditionally). This rewrites
+  the seed in the config text at load, so two server runs differ. **Within one
+  run an identical prompt still replays its identical answer** -- measured, and
+  `geniex serve` does the same. Fixing it properly needs a QAIRT that honours a
+  post-create sampler apply; on 2.45 that call is accepted and ignored.
 - **It expects the NPU to wedge.** Wedges are detected by stalled token progress
   rather than elapsed time, `/health` answers without taking the engine lock,
   and the process exits for its supervisor instead of unwinding through a
@@ -477,6 +505,7 @@ src/bench_endpoint.py     prefill/decode benchmark against any OpenAI-compatible
 src/genie_smoke.py        minimal one-shot Genie generation, for isolating server bugs
 src/bench_contention.py   two engines at once: solo vs contended, cool-gated sampling
 src/bench_servers.py      interleaved A/B against another server on the SAME bundle
+src/probe_server_semantics.py  seed replay / overflow / stop-sequence probes
 src/run-genie-server.ps1  launcher + supervisor; finds the bundle/SDK itself (-Model picks 4B/8B)
 src/run-llama-server.ps1  Qwen3.5-9B llama-server legs: CPU (Q8_0) / Adreno (Q4_K_M)
 tests/                    416 device-free tests (no NPU, no bundle, no SDK needed)
