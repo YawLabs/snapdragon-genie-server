@@ -270,7 +270,7 @@ DIFFERENT failure mode from the unreapable-aihost AIX wedge this box has
 also exhibited (that one does need a reboot).
 
 Both bundles are LEFT at `poll: false` -- the steady-state setting this repo
-measured 1.45x-vs-0.78x arguments for -- because its failure mode here is
+measured concurrency arguments for -- because its failure mode here is
 loud (a crawl you cannot miss), while `poll: true` left in place after the
 driver heals fails silently (2.7 idle cores, up to -36% decode, NPU+GPU
 concurrency inverted). If a Genie server crawls at ~0.3 t/s: restart the

@@ -1,18 +1,356 @@
 # snapdragon-genie-server
 
-An OpenAI- and Anthropic-compatible HTTP server that runs a full LLM on the
-**Snapdragon X Elite Hexagon NPU (HTP)**. `src/genie_server.py` keeps a Qwen3
-w4a16 Genie bundle resident on the Hexagon and serves it over both APIs, with
-streaming, tool calls, stop sequences and context eviction. See
-[docs/GENIE_SERVER.md](docs/GENIE_SERVER.md).
+**What this repo is: a measurement log for running an LLM on the Snapdragon X
+Elite Hexagon NPU, and a server that applies what it found.**
 
-The repo also carries the path underneath it: **ONNX Runtime + the QNN
-Execution Provider**, the *productized* NPU route -- the same silicon a
-llama.cpp QNN backend targets, but reached through Microsoft/Qualcomm's
-shipping runtime stack instead of a custom ggml backend. On that path
-`src/bench.py` is a **single-GEMM micro-benchmark** placing the LLM prefill
-matmul primitive on the HTP against the ONNX Runtime CPU EP, with **HTP
-placement verified on every run** (not assumed).
+The findings are the valuable part and they are portable -- most are properties
+of Genie and of the AI Hub bundles, not of this code, so they hold whichever
+server you run. Several of them are worth 2-3x and are invisible in every
+published descriptor of the bundle they apply to.
+
+The server is the reference implementation. `src/genie_server.py` keeps a Qwen3
+w4a16 Genie bundle resident on the Hexagon and serves it over the OpenAI *and*
+Anthropic APIs, with streaming, tool calls, stop sequences and context eviction
+-- see [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md). It is **not** faster than
+Qualcomm's own server; that was measured, and decode is a tie. Read
+[what this found](#what-this-found) first and the server second.
+
+The repo also carries the other route to the same silicon: **ONNX Runtime + the
+QNN Execution Provider**, where `src/bench.py` is a single-GEMM micro-benchmark
+with HTP placement verified on every run. That path has its own findings, kept
+separable below.
+
+## What this found
+
+Ranked by what would change if you did not know it. Every number here was
+measured on one X1E80100; the conditions are in the linked docs, and
+[Proven vs untested](#proven-vs-untested-here-on-this-machine) says which
+claims are neither.
+
+### The five that change what you do today
+
+1. **The shipped bundles set `"poll": true`, and it costs 2.7 idle cores and up
+   to 36% of decode.** A resident server that had answered nothing but `/health`
+   burned 267% CPU against a 0.0% control. Setting it false took decode at 4096
+   from 11.6 to **18.0 t/s**. It is one line in the bundle's
+   `genie_config.json`, it is a vendor default, and nothing measured got worse.
+
+2. **A single-length export pays for its whole compiled window on every token.**
+   Same model, same 8192 window, same HTP allocation *to the byte*
+   (646,971,904): a multi-length bundle serves **1382 t/s prefill against 463**
+   (2.98x) and **18.2 t/s decode against 8.8** (2.07x), for +3.8% on disk. So
+   always export with several `--context-lengths`. `metadata.json` cannot tell
+   the two apart -- same 28 inputs, 25 outputs, same KV shape -- the difference
+   is 2 compiled graphs against 10, visible only in the context binary itself.
+
+3. **Per-request sampling is inert on QAIRT 2.45, and it returns success.**
+   `GenieDialog_getSampler`, `GenieSamplerConfig_createFromJson` and
+   `GenieSampler_applyConfig` all return 0, and generation is byte-identical
+   across seeds 1/999/12345 and temps 0.0/1.5/2.0. The sampler binds at
+   `GenieDialog_create`. Any OpenAI-compatible layer over Genie that accepts
+   `temperature` is lying unless it tested that the output moved.
+
+4. **The bundles ship `"seed": 42`, and Genie re-seeds on every dialog reset --
+   so an identical prompt returns a byte-identical answer, forever.** At temp
+   0.8 the model is nominally sampling with the dice reset before every roll,
+   which presents as a stubborn model rather than a config bug. `"seed": -1`
+   does not rescue it: `reset()` re-seeds with `_seed` unconditionally, so -1
+   casts to a fixed uint32. Rewriting the seed in the config text fixes it per
+   *process*; per *request* needs a QAIRT that honours a post-create apply.
+
+5. **Genie has no sliding window. Overflowing the compiled window is a hard
+   query failure, not a truncation** -- so anything serving on top of it has to
+   evict, and eviction has to keep the system turn and never orphan a tool
+   result from its call.
+
+### If you use ONNX Runtime + the QNN EP instead
+
+| finding | consequence |
+|---|---|
+| The legacy `providers=[("QNNExecutionProvider", ...)]` argument is **silently ignored** under the dynamic-EP model | your op runs on CPU at ~1/10th speed, and `get_providers()` still lists QNN |
+| `get_providers()` is not proof of placement | only the QNN HTP compile stages are, and reading them needs fd-level capture of the native log |
+| The HTP can wedge into a transient `Code 1003` -- graph compiles, first execute fails | ORT then **silently rebuilds on CPU and retries**, reporting a ~1.0x "NPU" number |
+
+Detail and the working attach are in
+[the plugin-EP section](#the-one-gotcha-that-will-eat-your-afternoon-the-plugin-ep-attach).
+
+### If you are choosing or building a server
+
+| finding | detail |
+|---|---|
+| **Neither Qualcomm server honours an output cap correctly** | GenieAPIService ignores `max_tokens` *and* `max_completion_tokens` (16 requested, 125 returned); `geniex serve` honours only the modern spelling |
+| **`geniex serve` ignores stop sequences** | `stop: ["four"]` returned output byte-identical to the unstopped run |
+| **Decode is a tie** | 1.01x / 1.00x / 1.09x at depths 250/1500/3000, ranges overlapping. No serving layer makes the Hexagon emit tokens faster |
+| Genie wants `{"stop-sequence": [...]}` | a bare array returns -8 "Top level config is not an object" and is then silently ignored by the generation |
+| GenieAPIService reports `usage` as all zeros | so a client cannot bound a generation *or* detect that it failed to |
+
+Measured with `src/bench_servers.py` and `src/probe_server_semantics.py`;
+the comparison is written up in
+[what else serves these bundles](#what-else-serves-these-bundles-and-what-this-does-differently).
+
+### If you are measuring anything on this hardware
+
+| trap | what it does to your numbers |
+|---|---|
+| **The precondition is a settled pack, not "on AC"** | below ~20-25% charge the box halves prefill while `PowerOnline` reads True |
+| **A depth that crosses a compiled-graph boundary** | the 1-token and N-token calls run different graphs, the subtraction stops cancelling, and the noise reads as a convincing thermal curve |
+| **A decode window under ~16 steps** | measures per-request overhead, not decode: a 4-step window reported 0.60 t/s against a true 17.6 |
+| **Sequential A/B on a drifting box** | hands all the drift to whichever arm ran second; interleave instead |
+| **On Windows, a second process can bind a port another is serving** | both binds succeed, the OLD process keeps answering, and your new server logs a clean start while serving nobody |
+| **A 200 from `/health` does not mean the model generates** | Qwen3.5-9B Q8_0 on the llama-qnn fork build answers every request with an empty completion and `finish_reason: stop`, at an impossible 66 t/s. Smoke-test the tokens, not the status code |
+
+## Target
+
+| | |
+|---|---|
+| Hardware | Snapdragon X Elite / X Plus (Hexagon v73, dev box is X1E80100) or X2 Elite (v81) -- the Windows-on-Snapdragon Hexagons. Verified on v73 only. |
+| OS | Windows on ARM64 (tested on Windows 11, build 26200) |
+| Python | 3.14 (win_arm64 wheels also exist for 3.11 / 3.12 / 3.13) |
+| Runtime | onnxruntime 1.29.0 + onnxruntime-qnn 2.5.0 |
+
+## The one gotcha that will eat your afternoon: the plugin-EP attach
+
+`onnxruntime-qnn` (2.5.0) is **not** a normal EP baked into an onnxruntime
+build. It is a **plugin** for onnxruntime 1.29's *dynamic-EP* model. You
+register the plugin library, then attach it to a session **by device**.
+
+The trap: the old-style
+
+```python
+# WRONG under the dynamic-EP model -- SILENTLY IGNORED. Runs on CPU.
+ort.InferenceSession(model, providers=[("QNNExecutionProvider", {...})])
+```
+
+builds a session that *looks* fine -- no error, and `get_providers()` can even
+list `QNNExecutionProvider` -- while the op quietly runs on CPU at ~1/10th the
+speed. The correct attach is:
+
+```python
+import onnxruntime as ort, onnxruntime_qnn as q
+ort.register_execution_provider_library(q.get_ep_name(), q.get_library_path())
+
+# get_ep_devices() returns BOTH a QNN NPU and a QNN GPU device -- pick the NPU
+npu = [d for d in ort.get_ep_devices()
+       if d.ep_name == "QNNExecutionProvider"
+       and d.device.type == ort.OrtHardwareDeviceType.NPU][0]
+
+so = ort.SessionOptions()
+so.add_provider_for_devices([npu], {"htp_performance_mode": "burst"})
+sess = ort.InferenceSession(model, sess_options=so)
+```
+
+`src/qnn_ep.py` wraps exactly this.
+
+### Verifying the NPU actually ran (never trust it)
+
+`get_providers()` listing `QNNExecutionProvider` is **necessary but not
+sufficient** -- individual nodes can still fall back to CPU. The only
+trustworthy signal is that the **QNN HTP graph compiler emits its compile
+stages** ("Graph Sequencing for Target", "Finalizing Graph Sequence", "VTCM
+Allocation") at ORT `log_severity_level <= 3`. A silent CPU fallback prints
+none of them and runs ~10x slower.
+
+`qnn_ep.build_session(...)` captures that native log at the file-descriptor
+level during session construction and **raises `PlacementError`** if the HTP
+compile stages are absent. Placement is asserted, not hoped for.
+
+Note also: the QNN EP HTP only offloads **quantized (QDQ INT8/INT4)** graphs or
+supported float graphs. A plain FP32 op with a bad attach falls back to CPU
+silently -- which is exactly why the verification above matters.
+
+## Install
+
+The wheels for `onnxruntime` and `onnxruntime-qnn` **ship the same
+`onnxruntime` module** and collide. Install into a clean venv that has **no
+plain `onnxruntime`**:
+
+```powershell
+# Windows ARM64, Python 3.11-3.14
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt        # onnxruntime-qnn pulls onnxruntime 1.29 as a dep
+```
+
+If a plain `onnxruntime` is already present, do **not** try to patch it in
+place (`uninstall onnxruntime` then `--force-reinstall onnxruntime-qnn
+--no-deps` is not enough). Start from a fresh venv.
+
+## Run the benchmark
+
+```powershell
+python src\bench.py --all
+# or individual cases:
+python src\bench.py --fp16 --shape 512,4096,4096 --iters 30
+python src\bench.py --int8
+python src\bench.py --sweep
+```
+
+It generates the ONNX GEMM models on the fly (into a temp dir), builds an HTP
+session (placement-verified) and a CPU-EP session for each, times both, and
+prints ms/run, GOP/s, and the NPU-vs-CPU speedup. `--no-verify` downgrades the
+placement check from hard-fail to a flag in the output.
+
+### End-to-end LLM throughput
+
+`src/bench.py` measures one matmul. To measure a whole served model, point
+`src/bench_endpoint.py` at a running `genie_server.py`:
+
+```powershell
+python src\bench_endpoint.py                          # prefill + decode sweep
+python src\bench_endpoint.py --base http://127.0.0.1:8123 --decode-only
+```
+
+It reports prefill and decode in tokens/sec at several context depths. Decode
+is measured as the delta between an N-token and a 1-token run at the same depth,
+so prefill cancels instead of being folded into the rate; prefill in turn has
+one decode step removed, since a 1-token cap still generates a token and leaving
+it in understates prefill by ~16% at shallow depths. Failed requests (a 429, a
+400) skip that point rather than killing a twenty-minute sweep. Because it speaks plain OpenAI HTTP, the same command benchmarks
+a `llama-server` GPU or CPU leg -- which is the only way to get a cross-engine
+comparison on identical prompts.
+
+**Read the result next to the bundle's `n_ctx`.** On Genie the compiled context
+window sets throughput for every request, so a run is only comparable to
+another run at the same `/props` `n_ctx` -- see the window-tax note in
+`docs/GENIE_SERVER.md`.
+
+## Results
+
+These are **single-GEMM micro-benchmarks** -- the prefill matmul primitive
+`[M tokens, K] x [K, N]`, **not** full-model tokens/sec. FP32-IO GEMMs run on
+the HTP in FP16.
+
+### Reference measurement (originally captured on this box -- cite, do not inflate)
+
+| Case | NPU/HTP | ORT CPU EP | NPU win |
+|---|---|---|---|
+| FP16 GEMM 512x4096x4096 | 3477 GFLOP/s | 415 GFLOP/s | 8.4x |
+| INT8 QDQ GEMM 512x4096x4096 | 2620 GOP/s | 1285 GOP/s | 2.0x |
+
+This table used to carry three more rows -- an FP16 sweep reporting 19.2x /
+11.8x / 10.3x at 128 / 512 / 2048 tokens, with both ms columns blank. They are
+gone. Nothing in this repo, and nothing anywhere in its history, records the
+measurements behind them: no ms, no GFLOP/s, no log, no script. A speedup ratio
+with no timings under it is not a result, and nothing else on this page is
+allowed to lean on one.
+
+### Verified HTP reproduction (captured this session, real HTP)
+
+Real HTP execution, placement-verified by the QNN compile stages *and* by the
+order-of-magnitude speedup. `bench.py` is the clean consolidation of exactly the
+two scripts that produced these:
+
+```
+=== FP16 GEMM 512x4096x4096 (FP32 IO, HTP runs FP16) ===
+  NPU/HTP     5.81 ms/run   2956.8 GFLOP/s   [HTP verified]
+  CPU EP    127.72 ms/run    134.5 GFLOP/s
+  NPU speedup: 22.0x
+
+=== INT8 QDQ GEMM 512x4096x4096 (HTP fuses to int8) ===
+  NPU/HTP    12.98 ms/run   1323.3 GOP/s     [HTP verified]
+  CPU EP     67.36 ms/run    255.0 GOP/s
+  NPU speedup: 5.2x
+
+=== FP16 prompt-length sweep (K=N=4096) ===
+ tokens   NPU ms   CPU ms   NPU win
+    128     1.23    37.56    30.4x
+    512     5.21    53.68    10.3x
+   2048    20.89   215.99    10.3x
+```
+
+**Read the 22.0x and the 10.3x together -- they are the same GEMM.** The
+standalone FP16 case and the sweep's 512-token row are both `512x4096x4096`,
+in the run pasted above, minutes apart. Working the printed ms back through
+`ops = 2*M*K*N` (what `bench.py` computes) shows where the gap lives:
+
+| row | M | NPU ms | NPU GFLOP/s | CPU ms | CPU GFLOP/s | win |
+|---|---|---|---|---|---|---|
+| standalone | 512 | 5.81 | 2957 | 127.72 | 134.5 | 22.0x |
+| sweep | 128 | 1.23 | 3492 | 37.56 | 114.3 | 30.4x |
+| sweep | 512 | 5.21 | 3298 | 53.68 | 320.0 | 10.3x |
+| sweep | 2048 | 20.89 | 3290 | 215.99 | 318.2 | 10.3x |
+
+The NPU leg is steady -- 2957 to 3492 GFLOP/s across all four rows, a 1.18x
+spread. The CPU EP is not: the same 512-token GEMM reads 134.5 GFLOP/s
+standalone and 320.0 in the sweep, a **2.38x** move. On that same row the NPU
+shifted only 1.12x (2957 -> 3298), and 2.38 / 1.12 = 2.13 -- which is the
+22.0x-to-10.3x collapse. **It is the baseline that moved, not the NPU.** So
+22.0x is not a headline: it is one anomalously slow CPU measurement, and any
+speedup quoted here inherits whatever the ORT CPU EP is doing that minute.
+
+Thermal state and machine load do move these numbers, and a busy box gives a
+slower CPU EP and thus a *larger* apparent NPU win -- but that is not what
+happened here, and the direction is worth stating. `--all` runs the sweep
+**last** (`src/bench.py:250-256`), so a warming box predicts the sweep's CPU leg
+to be the slower of the two. It is the faster one, by 2.4x. That is unexplained.
+
+Two harness limits to know before quoting any of this: `bench.py` reports a bare
+mean over 30 iterations with no dispersion, and it always times the NPU leg
+before the CPU leg with no interleaving, so a drifting box shows up as a shifted
+ratio rather than as visible spread. Nothing here checks that the NPU's output is
+numerically *correct*, and the FP16 rows compare fp16-on-HTP against fp32-on-CPU
+-- a speed comparison, not an identical computation.
+
+The load-bearing, stable result is the **order-of-magnitude FP16 NPU advantage**
+with **HTP placement verified** -- not the GFLOP/s to three digits, and not any
+single speedup ratio.
+
+### A real gotcha you will hit: transient HTP `Code 1003`
+
+After heavy back-to-back QNN usage this NPU can wedge: the graph still *compiles*
+onto the HTP (compile stages appear, so a compile-only check passes), but the
+first HTP *execute* fails with `QNN_COMMON_ERROR_SYSTEM ... Code: 1003`. By
+default ONNX Runtime then **silently rebuilds the session on CPU and retries**,
+so a naive benchmark reports a ~1.0x "NPU" result that is really CPU. `bench.py`
+disables that fallback (`session.disable_fallback()`) so the run surfaces
+honestly instead:
+
+```
+=== FP16 GEMM 512x4096x4096 (FP32 IO, HTP runs FP16) ===
+  NPU/HTP  RUN FAILED: EPFail: [ONNXRuntimeError] : 11 : EP_FAIL : ... QNN graph
+           execute error. Error: QNN_COMMON_ERROR_SYSTEM ... Code: 1003
+           (HTP graph compiled=True, but execute failed -- transient device
+            error, NOT reported as a CPU number)
+  CPU EP     34.67 ms/run    495.5 GFLOP/s
+```
+
+It is a device-state issue, not a code bug -- when it is active it breaks the
+original proven scripts identically. Recovery: let the NPU idle (or reboot); do
+not trust a 1.0x "NPU" number, which is the whole reason placement is asserted
+at both compile time and run time.
+
+One more honesty note: the ORT **CPU EP** is a weaker baseline than
+llama.cpp's KleidiAI-tuned ARM64 kernels, so the *real* NPU-vs-llama.cpp edge on
+a full model is **smaller** than the NPU-vs-ORT-CPU-EP ratios above.
+
+## Tests
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+Lint with the same config CI would have used, if there were CI:
+
+```powershell
+python -m ruff check src tests
+```
+
+416 tests, and **none of them need the NPU, a Genie bundle, or the QAIRT
+SDK** -- they drive the handlers with a fake socket and a stub engine, so they
+run anywhere.
+
+That device-free property is load-bearing rather than incidental, and it has a
+cost worth stating: the ctypes bindings and every Genie call are NOT covered.
+A regression there is invisible until the server is actually started, so
+starting it remains part of checking a change that touches the engine.
+
+The Genie C API is deliberately NOT mocked. Two payload shapes it requires
+(`{"stop-sequence": [...]}` and `{"sampler": {...}}`) were discovered only by
+calling the real library: the obvious shapes were rejected or, worse, accepted
+and silently ignored. A mock would have encoded the wrong assumption and made
+the suite agree with a bug. Anything crossing that boundary belongs in a
+hardware-gated integration test instead.
 
 ## What else serves these bundles, and what this does differently
 
@@ -180,259 +518,6 @@ Reasons to use something else, none of them hypothetical:
   [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md), make two config edits, and keep
   whatever you are already running.
 
-## Target
-
-| | |
-|---|---|
-| Hardware | Snapdragon X Elite / X Plus (Hexagon v73, dev box is X1E80100) or X2 Elite (v81) -- the Windows-on-Snapdragon Hexagons. Verified on v73 only. |
-| OS | Windows on ARM64 (tested on Windows 11, build 26200) |
-| Python | 3.14 (win_arm64 wheels also exist for 3.11 / 3.12 / 3.13) |
-| Runtime | onnxruntime 1.29.0 + onnxruntime-qnn 2.5.0 |
-
-## The one gotcha that will eat your afternoon: the plugin-EP attach
-
-`onnxruntime-qnn` (2.5.0) is **not** a normal EP baked into an onnxruntime
-build. It is a **plugin** for onnxruntime 1.29's *dynamic-EP* model. You
-register the plugin library, then attach it to a session **by device**.
-
-The trap: the old-style
-
-```python
-# WRONG under the dynamic-EP model -- SILENTLY IGNORED. Runs on CPU.
-ort.InferenceSession(model, providers=[("QNNExecutionProvider", {...})])
-```
-
-builds a session that *looks* fine -- no error, and `get_providers()` can even
-list `QNNExecutionProvider` -- while the op quietly runs on CPU at ~1/10th the
-speed. The correct attach is:
-
-```python
-import onnxruntime as ort, onnxruntime_qnn as q
-ort.register_execution_provider_library(q.get_ep_name(), q.get_library_path())
-
-# get_ep_devices() returns BOTH a QNN NPU and a QNN GPU device -- pick the NPU
-npu = [d for d in ort.get_ep_devices()
-       if d.ep_name == "QNNExecutionProvider"
-       and d.device.type == ort.OrtHardwareDeviceType.NPU][0]
-
-so = ort.SessionOptions()
-so.add_provider_for_devices([npu], {"htp_performance_mode": "burst"})
-sess = ort.InferenceSession(model, sess_options=so)
-```
-
-`src/qnn_ep.py` wraps exactly this.
-
-### Verifying the NPU actually ran (never trust it)
-
-`get_providers()` listing `QNNExecutionProvider` is **necessary but not
-sufficient** -- individual nodes can still fall back to CPU. The only
-trustworthy signal is that the **QNN HTP graph compiler emits its compile
-stages** ("Graph Sequencing for Target", "Finalizing Graph Sequence", "VTCM
-Allocation") at ORT `log_severity_level <= 3`. A silent CPU fallback prints
-none of them and runs ~10x slower.
-
-`qnn_ep.build_session(...)` captures that native log at the file-descriptor
-level during session construction and **raises `PlacementError`** if the HTP
-compile stages are absent. Placement is asserted, not hoped for.
-
-Note also: the QNN EP HTP only offloads **quantized (QDQ INT8/INT4)** graphs or
-supported float graphs. A plain FP32 op with a bad attach falls back to CPU
-silently -- which is exactly why the verification above matters.
-
-## Install
-
-The wheels for `onnxruntime` and `onnxruntime-qnn` **ship the same
-`onnxruntime` module** and collide. Install into a clean venv that has **no
-plain `onnxruntime`**:
-
-```powershell
-# Windows ARM64, Python 3.11-3.14
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt        # onnxruntime-qnn pulls onnxruntime 1.29 as a dep
-```
-
-If a plain `onnxruntime` is already present, do **not** try to patch it in
-place (`uninstall onnxruntime` then `--force-reinstall onnxruntime-qnn
---no-deps` is not enough). Start from a fresh venv.
-
-## Run the benchmark
-
-```powershell
-python src\bench.py --all
-# or individual cases:
-python src\bench.py --fp16 --shape 512,4096,4096 --iters 30
-python src\bench.py --int8
-python src\bench.py --sweep
-```
-
-It generates the ONNX GEMM models on the fly (into a temp dir), builds an HTP
-session (placement-verified) and a CPU-EP session for each, times both, and
-prints ms/run, GOP/s, and the NPU-vs-CPU speedup. `--no-verify` downgrades the
-placement check from hard-fail to a flag in the output.
-
-### End-to-end LLM throughput
-
-`src/bench.py` measures one matmul. To measure a whole served model, point
-`src/bench_endpoint.py` at a running `genie_server.py`:
-
-```powershell
-python src\bench_endpoint.py                          # prefill + decode sweep
-python src\bench_endpoint.py --base http://127.0.0.1:8123 --decode-only
-```
-
-It reports prefill and decode in tokens/sec at several context depths. Decode
-is measured as the delta between an N-token and a 1-token run at the same depth,
-so prefill cancels instead of being folded into the rate; prefill in turn has
-one decode step removed, since a 1-token cap still generates a token and leaving
-it in understates prefill by ~16% at shallow depths. Failed requests (a 429, a
-400) skip that point rather than killing a twenty-minute sweep. Because it speaks plain OpenAI HTTP, the same command benchmarks
-a `llama-server` GPU or CPU leg -- which is the only way to get a cross-engine
-comparison on identical prompts.
-
-**Read the result next to the bundle's `n_ctx`.** On Genie the compiled context
-window sets throughput for every request, so a run is only comparable to
-another run at the same `/props` `n_ctx` -- see the window-tax note in
-`docs/GENIE_SERVER.md`.
-
-## Tests
-
-```powershell
-pip install -r requirements-dev.txt
-python -m pytest -q
-```
-
-Lint with the same config CI would have used, if there were CI:
-
-```powershell
-python -m ruff check src tests
-```
-
-416 tests, and **none of them need the NPU, a Genie bundle, or the QAIRT
-SDK** -- they drive the handlers with a fake socket and a stub engine, so they
-run anywhere.
-
-That device-free property is load-bearing rather than incidental, and it has a
-cost worth stating: the ctypes bindings and every Genie call are NOT covered.
-A regression there is invisible until the server is actually started, so
-starting it remains part of checking a change that touches the engine.
-
-The Genie C API is deliberately NOT mocked. Two payload shapes it requires
-(`{"stop-sequence": [...]}` and `{"sampler": {...}}`) were discovered only by
-calling the real library: the obvious shapes were rejected or, worse, accepted
-and silently ignored. A mock would have encoded the wrong assumption and made
-the suite agree with a bug. Anything crossing that boundary belongs in a
-hardware-gated integration test instead.
-
-## Results
-
-These are **single-GEMM micro-benchmarks** -- the prefill matmul primitive
-`[M tokens, K] x [K, N]`, **not** full-model tokens/sec. FP32-IO GEMMs run on
-the HTP in FP16.
-
-### Reference measurement (originally captured on this box -- cite, do not inflate)
-
-| Case | NPU/HTP | ORT CPU EP | NPU win |
-|---|---|---|---|
-| FP16 GEMM 512x4096x4096 | 3477 GFLOP/s | 415 GFLOP/s | 8.4x |
-| INT8 QDQ GEMM 512x4096x4096 | 2620 GOP/s | 1285 GOP/s | 2.0x |
-
-This table used to carry three more rows -- an FP16 sweep reporting 19.2x /
-11.8x / 10.3x at 128 / 512 / 2048 tokens, with both ms columns blank. They are
-gone. Nothing in this repo, and nothing anywhere in its history, records the
-measurements behind them: no ms, no GFLOP/s, no log, no script. A speedup ratio
-with no timings under it is not a result, and nothing else on this page is
-allowed to lean on one.
-
-### Verified HTP reproduction (captured this session, real HTP)
-
-Real HTP execution, placement-verified by the QNN compile stages *and* by the
-order-of-magnitude speedup. `bench.py` is the clean consolidation of exactly the
-two scripts that produced these:
-
-```
-=== FP16 GEMM 512x4096x4096 (FP32 IO, HTP runs FP16) ===
-  NPU/HTP     5.81 ms/run   2956.8 GFLOP/s   [HTP verified]
-  CPU EP    127.72 ms/run    134.5 GFLOP/s
-  NPU speedup: 22.0x
-
-=== INT8 QDQ GEMM 512x4096x4096 (HTP fuses to int8) ===
-  NPU/HTP    12.98 ms/run   1323.3 GOP/s     [HTP verified]
-  CPU EP     67.36 ms/run    255.0 GOP/s
-  NPU speedup: 5.2x
-
-=== FP16 prompt-length sweep (K=N=4096) ===
- tokens   NPU ms   CPU ms   NPU win
-    128     1.23    37.56    30.4x
-    512     5.21    53.68    10.3x
-   2048    20.89   215.99    10.3x
-```
-
-**Read the 22.0x and the 10.3x together -- they are the same GEMM.** The
-standalone FP16 case and the sweep's 512-token row are both `512x4096x4096`,
-in the run pasted above, minutes apart. Working the printed ms back through
-`ops = 2*M*K*N` (what `bench.py` computes) shows where the gap lives:
-
-| row | M | NPU ms | NPU GFLOP/s | CPU ms | CPU GFLOP/s | win |
-|---|---|---|---|---|---|---|
-| standalone | 512 | 5.81 | 2957 | 127.72 | 134.5 | 22.0x |
-| sweep | 128 | 1.23 | 3492 | 37.56 | 114.3 | 30.4x |
-| sweep | 512 | 5.21 | 3298 | 53.68 | 320.0 | 10.3x |
-| sweep | 2048 | 20.89 | 3290 | 215.99 | 318.2 | 10.3x |
-
-The NPU leg is steady -- 2957 to 3492 GFLOP/s across all four rows, a 1.18x
-spread. The CPU EP is not: the same 512-token GEMM reads 134.5 GFLOP/s
-standalone and 320.0 in the sweep, a **2.38x** move. On that same row the NPU
-shifted only 1.12x (2957 -> 3298), and 2.38 / 1.12 = 2.13 -- which is the
-22.0x-to-10.3x collapse. **It is the baseline that moved, not the NPU.** So
-22.0x is not a headline: it is one anomalously slow CPU measurement, and any
-speedup quoted here inherits whatever the ORT CPU EP is doing that minute.
-
-Thermal state and machine load do move these numbers, and a busy box gives a
-slower CPU EP and thus a *larger* apparent NPU win -- but that is not what
-happened here, and the direction is worth stating. `--all` runs the sweep
-**last** (`src/bench.py:250-256`), so a warming box predicts the sweep's CPU leg
-to be the slower of the two. It is the faster one, by 2.4x. That is unexplained.
-
-Two harness limits to know before quoting any of this: `bench.py` reports a bare
-mean over 30 iterations with no dispersion, and it always times the NPU leg
-before the CPU leg with no interleaving, so a drifting box shows up as a shifted
-ratio rather than as visible spread. Nothing here checks that the NPU's output is
-numerically *correct*, and the FP16 rows compare fp16-on-HTP against fp32-on-CPU
--- a speed comparison, not an identical computation.
-
-The load-bearing, stable result is the **order-of-magnitude FP16 NPU advantage**
-with **HTP placement verified** -- not the GFLOP/s to three digits, and not any
-single speedup ratio.
-
-### A real gotcha you will hit: transient HTP `Code 1003`
-
-After heavy back-to-back QNN usage this NPU can wedge: the graph still *compiles*
-onto the HTP (compile stages appear, so a compile-only check passes), but the
-first HTP *execute* fails with `QNN_COMMON_ERROR_SYSTEM ... Code: 1003`. By
-default ONNX Runtime then **silently rebuilds the session on CPU and retries**,
-so a naive benchmark reports a ~1.0x "NPU" result that is really CPU. `bench.py`
-disables that fallback (`session.disable_fallback()`) so the run surfaces
-honestly instead:
-
-```
-=== FP16 GEMM 512x4096x4096 (FP32 IO, HTP runs FP16) ===
-  NPU/HTP  RUN FAILED: EPFail: [ONNXRuntimeError] : 11 : EP_FAIL : ... QNN graph
-           execute error. Error: QNN_COMMON_ERROR_SYSTEM ... Code: 1003
-           (HTP graph compiled=True, but execute failed -- transient device
-            error, NOT reported as a CPU number)
-  CPU EP     34.67 ms/run    495.5 GFLOP/s
-```
-
-It is a device-state issue, not a code bug -- when it is active it breaks the
-original proven scripts identically. Recovery: let the NPU idle (or reboot); do
-not trust a 1.0x "NPU" number, which is the whole reason placement is asserted
-at both compile time and run time.
-
-One more honesty note: the ORT **CPU EP** is a weaker baseline than
-llama.cpp's KleidiAI-tuned ARM64 kernels, so the *real* NPU-vs-llama.cpp edge on
-a full model is **smaller** than the NPU-vs-ORT-CPU-EP ratios above.
-
 ## Proven vs untested (here, on this machine)
 
 **Proven:**
@@ -507,7 +592,7 @@ src/bench_contention.py   two engines at once: solo vs contended, cool-gated sam
 src/bench_servers.py      interleaved A/B against another server on the SAME bundle
 src/probe_server_semantics.py  seed replay / overflow / stop-sequence probes
 src/run-genie-server.ps1  launcher + supervisor; finds the bundle/SDK itself (-Model picks 4B/8B)
-src/run-llama-server.ps1  Qwen3.5-9B llama-server legs: CPU (Q8_0) / Adreno (Q4_K_M)
+src/run-llama-server.ps1  Qwen3.5-9B llama-server legs: CPU (Q4_0) / Adreno (Q4_K_M)
 tests/                    416 device-free tests (no NPU, no bundle, no SDK needed)
 
 docs/GENIE_SERVER.md      the server: endpoints, env vars, and its measured limits

@@ -376,7 +376,14 @@ def test_poll_true_is_called_out_with_what_it_costs(gs):
     w = warnings[0]
     assert "WARNING" in w
     assert "dialog.engine.backend.QnnHtp.poll" in w, "name the key to edit"
-    assert "1.45x" in w and "0.78x" in w, "the concurrency reversal is the point"
+    # What it COSTS is the point -- a warning that only says "this is wrong"
+    # gets skipped. The concurrency figure this used to assert (1.45x turning
+    # into a 0.78x net loss) was refuted: both poll settings are a gain, and
+    # the flag gives away about a quarter of the win. Assert the cost is named,
+    # and that the retired number stays retired.
+    assert "36%" in w, "name the decode cost"
+    assert "concurrency" in w, "name the second cost"
+    assert "0.78x" not in w, "refuted figure must not come back"
 
 
 def test_a_correctly_configured_bundle_says_nothing(gs):

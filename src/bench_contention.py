@@ -938,12 +938,13 @@ def main():
             print("  never for throughput.")
             # Before believing this, check the flag. A poll:true bundle
             # busy-polls the HTP on ~2.8 cores and starves the OpenCL
-            # backend's per-token dispatch, which turned a measured 1.45x
-            # GAIN into a 0.78x LOSS on 2026-08-24. A net-loss verdict on
-            # this hardware is far more likely to be that flag than a real
-            # hardware limit.
+            # backend's per-token dispatch, taking about a quarter of the
+            # concurrency win (1.70x vs 1.26x over the best single engine). A
+            # net-loss verdict on this hardware is far more likely to be that
+            # flag than a real hardware limit -- the 0.78x this comment used to
+            # cite did not reproduce under a controlled re-run.
             print("  FIRST check QnnHtp/poll in the bundle's genie_config.json:")
-            print("  poll:true measured 0.78x here, poll:false measured 1.45x.")
+            print("  poll:true gives up ~1/4 of the concurrency win; both are gains.")
         else:
             print("\n  VERDICT: two hot engines beat the best single engine by "
                   "%.2fx." % (agg / best_solo))

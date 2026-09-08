@@ -291,9 +291,12 @@ def read_poll_setting():
     most consequential thing about a bundle and it ships in the wrong state.
     `"poll": true` busy-waits: measured here, a server that has answered nothing
     but /health burns 270% CPU -- 2.7 cores -- while completely idle, and it
-    costs up to 36% of decode on top. It also decides whether running this
-    engine beside a GPU one is a 1.45x gain or a 0.78x LOSS, because the OpenCL
-    backend needs those same host cores to dispatch a kernel per token.
+    costs up to 36% of decode on top. It also takes about a quarter of the
+    win from running this engine beside a GPU one (1.70x against 1.26x over the
+    best single engine), because the OpenCL backend needs those same host cores
+    to dispatch a kernel per token. An earlier revision called that a 0.78x NET
+    LOSS; a controlled re-run refuted it -- both settings are a gain, and the
+    retraction is in MULTI_ENGINE.md.
 
     Nearly every retracted number in docs/ traces back to this flag being true
     and nobody noticing. Noticing is cheap; the docs are the record of what not
@@ -470,8 +473,8 @@ def bundle_config_warnings():
     elif poll:
         out.append(
             "WARNING: this bundle has %s = %s. It busy-waits: ~2.7 host "
-            "cores burned while IDLE, up to 36%% of decode lost, and NPU+GPU "
-            "concurrency turned from a 1.45x gain into a 0.78x loss. Set it to "
+            "cores burned while IDLE, up to 36%% of decode lost, and about a "
+            "quarter of the NPU+GPU concurrency win given away. Set it to "
             "false in genie_config.json and restart -- nothing measured got "
             "worse." % (where or "QnnHtp.poll", json.dumps(poll)))
     # Only when the config was actually readable: {} here means "could not

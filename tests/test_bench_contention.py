@@ -823,15 +823,24 @@ def test_heavy_loss_near_the_bus_ceiling_is_not_blamed_on_something_else(
 
 
 def test_a_net_loss_verdict_points_at_the_poll_flag_first(monkeypatch, capsys):
-    # This verdict was WRONG for a whole revision of the docs: 0.78x, measured
-    # against a poll:true bundle. The advice telling the next reader to check
-    # that flag before believing it is the reason the branch exists.
+    # This verdict was WRONG for a whole revision of the docs: a 0.78x net loss,
+    # measured against a poll:true bundle. The advice telling the next reader to
+    # check that flag before believing it is the reason the branch exists.
+    #
+    # The 0.78x itself was then refuted too -- a controlled re-run found both
+    # poll settings a GAIN (1.70x vs 1.26x over the best single engine), so the
+    # flag costs about a quarter of the win rather than reversing the sign.
+    # This asserts the pointer, not the retired number: the branch has to send
+    # the reader to the flag, and must not re-assert a figure that did not
+    # reproduce.
     rounds = _both_ran(18.0, 6.9, 18.0, 7.3)
     assert _run_main(monkeypatch, rounds,
                      ["--repeat", "1", "--cool-floor", "0"]) == 0
     out = capsys.readouterr().out
     assert "SLOWER than the best engine alone" in out
-    assert "QnnHtp/poll" in out and "0.78x" in out
+    assert "QnnHtp/poll" in out
+    assert "concurrency win" in out
+    assert "0.78x" not in out, "refuted figure must not come back"
 
 
 def test_a_gain_verdict_does_not_mention_poll(monkeypatch, capsys):

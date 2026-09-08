@@ -104,7 +104,7 @@ regardless.
   | `single_flight` | `true`; the constraint behind the 429/529, stated rather than discovered from one |
   | `context_lengths` | the graphs compiled into the bundle |
   | `multi_length` | `false` means 2-3x slower on short prompts at the SAME `n_ctx` |
-  | `poll` | `true` means an idle 2.7-core busy-wait, and NPU+GPU concurrency is a 0.78x LOSS rather than a 1.45x gain |
+  | `poll` | `true` means an idle 2.7-core busy-wait, ~36% of decode, and about a quarter of the NPU+GPU concurrency win |
 
   `n_ctx` alone is not enough to rank this endpoint against a GPU or CPU one,
   and on this engine it is actively misleading: it is the SOFTWARE cap
@@ -595,13 +595,17 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   `poll: true` and is therefore pessimistic.
 
   That second consequence has since been measured, and it is larger than the
-  single-engine gain above. `MULTI_ENGINE.md` reports NPU+GPU concurrency at
-  **0.78x -- a net loss -- with `poll: true`, against 1.45x with `poll: false`**,
-  because the OpenCL backend needs host cores per token to dispatch its kernels
-  and the busy-wait was taking them. The same run had earlier retired memory
-  bandwidth as the contention mechanism on the strength of the `poll: true`
-  numbers; with the spin removed, bandwidth predicts the result again. So this
-  one config line decides whether running two engines together is worth doing
+  single-engine gain above. `MULTI_ENGINE.md` reports NPU+GPU concurrency
+  costing about a quarter of its win under `poll: true` -- **1.70x against
+  1.26x** over the best single engine -- because the OpenCL backend needs host
+  cores per token to dispatch its kernels and the busy-wait was taking them.
+  **The stronger claim this paragraph used to make, that `poll: true` turns
+  concurrency into a 0.78x NET LOSS, was refuted by a controlled re-run**: both
+  settings are a gain, and two hot engines are worth running either way. The
+  same run had earlier retired memory bandwidth as the contention mechanism on
+  the strength of the `poll: true` numbers; with the spin removed, bandwidth
+  predicts the result again. So this config line changes how much running two
+  engines together is worth
   at all.
 
 - **The compiled context window is a per-token tax, paid whether or not you
