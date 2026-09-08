@@ -458,11 +458,12 @@ def paired_sweep(engines, a, make_load):
     WHAT "SOLO" MEANS HERE, because it is narrower than the word suggests: the
     other engine's SERVER is still resident, it is merely not generating -- the
     load generator starts for the contended leg only. So this measures
-    engine-with-an-idle-peer, not engine-alone. That distinction is not
-    academic: an idle genie_server with poll:true was measured costing the GPU
-    25-32% of its throughput while answering nothing, so "solo" and "alone" can
-    differ by a third. Stopping the peer entirely is a different baseline and
-    has to be measured deliberately, not inferred from this one.
+    engine-with-an-idle-peer, not engine-alone. The 25-32% idle-peer penalty
+    this docstring used to quantify did NOT survive its controlled re-run --
+    the GPU solo row moved 18.20 against 18.47 with an idle poll:true NPU
+    resident, which is nothing. The methodological point stands without the
+    number: stopping the peer entirely is a different baseline and has to be
+    measured deliberately, not inferred from this one.
 
     The ordering is the whole point. Measuring every solo first and every
     contended second puts all of any thermal decay into the contended half,

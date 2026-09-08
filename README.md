@@ -336,7 +336,7 @@ Lint with the same config CI would have used, if there were CI:
 python -m ruff check src tests
 ```
 
-416 tests, and **none of them need the NPU, a Genie bundle, or the QAIRT
+417 tests, and **none of them need the NPU, a Genie bundle, or the QAIRT
 SDK** -- they drive the handlers with a fake socket and a stub engine, so they
 run anywhere.
 
@@ -593,7 +593,7 @@ src/bench_servers.py      interleaved A/B against another server on the SAME bun
 src/probe_server_semantics.py  seed replay / overflow / stop-sequence probes
 src/run-genie-server.ps1  launcher + supervisor; finds the bundle/SDK itself (-Model picks 4B/8B)
 src/run-llama-server.ps1  Qwen3.5-9B llama-server legs: CPU (Q4_0) / Adreno (Q4_K_M)
-tests/                    416 device-free tests (no NPU, no bundle, no SDK needed)
+tests/                    417 device-free tests (no NPU, no bundle, no SDK needed)
 
 docs/GENIE_SERVER.md      the server: endpoints, env vars, and its measured limits
 docs/IMPLEMENTATION_PLAN.md  living plan + decision log; start here for the why

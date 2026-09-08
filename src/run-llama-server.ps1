@@ -72,7 +72,7 @@ if ($Leg -eq "cpu") {
     if (-not ($hf -or $gguf)) { $hf = "unsloth/Qwen3.5-9B-GGUF:Q4_0" }
     $port  = if ($env:LLAMA_PORT) { $env:LLAMA_PORT } else { "8080" }
     # No -a by default on this leg, deliberately: without it the server
-    # reports the -hf spec ("unsloth/Qwen3.5-9B-GGUF:Q8_0"), which is what
+    # reports the -hf spec ("unsloth/Qwen3.5-9B-GGUF:Q4_0"), which is what
     # the hand-run instances have always advertised -- a client keyed on that
     # id would break if the launcher renamed it.
     $alias = $env:LLAMA_ALIAS
@@ -223,7 +223,7 @@ else       { $srvArgs = @("-hf", $hf) + $srvArgs }
 if ($env:LLAMA_EXTRA_ARGS) { $srvArgs += ($env:LLAMA_EXTRA_ARGS -split " ") }
 
 Write-Host "[run] starting llama-server ($Leg leg) on ${bindHost}:${port}"
-Write-Host "[run] model: $(if ($gguf) { $gguf } else { $hf + ' (HF cache; ~9.5 GB on first fetch)' })"
+Write-Host "[run] model: $(if ($gguf) { $gguf } else { $hf + ' (HF cache; ~5.4 GB on first fetch)' })"
 Write-Host "[run] log:   $log(.err)"
 $proc = Start-Process -FilePath $server -ArgumentList $srvArgs `
     -RedirectStandardOutput $log -RedirectStandardError ($log + ".err") `
@@ -287,7 +287,7 @@ function Flush-Carry {
 # Wait for health on a wall-clock deadline (an iteration-counted loop ran up
 # to ~3x the stated timeout: each pass is 1s of sleep PLUS up to 2s of probe
 # timeout). The server's own output streams throughout, so a first -hf run's
-# ~9.5 GB download and the model load are visible progress, not silence.
+# ~5.4 GB download and the model load are visible progress, not silence.
 $deadline = (Get-Date).AddSeconds($timeout)
 $up = $false
 while ((Get-Date) -lt $deadline) {

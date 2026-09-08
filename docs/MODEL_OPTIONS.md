@@ -8,7 +8,7 @@ recording: the newest model here is the one the NPU cannot run.
 |---|---|---|---|---|
 | Qwen3-4B (default) | NPU (Hexagon HTP) | `src\run-genie-server.ps1` | 8123 | `qwen3-4b-npu` |
 | Qwen3-8B | NPU (Hexagon HTP) | `src\run-genie-server.ps1 -Model qwen3-8b` | 8123 | `qwen3-8b-npu` |
-| Qwen3.5-9B Q8_0 | CPU (KleidiAI) | `src\run-llama-server.ps1` | 8080 | `unsloth/Qwen3.5-9B-GGUF:Q8_0` |
+| Qwen3.5-9B Q4_0 | CPU (KleidiAI) | `src\run-llama-server.ps1` | 8080 | `unsloth/Qwen3.5-9B-GGUF:Q4_0` |
 | Qwen3.5-9B Q4_K_M | GPU (Adreno OpenCL) | `src\run-llama-server.ps1 -Leg gpu` | 8124 | `qwen3.5-9b-gpu` |
 
 The two llama-server rows are ONE model with two leg-specific quants -- see
@@ -148,9 +148,9 @@ that only checks health would pass on a server that generates nothing** --
 check for non-empty content.
 
 The CPU leg's alias is deliberately the bare `-hf` spec
-(`unsloth/Qwen3.5-9B-GGUF:Q8_0`): that is what the hand-run instances have
-always advertised, and a client keyed on it would break if the launcher
-renamed it. The GPU leg is new, so it gets a clean `qwen3.5-9b-gpu`.
+(`unsloth/Qwen3.5-9B-GGUF:Q4_0` since the quant correction; it read `:Q8_0`
+while that was the default): passing no `-a` means the served id tracks the
+quant, and a client keyed on the old string needs updating once, here. The GPU leg is new, so it gets a clean `qwen3.5-9b-gpu`.
 
 ## The Qwen3-8B NPU tier
 

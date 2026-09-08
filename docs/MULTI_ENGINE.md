@@ -205,9 +205,10 @@ this measurement. Which half a given sample belongs to is *inferred* -- from
 that file mtime and from server start times -- not from a variable held under
 control. The `.orig` backups still carry the shipped `true`, so confirming the
 whole result deliberately is about fifteen minutes: flip the flag back, re-run
-`bench_contention.py`, flip it forward, re-run. **That has not been done.** The
-idle-CPU control table above *is* a proper A/B; this is not, and the two should
-not be read as carrying the same weight.
+`bench_contention.py`, flip it forward, re-run. **That was done on 2026-09-03 --
+see the controlled A/B below**, which is where the net-loss half of this
+section's conclusion was refuted. Read this inferred split as the weaker
+evidence it is; the A/B supersedes it.
 
 Two things follow for the design, and they cut back the other way from the
 previous revision:
@@ -463,9 +464,10 @@ are in the contention section above.
 
 **This page answered "no" on 2026-08-23** -- 0.78x, a net loss, bandwidth ruled
 out. That answer was taken against `"poll": true` bundles whose idle busy-wait
-stole 2.7 host cores from the GPU's per-token dispatch path. It is superseded,
-and survives only as the honest answer for a box left in the shipped
-configuration.
+stole 2.7 host cores from the GPU's per-token dispatch path. It is superseded outright: the
+controlled A/B measured that same shipped configuration at 1.26x over the best
+single engine -- still a gain. The net loss does not reproduce under any
+setting tested.
 
 Caveats that travel with the corrected answer: one pair of engines, one model,
 one depth (d469), n=3; the GPU leg was driven by `llama-bench` rather than over

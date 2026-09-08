@@ -95,8 +95,9 @@ with `src/bench_contention.py` in `snapdragon-genie-server`; Qwen3-4B Q4_K_M
 (2.32 GiB GGUF), decode at context depth 469, n=3. **Supersedes 117 / 6.0** --
 decode was understated 3.0x. Those retired figures came from the same loaded
 window as the NPU's 277, and paid whatever a resident NPU server costs on top
-(see below). The CPU row came from that same window, has **not** been
-re-measured, and should still be treated as a loaded-box number.
+(see below). The CPU row came from that same window and **has since been
+re-measured on a verified-quiet box** -- 22.57 t/s at d0, 13.15 at d469, given
+in full further down. Use those; the loaded-window CPU figures are retired.
 
 **On the GPU leg, Q4_K_M is the fast path -- not merely the smaller file.**
 Measured at d0 on the same box: Q4_K_M (2.32 GiB) decodes **19.39** t/s, Q8_0

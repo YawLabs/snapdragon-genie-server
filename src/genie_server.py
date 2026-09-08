@@ -2337,8 +2337,9 @@ class Handler(BaseHTTPRequestHandler):
             # from HTTP. n_ctx alone is actively misleading here: it is the
             # SOFTWARE cap, while throughput is set by the compiled window and
             # by whether the bundle carries one graph or several -- two bundles
-            # of the same n_ctx differ 2-3x on short prompts, and `poll` decides
-            # whether running this engine beside another is a gain or a loss.
+            # of the same n_ctx differ 2-3x on short prompts, and `poll` costs
+            # about a quarter of the win from running this engine beside
+            # another (both settings are a gain; see MULTI_ENGINE.md).
             # Namespaced so no llama.cpp-shaped field is misreported, and
             # additive so a client that ignores it sees what it saw before.
             #

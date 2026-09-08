@@ -43,7 +43,7 @@ That serves on `127.0.0.1:8123`, and supervises: see Supervision below.
 
 If the artifacts live elsewhere, point `GENIE_NPU_ROOT` at the directory
 holding them, or set the two paths directly. The launcher checks both exist
-before the ~10s model load and exits naming what it tried, rather than failing
+before the 11-35s model load and exits naming what it tried, rather than failing
 deep inside the server:
 
 ```powershell
