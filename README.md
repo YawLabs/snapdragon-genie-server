@@ -70,13 +70,41 @@ QAIRT 2.44 runtime against 2.45-compiled binaries, which is the unsupported
 direction, so the local 2.45 DLLs had to be grafted in. `geniex pull
 --model-hub localfs` took the same bundle in one command.
 
-**No throughput numbers, and that is deliberate.** Three runs of one identical
-prompt on the same warm server spanned 6.09, 6.30 and 9.12 tok/s -- a 48%
-spread -- on a box whose CPU was 87% busy with an ordinary desktop session.
-Any A/B taken in that state would say more about which arm ran during a quiet
-minute than about either server. A comparison worth publishing needs a settled
-pack and a quiet box; this one had neither, and the difference between
-measuring and guessing is exactly what this repo is for.
+**Decode is a tie, and that is the useful result.** `src/bench_servers.py`
+runs the two servers A/B/B/A/A/B, three passes each, restarting between passes
+because the Hexagon is single-flight and they cannot both hold it. Decode is a
+two-request delta at one prompt (`max_tokens` 1 vs 121), so prefill and
+per-request HTTP overhead cancel -- which is what makes two different HTTP
+stacks comparable at all. Depths keep prompt + 120 generated tokens inside one
+compiled graph. Tokens are counted locally from the returned text with the
+bundle's tokenizer, never from `usage`, because one server reports zeros there
+and two instruments would not be one measurement.
+
+| depth | this server | `geniex serve` | ratio |
+|---|---|---|---|
+| 250  | **17.69** t/s (16.33-18.35) | 17.43 (16.11-17.58) | 1.01x |
+| 1500 | **14.06** t/s (13.78-14.37) | 14.00 (10.57-14.07) | 1.00x |
+| 3000 | **10.77** t/s (10.54-10.86) | 9.86 (8.70-10.51) | 1.09x |
+
+Medians of n=3, full range in brackets. At 250 and 1500 the ranges overlap and
+the two are indistinguishable. At 3000 they technically do not -- ours' slowest
+sample beat geniex's fastest by 0.03 t/s -- which with n=3 is a coin flip, not
+a finding. Both of geniex's low outliers came from its FIRST pass; drop that as
+warm-up and it matches everywhere.
+
+**So do not choose this for speed.** Both servers drive the same bundle through
+the same Genie C API onto the same Hexagon, and decode is bandwidth-bound on
+the NPU rather than anything the serving layer does. A server cannot make the
+HTP emit tokens faster, and this one does not. What differs is the table above
+this one -- the API surface, the output cap, the token accounting -- and the
+window-tax and `poll` findings, which are properties of the bundle and transfer
+to whichever server you run.
+
+*Conditions: X1E80100, Windows 11 26200, pack 73% on AC, an ordinary desktop
+session running. Base clock varied 42-79% across passes, which is why the runs
+are interleaved rather than sequential -- drift then lands on both arms instead
+of on whichever ran second. The 5x wider spread on geniex is itself a
+measurement, and a reason to read a single sample from either as a range.*
 
 What is actually different here, each verified in this tree:
 
@@ -448,6 +476,7 @@ src/genie_server.py       OpenAI + Anthropic HTTP server over a resident Genie b
 src/bench_endpoint.py     prefill/decode benchmark against any OpenAI-compatible server
 src/genie_smoke.py        minimal one-shot Genie generation, for isolating server bugs
 src/bench_contention.py   two engines at once: solo vs contended, cool-gated sampling
+src/bench_servers.py      interleaved A/B against another server on the SAME bundle
 src/run-genie-server.ps1  launcher + supervisor; finds the bundle/SDK itself (-Model picks 4B/8B)
 src/run-llama-server.ps1  Qwen3.5-9B llama-server legs: CPU (Q8_0) / Adreno (Q4_K_M)
 tests/                    416 device-free tests (no NPU, no bundle, no SDK needed)

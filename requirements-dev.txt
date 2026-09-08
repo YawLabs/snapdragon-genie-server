@@ -10,6 +10,12 @@
 # both needed a keyed wrapper the obvious shape did not have).
 pytest>=8.0
 ruff>=0.16          # lint gate, configured in pyproject.toml
+tokenizers>=0.20    # NOT a server dependency, and not needed by the tests
+                    # either. src/bench_servers.py counts generated tokens
+                    # locally because one of the servers it measures reports
+                    # `usage` as all zeros, and measuring one arm through the
+                    # usage block and the other through a fallback would be
+                    # two instruments rather than one measurement.
 numpy>=1.26         # NOT a server dependency. tests/test_bench.py imports
                     # src/bench.py, which needs numpy for real; onnx and
                     # onnxruntime are stubbed there because they are
