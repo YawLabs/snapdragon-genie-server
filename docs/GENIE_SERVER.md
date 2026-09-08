@@ -774,3 +774,68 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   `run-llama-server.ps1` instead -- the whole model matrix, and a
   box-state failure mode that can make any Genie bundle crawl at ~0.3 t/s
   under `poll: false`, is in `MODEL_OPTIONS.md`.
+
+## Reproducing the cross-server comparison
+
+`src/bench_servers.py` and `src/probe_server_semantics.py` measure this server
+against Qualcomm's two, on the *same* bundle. Both default to a `geniex` model
+id that only exists once you have imported that bundle, so the setup is written
+down here rather than left in someone's shell history.
+
+The findings these produced are in the README; this is only how to re-run them,
+which is worth doing whenever either vendor ships a release.
+
+**geniex serve -- one command.** It accepts an AI Hub bundle directory
+(`metadata.json` + `part*.bin`) directly, and COPIES it into its own cache
+(~3 GB), so later edits to `poll` or the window must be made on the copy at
+`%LOCALAPPDATA%\..\.cache\geniex\models\qualcomm\<name>`, not on the source bundle:
+
+```powershell
+geniex pull qwen3-4b-ours --model-hub localfs --model-type llm `
+  --local-path $env:GENIE_BUNDLE_DIR
+geniex serve --host 127.0.0.1:18181
+# the served id is namespaced: qualcomm/qwen3-4b-ours
+```
+
+**GenieAPIService -- four things, none of them optional.** From
+[qualcomm/qai-appbuilder](https://github.com/qualcomm/qai-appbuilder):
+
+1. **Take the v2.3.7 asset, not `GenieAPIService_Stable`.** Stable's model
+   detector tries QNN, MNN and GGUF against a valid Genie config and rejects it
+   with no reason given; v2.3.7 lets you declare the backend instead of
+   guessing. (The newest Windows-ARM64 asset, v2.48.40, downloaded corrupt --
+   truncated at 38 MiB with no central directory, identically over three
+   fetches. Check it before assuming it is fixed.)
+2. **Graft the local QAIRT 2.45 runtime over the bundled 2.44.** Bundles
+   compiled by 2.45 against a 2.44 runtime is the unsupported direction. Eight
+   files, from `$env:GENIE_SDK_DIR`: `Genie.dll`, `QnnHtp.dll`,
+   `QnnHtpNetRunExtensions.dll`, `QnnHtpPrepare.dll`, `QnnHtpV73Stub.dll` and
+   `QnnSystem.dll` from `lib/aarch64-windows-msvc`, plus `libQnnHtpV73Skel.so`
+   and `libqnnhtpv73.cat` from `lib/hexagon-v73/unsigned`. The service imports
+   29 Genie symbols and 2.45 exports all of them, so the swap is ABI-clean.
+   Back the originals up first; two filenames differ only in case.
+3. **Put the model files BESIDE `config.json`,** not wherever the config
+   points. This is the step that is not documented anywhere and the one that
+   makes the difference between loading and the bare "Load Model Failed":
+   hardlink `part*_of_4.bin`, `tokenizer.json`, `htp_backend_ext_config.json`
+   and friends into `config/<name>/`, then use bare filenames for `ctx-bins`,
+   `tokenizer.path` and `extensions`. Hardlinks cost no disk. The bundle's own
+   `config.json` collides with the service's, so rename it.
+4. **Declare the model in `service_config.json`** -- this is what bypasses the
+   detector:
+
+   ```json
+   {"name": "qwen3-4b-ours", "path": "qwen3-4b-ours", "backend": "qnn",
+    "device": "npu", "context_size": 8192, "enabled": true}
+   ```
+
+   Then `GenieAPIService.exe -c config\<name>\config.json -p 8910 -l`.
+
+A sanity check worth running before believing any failure is yours: the
+`genie-t2t-run.exe` shipped in the same package, with the same grafted DLLs,
+should generate from the bundle in one shot. If it does and the service does
+not, the graft is fine and the service's config is the problem -- which is
+exactly how the beside-the-config requirement was found.
+
+**Keep only one server resident.** The HTP is single-flight; two loaded engines
+contend, and a benchmark taken that way measures the contention.

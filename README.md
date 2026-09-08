@@ -84,8 +84,10 @@ Detail and the working attach are in
 | Genie wants `{"stop-sequence": [...]}` | a bare array returns -8 "Top level config is not an object" and is then silently ignored by the generation |
 | GenieAPIService reports `usage` as all zeros | so a client cannot bound a generation *or* detect that it failed to |
 
-Measured with `src/bench_servers.py` and `src/probe_server_semantics.py`;
-the comparison is written up in
+Measured with `src/bench_servers.py` and `src/probe_server_semantics.py` --
+standing the other servers up on the same bundle is
+[written down](docs/GENIE_SERVER.md#reproducing-the-cross-server-comparison),
+because one of them takes four undocumented steps. The comparison is in
 [what else serves these bundles](#what-else-serves-these-bundles-and-what-this-does-differently).
 
 ### If you are measuring anything on this hardware

@@ -10,6 +10,10 @@
    eviction policy is only acceptable if there is one.
 3. Are stop sequences honoured? Genie wants a keyed object and silently ignores
    a bare list, so this is a real thing to get wrong.
+
+Standing the servers up to point this at -- the geniex import, and the four
+undocumented steps GenieAPIService needs -- is in "Reproducing the cross-server
+comparison" in docs/GENIE_SERVER.md. Needs `pip install tokenizers`.
 """
 import json
 import sys

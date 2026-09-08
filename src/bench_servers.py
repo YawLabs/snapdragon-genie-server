@@ -36,6 +36,11 @@ returns 125 tokens for a requested 16 under both `max_tokens` and
 
 Needs the NPU, a bundle, and `pip install tokenizers`. Unlike tests/, this is a
 hardware tool.
+
+The --geniex-model default names a model that must be IMPORTED first; standing
+both servers up on one bundle is four steps for one of them and one command for
+the other, all written down in "Reproducing the cross-server comparison" in
+docs/GENIE_SERVER.md. Do that before wondering why an arm will not start.
 """
 import argparse
 import json
