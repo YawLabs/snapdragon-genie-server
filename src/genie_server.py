@@ -114,9 +114,8 @@ def next_seed():
     """The sampler seed to load this process with.
 
     Why this is needed at all: Genie re-seeds its RNG from the config's `seed`
-    on every GenieDialog_reset (qualla Sampler::reset -- "just need to reinit
-    rng"), and _plan calls reset on every request that does not continue the
-    resident KV. The AI Hub bundles ship `"seed": 42`, so each fresh prompt
+    on every GenieDialog_reset, and _plan calls reset on every request that does
+    not continue the resident KV. The AI Hub bundles ship `"seed": 42`, so each fresh prompt
     replays the SAME pseudo-random stream and the model walks an identical
     sampling trajectory. Identical prompt in, byte-identical answer out --
     measured here three times running, and again across separate server
@@ -397,7 +396,8 @@ def sampler_penalty_state(sampler):
     """Is this sampler's repetition penalty actually going to do anything?
 
     Genie applies four `token-penalty` fields, and the block is OPTIONAL: with
-    it absent every one defaults to 0 (sampler-utils.hpp), which means no
+    it absent every one defaults to 0 (measured here, by serving the same
+    bundle with the block present and absent), which means no
     repetition suppression at all. Qualcomm's own reference config for this
     stack sets it; the AI Hub export path emits the same sampler WITHOUT it, so
     a bundle arrives sampling at temp 0.8 with nothing holding it back. What

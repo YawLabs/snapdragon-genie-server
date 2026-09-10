@@ -22,13 +22,16 @@ Qualcomm QAIRT / Genie API declarations
 --------------------------------------------------------------------------
 
 src/genie_server.py declares a small set of constants, enum values and
-ctypes function signatures for Qualcomm's Genie C API, derived from the
-published headers (include/Genie/GenieDialog.h, GenieCommon.h, GenieSampler.h
-and GenieTokenizer.h) in the QAIRT SDK. These are interoperability declarations reimplemented in
+ctypes function signatures for Qualcomm's Genie C API, derived from the QAIRT
+SDK headers (include/Genie/GenieDialog.h, GenieCommon.h, GenieSampler.h and
+GenieTokenizer.h). The docs additionally reference include/QNN/HTP/
+QnnHtpDevice.h and include/QNN/QnnTypes.h when describing device
+configuration. These are interoperability declarations reimplemented in
 Python so that this program can call the library; no Qualcomm source code,
 object code, header file or other SDK material is included or redistributed
-here. The QAIRT SDK is obtained separately by the user, directly from
-Qualcomm, under Qualcomm's own license terms.
+here, and nothing here reproduces the contents of those headers. The QAIRT
+SDK is obtained separately by the user, directly from Qualcomm, under
+Qualcomm's own license terms.
 
 --------------------------------------------------------------------------
 Trademarks

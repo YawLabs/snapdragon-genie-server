@@ -16,6 +16,7 @@ undocumented steps GenieAPIService needs -- is in "Reproducing the cross-server
 comparison" in docs/GENIE_SERVER.md. Needs `pip install tokenizers`.
 """
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -23,9 +24,14 @@ import urllib.request
 
 from tokenizers import Tokenizer
 
-BUNDLE = (r"C:\Users\jeff\yaw\genie-npu\bundles"
-          r"\qwen3_4b-genie-w4a16-x-elite-ctx8192-multi")
-TOK = Tokenizer.from_file(BUNDLE + r"\tokenizer.json")
+# Same contract as bench_servers.py: the bundle location is an env var, not a
+# path baked into the file. This script used to pin one machine's absolute
+# path, which meant it crashed on import for everyone except its author -- on
+# a script the README cites as the instrument behind a whole findings table.
+BUNDLE = os.environ.get("GENIE_BUNDLE_DIR", "")
+if not BUNDLE:
+    sys.exit("set GENIE_BUNDLE_DIR to the bundle the server under test is serving")
+TOK = Tokenizer.from_file(os.path.join(BUNDLE, "tokenizer.json"))
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18181"
 MODEL = sys.argv[2] if len(sys.argv) > 2 else "qualcomm/qwen3-4b-ours"
 CAP = sys.argv[3] if len(sys.argv) > 3 else "max_completion_tokens"

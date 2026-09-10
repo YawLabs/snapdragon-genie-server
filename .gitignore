@@ -28,3 +28,6 @@ htmlcov/
 # staging for a Hugging Face model release -- deliberately untracked, so a
 # `git add -A` cannot sweep an unpublished model card into this repo
 /publish/
+
+# Internal decision memo -- untracked before the repo went public.
+/docs/OPEN_SOURCE_PLAN.md
