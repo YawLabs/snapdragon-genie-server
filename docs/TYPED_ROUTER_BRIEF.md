@@ -187,11 +187,11 @@ take a median or treat CPU as a range. And CPU decode falls off with depth
 considerably harder than either accelerator, so any measured rate must carry
 the depth it was taken at.
 
-Provenance: measured independently by two sessions on this box on 2026-08-24.
-Canonical write-up is **ADR 019, `17da11da` on YawLabs/typed master**
-(`docs/adr/019-local-multi-engine-routing.md`; supersedes `3c99a1af`). A second
-source recorded `t6 26.2 +-1.8, t12 11.9 +-5.2` at tg16 (d0), `30.2 / 6.2` at
-tg8, and `pp512 t12 115`, corroborating the shallow end.
+Provenance: measured on this box on 2026-08-24, independently by two sessions.
+Both the numbers and the method are reproduced in full in `docs/MULTI_ENGINE.md`
+in this repo. The second session recorded `t6 26.2 +-1.8, t12 11.9 +-5.2` at
+tg16 (d0), `30.2 / 6.2` at tg8, and `pp512 t12 115`, corroborating the shallow
+end.
 
 **The deep ranking is now measured, and it does NOT flip -- so depth is not a
 routing input for the decoder choice.** Both accelerators fall past ~600 tokens
@@ -290,7 +290,18 @@ and costs 2.7 cores at `poll: true`. That is why a run measured against a
 genuinely clean GPU baseline and one measured against a both-resident baseline
 disagree, and both can be right. State which one a number is.
 
-## Concurrency measured: 1.45x (corrected 2026-08-24)
+## Concurrency measured: 1.45x (corrected 2026-08-24; net-loss reading retracted 2026-09-03)
+
+> **Read this before any number below.** A controlled A/B on 2026-09-03
+> refuted the "net loss" reading this section is built around. Both `poll`
+> settings are a **gain** over the best single engine -- 1.70x with
+> `poll: false` and **1.26x** with `poll: true`, not 0.78x. The busy-wait
+> wastes about a quarter of the win; it does not invert the verdict. Every
+> "0.78x" and every "net loss" below is the superseded 2026-08-23 reading,
+> kept because the reasoning around it is still instructive and because
+> deleting a retracted number hides that it was ever published. Current
+> figures and method: [`MULTI_ENGINE.md`](MULTI_ENGINE.md), section "The
+> controlled poll A/B".
 
 **This section reported 0.78x and "it is a net loss" until 2026-08-24.** That
 measurement was taken against bundles shipping `"poll": true`, where an idle
@@ -334,8 +345,8 @@ distinction is invisible from the endpoint:
 
 **The NPU figures in the engine table above came from the 4096 prebuilt, which
 is MULTI-length**, so they are already context-in-use numbers and are not
-understated by this. (I first told the ADR author their figures were a floor;
-that was wrong, and their bundle's own metadata says so.) The single-length
+understated by this. (An earlier claim of mine -- that those figures were a
+floor -- was wrong, and the bundle's own metadata says so.) The single-length
 16384 and 8192 bundles are the slow ones.
 
 A multi-length 8192 bundle (`--context-lengths 512,1024,2048,4096,8192`)
@@ -389,10 +400,12 @@ measurement. That applies equally to gated and ungated runs, and equally to the
 numbers elsewhere in this brief -- the window-tax measurements were taken on a
 verified-quiet box but were never clock-gated at all.
 
-So: treat the 1.45x-vs-0.78x ratio as sound (a between-configuration difference
-measured the same way on both sides, with the GPU's solo rate identical across
-them), and treat every absolute rate here -- retention percentages included --
-as gated at entry at best and unmonitored throughout. Not wrong; bounded.
+So: treat the DIRECTION of the poll difference as sound (a between-configuration
+difference measured the same way on both sides, with the GPU's solo rate
+identical across them) while treating its MAGNITUDE as superseded -- the
+controlled A/B put the two arms at 1.70x and 1.26x, not 1.45x and 0.78x -- and
+treat every absolute rate here, retention percentages included, as gated at
+entry at best and unmonitored throughout. Not wrong; bounded.
 
 **`poll: false` -- correct configuration:**
 
@@ -411,10 +424,16 @@ and **73% of the additive ideal** (36.60).
 | NPU | 12.82 t/s | 6.88 | 54% |
 | GPU | 18.05 t/s | 7.27 +-0.72 | 40% |
 
-Aggregate 14.15 t/s against 18.05: **0.78x, a net loss**, at 46% of that run's
-additive ideal (30.87). The GPU's solo rate is identical in both tables --
-nothing about the GPU changed. The busy-wait costs about half the pair's
-throughput and inverts the verdict.
+Aggregate 14.15 t/s against 18.05: ~~**0.78x, a net loss**~~, at 46% of that
+run's additive ideal (30.87). The GPU's solo rate is identical in both tables
+-- nothing about the GPU changed. The busy-wait costs about half the pair's
+throughput and ~~inverts the verdict~~.
+
+**Retracted 2026-09-03.** The controlled A/B put `poll: true` at **1.26x**, a
+gain. This run was not controlled -- a third party flipped the setting between
+arms -- so the two arms differ by more than `poll`. What survives is that the
+busy-wait costs a large slice of the win; what does not is that it turns the
+pair into a loss.
 
 **And it is the bus.** This brief retired the bandwidth premise on 2026-08-23;
 restore it. With `poll: false` the additive demand is **84.5 GB/s** and the pair
@@ -465,7 +484,10 @@ attribution to `poll` is well-supported but inferred.
 Three rules fall out for the router:
 
 1. **Check `poll` before trusting any local concurrency number, including
-   these.** `"poll": true` is the shipped default and it turns 1.45x into 0.78x.
+   these.** `"poll": true` is the shipped default and it costs roughly a
+   quarter of the concurrency win (1.70x to 1.26x in the controlled A/B).
+   It does not turn the pair into a loss -- see the retraction at the head of
+   the concurrency section.
 2. **Fanning across both engines is worth ~1.45x, not 2x.** Bandwidth is the
    ceiling and the pair already draws three-quarters of what this memory system
    delivers, so plan for diminishing returns and do not assume a third engine
@@ -519,9 +541,11 @@ misconfigured bundle and is withdrawn.
 5. **Engine configuration, not just engine selection.** One setting dominates
    everything else on this hardware: `"poll": false` in the bundle's
    `genie_config.json`. Shipped as `true` it busy-waits on 2.7 cores while idle,
-   costs up to 36% of NPU decode, and turns concurrent GPU + NPU serving from a
-   1.45x gain into a 0.78x loss. If typed ever manages these bundles, assert the
-   flag rather than trusting the vendor default.
+   costs up to 36% of NPU decode, and gives up about a quarter of the
+   concurrent GPU + NPU win (1.70x to 1.26x in the controlled A/B; an earlier
+   uncontrolled run read this as a net loss and that reading is retracted). If
+   typed ever manages these bundles, assert the flag rather than trusting the
+   vendor default.
 6. **Engine lifecycle -- and a hot spare is free.** This brief recommended
    stopping an idle engine rather than parking it hot, on the strength of a 15%
    penalty a merely-resident NPU server imposed on the GPU. That penalty was

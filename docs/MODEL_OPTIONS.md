@@ -35,14 +35,9 @@ Checked 2026-09-03, three independent ways:
   GenieX crash report for Qwen3.5 on its NPU backend (qualcomm/GenieX#1178),
   so even the llama.cpp-on-Hexagon route is not there yet for this family.
 
-When qai-hub-models grows a `qwen3_5_9b` export target, the normal chain
-(`docs/IMPLEMENTATION_PLAN.md`, `export-8192-multi.sh` in the artifacts dir)
-should apply unchanged. Until then the 9B serves through llama.cpp. A weekly
-cloud routine ("Watch Qwen3.5-9B Genie export") checks for the target
-landing, and `publish/qwen3.5-9b-genie-npu/` holds a ready-to-go Hugging
-Face model card + validated publish script so the resulting bundle can ship
-publicly the day it exists (`publish.ps1 -CardOnly` creates the private repo
-now; needs `hf auth login` with a write token first).
+When qai-hub-models grows a `qwen3_5_9b` export target, the normal chain in
+`docs/IMPLEMENTATION_PLAN.md` should apply unchanged. Until then the 9B serves
+through llama.cpp.
 
 ## GenieX: Qwen3.5 DOES reach the NPU now -- it is just not worth it yet (2026-09-03)
 

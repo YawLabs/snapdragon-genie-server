@@ -3,6 +3,12 @@
 **What this repo is: a measurement log for running an LLM on the Snapdragon X
 Elite Hexagon NPU, and a server that applies what it found.**
 
+**Scope:** everything here was measured on one machine -- a Snapdragon X Elite
+X1E80100 (Hexagon v73) running Windows on ARM64 -- at sample sizes of 1 to 3,
+and nothing has been reproduced on a second box. Which claims are measured and
+which are only documented is set out in
+[Proven vs untested](#proven-vs-untested-here-on-this-machine).
+
 The findings are the valuable part and they are portable -- most are properties
 of Genie and of the AI Hub bundles, not of this code, so they hold whichever
 server you run. Several of them are worth 2-3x and are invisible in every
@@ -176,6 +182,32 @@ pip install -r requirements.txt        # onnxruntime-qnn pulls onnxruntime 1.29 
 If a plain `onnxruntime` is already present, do **not** try to patch it in
 place (`uninstall onnxruntime` then `--force-reinstall onnxruntime-qnn
 --no-deps` is not enough). Start from a fresh venv.
+
+### Getting the bundle and the SDK
+
+That venv is the whole prerequisite for the GEMM benchmark below: `bench.py`
+generates its own ONNX models and the QNN EP arrives with the wheel, so nothing
+beyond `requirements.txt` is needed. **Everything Genie-side is different** --
+and that is where the five headline findings live. No bundle, no QAIRT runtime
+and no weights ship in this repo; both of the things they come from are
+obtained by you, from Qualcomm.
+
+- **A free Qualcomm AI Hub account**, for the bundles. Both routes to one
+  authenticate against it -- `qai-hub-models export` (compile a bundle for your
+  own chipset) and `qai-hub-models fetch` (pull a Qualcomm prebuilt) -- so run
+  `qai-hub configure --api_token <token>`, with the token from your AI Hub
+  account, once before either. An export has to run from Linux/WSL; the Windows
+  path dies on `fcntl`. The chain end to end, the flag that matters most
+  (`--context-lengths`, finding 2 above) and what each step actually produced
+  here are in [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md), and
+  the per-model matrix is in [docs/MODEL_OPTIONS.md](docs/MODEL_OPTIONS.md).
+  They are not repeated here.
+- **The QAIRT SDK**, obtained separately from Qualcomm under their own terms.
+  A bundle is locked to one Hexagon arch *and* one QAIRT version, so the
+  runtime has to match what the bundle was compiled against or it fails at
+  `GenieDialog_create`. What the server needs on disk, and how it derives the
+  archs this box can serve, is in
+  [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md).
 
 ## Run the benchmark
 
@@ -603,9 +635,41 @@ docs/MODEL_CONVERSION.md  full-LLM path: Olive / AI Hub / Foundry Local + genai 
 docs/MODEL_OPTIONS.md     the model matrix: what serves where (4B/8B NPU, 9B llama.cpp) and why
 docs/MULTI_ENGINE.md      running NPU + GPU + CPU at once -- 1.45x measured, and why
 docs/TYPED_ROUTER_BRIEF.md  self-contained handoff for the routing work in typed
+                          (typed is a separate coding-agent product that consumes
+                          these endpoints; the brief is kept here because the
+                          measurements in it are this box's)
 requirements.txt          onnxruntime-qnn, onnx, numpy (genai is separate/optional)
-requirements-dev.txt      pytest only; the server itself has NO pip dependencies
+requirements-dev.txt      pytest, ruff, numpy, tokenizers -- tests, lint and the
+                          bench harnesses; the server has NO pip dependencies
 ```
+
+## Support
+
+This is a research log and a reference implementation, not a supported product.
+It is one person's measurements on one machine, published because the findings
+are portable. Issues and pull requests are welcome but unpromised: there is no
+SLA, no roadmap, and no commitment to respond.
+
+A bug report that can be acted on names, at minimum:
+
+- **the exact device** -- X Elite vs X Plus vs X2 Elite, and the part number if
+  you have it. Everything here is a v73 X1E80100; v81 is derived-and-offered
+  but unverified.
+- **the QAIRT / SDK version** -- both the one the bundle was compiled against
+  and the one you are running. A mismatch is a load failure, not a slow path.
+- **the bundle's compiled context lengths** -- `genie.context_lengths` in
+  `genie_config.json`, or `n_ctx` from a running server's `/props`. A
+  single-length bundle and a multi-length one at the same window are 2-3x
+  apart, and `metadata.json` cannot tell them apart.
+- **whether the box was quiet when you measured.**
+
+That last one is not a formality. This repo documents ambient load producing
+false results: a drifting box hands all its drift to whichever arm ran second,
+base clock varied 42-79% across the cross-server passes here, and a busy box
+gives a slower CPU baseline and so a *larger* apparent NPU win. The rest of
+that list is under
+[if you are measuring anything on this hardware](#if-you-are-measuring-anything-on-this-hardware).
+A number taken on a loaded box is not comparable to one taken here.
 
 ## License
 

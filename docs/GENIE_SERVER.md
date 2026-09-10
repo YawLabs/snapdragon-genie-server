@@ -290,8 +290,8 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
 - **The sampler ships with NO repetition penalty, and that is what a
   degenerate loop looks like.** Genie's `token-penalty` block is optional and
   every field in it defaults to 0 (`penalize-last-n`, `repetition-penalty`,
-  `presence-penalty`, `frequency-penalty` -- read off
-  `examples/Genie/Genie/src/qualla/include/qualla/detail/sampler-utils.hpp`),
+  `presence-penalty`, `frequency-penalty` -- established here by running bundles
+  with the block present and absent and diffing the output),
   so a bundle without it samples at temp 0.8 with nothing suppressing a repeat.
   Every bundle here arrived that way: the sampler is byte-identical to
   Qualcomm's own reference for this stack **minus** that block. The symptom is
@@ -379,7 +379,7 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
 
 - **Every fresh prompt replayed the same answer, because the seed is reset per
   request.** Genie re-seeds its RNG from the config's `seed` on every
-  `GenieDialog_reset` (qualla `Sampler::reset` -- "just need to reinit rng"),
+  `GenieDialog_reset`,
   and the server resets whenever a prompt does not continue the resident KV. The
   AI Hub bundles ship `"seed": 42`, so at temp 0.8 the model was nominally
   sampling while the dice were reset before every roll: identical prompt in,
