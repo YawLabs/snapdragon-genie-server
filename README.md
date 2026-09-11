@@ -1,5 +1,7 @@
 # snapdragon-genie-server
 
+[![Follow @TokenLimitNews on X](https://img.shields.io/badge/follow-%40TokenLimitNews-000000?logo=x&logoColor=white)](https://x.com/TokenLimitNews)
+
 **What this repo is: a measurement log for running an LLM on the Snapdragon X
 Elite Hexagon NPU, and a server that applies what it found.**
 
