@@ -32,7 +32,9 @@ can detect it structurally instead of by parsing content. A turn the SERVER
 cut short -- its watchdog aborting a stall, or shutdown aborting the turn in
 flight -- ends the same way now (on a non-streaming request: 500 for the
 stall, 503 for shutdown), with no `finish_reason` / `stop_reason`, where it
-used to end as an ordinary `stop` / `end_turn` over a fragment. The full list
+used to end as an ordinary `stop` / `end_turn` over a fragment. The shutdown
+case was checked on the NPU on 2026-09-17, on both APIs, streamed and not;
+the stall case has run only in device-free tests. The full list
 of codes and what to do with each is under **Status codes** in "What to
 build".
 
@@ -834,7 +836,7 @@ These are properties of the NPU endpoint that a router must not assume away:
   (`finish_reason: "length"` on the OpenAI side) is reported when the cap is
   hit -- as of 2026-09-16; before that a generation that ran into its cap
   reported as a natural stop and `length` meant only the engine's
-  context-exceeded warning. **Checked on the NPU on 2026-09-18:** a 6-token
+  context-exceeded warning. **Checked on the NPU on 2026-09-17:** a 6-token
   cap on the 4B multi-length bundle returned `finish_reason: "length"` and
   `stop_reason: "max_tokens"` on both APIs, on `master` and on the branch
   after it. That is one bundle and one cap size, so a router should still
