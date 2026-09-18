@@ -771,7 +771,7 @@ Reasons to use something else, none of them hypothetical:
   a Genie bundle today and serves via `src/run-llama-server.ps1` on the CPU
   or Adreno instead -- the model matrix and the reasons are in
   [docs/MODEL_OPTIONS.md](docs/MODEL_OPTIONS.md).
-- **The server's request paths, checked on the NPU on 2026-09-18** against
+- **The server's request paths, checked on the NPU on 2026-09-17** against
   both `master` at cc65d97 and the branch that added `--help` and the other
   first-run fixes, with the 4B multi-length 8192 bundle. Each passed on both
   commits: the OpenAI and Anthropic APIs, streamed and not; a 6-token
@@ -783,6 +783,21 @@ Reasons to use something else, none of them hypothetical:
   the engine; decode at 18.3 and 15.9 t/s; `/props` reporting the bundle as
   multi-length; and `--help` exiting in 0.26 s with the real bundle configured,
   loading nothing. `/health` stayed `ok` with no failures booked throughout.
+- **Shutdown in the middle of a generation, checked on the NPU on
+  2026-09-17** against `master` at 726cd8a: the server was interrupted two
+  and a half seconds into a 600-token reply, once for each API streamed and
+  not. It took the same `KeyboardInterrupt` path as a Ctrl-C, sent as a
+  console break because one process cannot send Ctrl-C to another's group.
+  Both streams ended in the API's error frame or event with no
+  `finish_reason` / `stop_reason`, both non-streamed requests got a 503
+  saying the generation was aborted part-way, and the process exited 0 within
+  2.3-5.2 s each time.
+- **The Qwen3.5-9B CPU leg's first-run download, checked on 2026-09-17**:
+  with no copy of the model in the Hugging Face cache,
+  `src/run-llama-server.ps1 -Leg cpu` fetched the 5.38 GB Q4_0 file (its
+  SHA-256 matched the name the cache files it under), loaded it and answered
+  `/health` within 3 min 40 s of launch, then served the OpenAI and Anthropic
+  APIs and a tool call.
 - **Full-model prefill and decode, measured** via `src/bench_endpoint.py`. The
   variable that matters is the bundle's LENGTH CLASS, not its window: a
   single-length export pays for its whole compiled window on every token, while

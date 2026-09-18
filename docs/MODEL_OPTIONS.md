@@ -143,7 +143,10 @@ Three more things the launcher does before or around the start:
   cause:` block names the file. Move it aside, or delete it, and rerun -- but
   only if nothing else is fetching that repo right now; never just drop the
   `.downloadInProgress` suffix, since an oversize partial is not a valid GGUF.
-  **The launcher deletes and moves nothing.**
+  **The launcher deletes and moves nothing.** After a corrupt partial was
+  deleted on this box, a clean fetch was checked on 2026-09-17: the cpu leg
+  fetched the whole Q4_0 file, whose SHA-256 matched its blob name, and served
+  requests (see the README's proven list).
 - **`-Help` / `-h` print usage** (and `--help` under `powershell -File`): the
   legs, the `LLAMA_*` variables and their defaults, and the docs, then exit 0
   without touching the env, the disk or the network. `-?` / `Get-Help -Full`

@@ -680,6 +680,13 @@ A turn that finished before the abort landed is reported as the whole answer
 it is, and a client's OWN disconnect is unchanged: it left, so nothing is
 sent.
 
+Checked on the NPU on 2026-09-17, on `master` at 726cd8a. The test
+interrupted the server two and a half seconds into a 600-token reply, once
+for each API streamed and not. Each streamed client got the error frame or
+event and no normal stop. Each non-streamed client got the 503 above. The
+log said `aborted mid-stream (shutdown)` or `503`, and the process exited 0
+within 2.3-5.2 s each time.
+
 ## Notes / limitations
 
 - **Context window: evict, don't crash.** The compiled window is fixed (read
@@ -1452,11 +1459,13 @@ sent.
   the streaming-failure note below), so `stop` / `end_turn` / `stop_sequence`
   can no longer be a stall.
 
-  **How far the cap detection is verified:** only against device-free stubs.
-  How many token callbacks real Genie makes per token, and the exact count it
-  reaches at the cap, have not been measured on the NPU, so `length` at the
-  cap is the stubbed contract rather than an observed one -- see the README's
-  untested list.
+  **How far the cap detection is verified:** checked on the NPU on
+  2026-09-17 for one bundle and one cap. With a 6-token cap, the 4B
+  multi-length bundle reported `finish_reason: "length"` and
+  `stop_reason: "max_tokens"` on both APIs (see the README's proven list).
+  Nobody has measured how many token callbacks real Genie makes per token, so
+  another bundle or cap size could still come out one short and report
+  `stop`. Treat a `stop` right at the cap as possibly capped.
 
 - **The output cap: both spellings, resolved once, applied every turn.**
   `max_tokens` and `max_completion_tokens` are both honoured. For either one
