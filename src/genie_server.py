@@ -20,8 +20,8 @@ one's default and what it decides -- is the "Environment" section of
 docs/GENIE_SERVER.md, and it is deliberately not repeated here: a second copy
 is how this docstring came to list nine of the twenty-one and to promise
 "sensible defaults" for the two that have none. GENIE_BUNDLE_DIR and
-GENIE_SDK_DIR are REQUIRED -- load_engine exits at startup naming them when
-either is unset -- and run-genie-server.ps1 derives both from GENIE_NPU_ROOT,
+GENIE_SDK_DIR are REQUIRED -- load_engine exits at startup naming whichever
+is unset -- and run-genie-server.ps1 derives both from GENIE_NPU_ROOT,
 so the normal launch path never sets them by hand. Every reader degrades on a
 malformed value (a warning line naming the variable, then the default) rather
 than refusing to boot; see _int_env.
@@ -38,6 +38,7 @@ import re
 import select
 import socket
 import sys
+import sysconfig
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,14 +50,15 @@ from urllib.parse import unquote, urlsplit
 def _int_env(name, default, minimum=None):
     """An int from the environment, or `default` with a line saying why not.
 
-    EVERY config reader here goes through this, _float_env or _path_env, and
-    that is the contract: a typo in any GENIE_* variable degrades to the
-    default with a line naming the variable and the value it rejected, never
-    a refusal to boot. It held for exactly two readers for a while (GENIE_SEED
-    and GENIE_ORPHAN_HOLD_CHARS) while this docstring claimed the rest already
-    behaved -- GENIE_PORT=808O killed the process at IMPORT with a bare
-    `invalid literal for int()`, before any startup line had printed, on a
-    server whose whole startup banner exists to explain itself.
+    EVERY config reader here goes through this, _float_env, _bool_env or
+    _path_env, and that is the contract: a typo in any GENIE_* variable
+    degrades to the default with a line naming the variable and the value it
+    rejected, never a refusal to boot. It held for exactly two readers for a
+    while (GENIE_SEED and GENIE_ORPHAN_HOLD_CHARS) while this docstring
+    claimed the rest already behaved -- GENIE_PORT=808O killed the process
+    at IMPORT with a bare `invalid literal for int()`, before any startup line
+    had printed, on a server whose whole startup banner exists to explain
+    itself.
 
     `minimum` extends the same contract to a value that PARSES and is still
     not usable, because "rejected" has to mean the same thing either way. A
@@ -100,6 +102,39 @@ def _float_env(name, default):
         return default
 
 
+_TRUE_WORDS = ("1", "true", "yes", "on")
+_FALSE_WORDS = ("0", "false", "no", "off")
+
+
+def _bool_env(name, default):
+    """_int_env for an on/off flag: every usual spelling, either way, or a line.
+
+    Stripped and case-insensitive, and 1/true/yes/on and 0/false/no/off are
+    all accepted. Anything else degrades to the default with a line naming the
+    variable and the value, which is the contract every other reader here
+    keeps. Each flag used to parse its own way, and each way had a hole that
+    read a value as the OPPOSITE of what was meant, silently:
+    GENIE_WEDGE_EXIT compared against three lowercase words, so `False` --
+    what PowerShell's `$env:GENIE_WEDGE_EXIT = $false` stores -- `off` or
+    ` 0` left the exit on for exactly the operator who had set the variable
+    to turn it off; GENIE_THINKING read `True` and `on` as off;
+    GENIE_STRIP_THINK took nothing but "1"; and GENIE_SUMMARIZE_EVICTED read
+    anything but "0" as on, `false` included.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    word = raw.lower()
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    print("[genie] WARNING: %s=%r is not an on/off value (1/true/yes/on or "
+          "0/false/no/off); using %s instead."
+          % (name, raw, "on" if default else "off"), flush=True)
+    return default
+
+
 def _path_env(name):
     """A directory from the environment, made absolute; "" when unset.
 
@@ -118,8 +153,8 @@ def _path_env(name):
 
 # The bundle (context binaries + config + tokenizer) and the QAIRT 2.45 runtime
 # are large external artifacts that do NOT live in this repo, and these two
-# have NO default: load_engine exits at startup naming both when either is
-# empty. run-genie-server.ps1 derives them from GENIE_NPU_ROOT -- the directory
+# have NO default: load_engine exits at startup naming whichever is empty.
+# run-genie-server.ps1 derives them from GENIE_NPU_ROOT -- the directory
 # holding bundles/ and qairt/, defaulting to ../genie-npu beside this repo --
 # picking the bundle by its -Model name and the newest qairt/* for the SDK, so
 # the normal launch path never sets these by hand. Set them directly only when
@@ -155,7 +190,7 @@ MAX_BODY_BYTES = _int_env("GENIE_MAX_BODY_BYTES", 8 * 1024 * 1024)
 # reads. What it bounds there is a client that stopped READING, which is
 # handled as one that left (see _Emitter.write).
 SOCKET_TIMEOUT_S = _int_env("GENIE_SOCKET_TIMEOUT", 120)
-STRIP_THINK = os.environ.get("GENIE_STRIP_THINK", "0") == "1"
+STRIP_THINK = _bool_env("GENIE_STRIP_THINK", False)
 # Qwen3 is a reasoning model: left alone it emits a <think> block before every
 # answer. Measured on this box, a single tool-calling turn spent ~280 of its
 # 300 output tokens thinking -- 41s against 2.4s for the same prompt and the
@@ -175,7 +210,7 @@ STRIP_THINK = os.environ.get("GENIE_STRIP_THINK", "0") == "1"
 # Faithfulness is still one env var or one request field away, and NOTHING here
 # is lossy -- suppression is a prompt prefill, not a filter over the output, so
 # a caller that asks for reasoning gets exactly what the model produces.
-THINKING_DEFAULT = os.environ.get("GENIE_THINKING", "0") in ("1", "true", "yes")
+THINKING_DEFAULT = _bool_env("GENIE_THINKING", False)
 # Headroom left between the rendered prompt and the compiled window, so a
 # generation has somewhere to go. Genie hard-errors (status=4) on overflow --
 # it does not truncate -- so the margin is what stands between a long session
@@ -240,7 +275,7 @@ def next_seed():
 # information it had. Summarising the turns on their way out keeps the facts and
 # discards only the tokens. Costs one extra NPU call, and ONLY when eviction was
 # going to happen anyway (i.e. the alternative was losing the content).
-SUMMARIZE_EVICTED = os.environ.get("GENIE_SUMMARIZE_EVICTED", "1") != "0"
+SUMMARIZE_EVICTED = _bool_env("GENIE_SUMMARIZE_EVICTED", True)
 SUMMARY_MAX_TOKENS = _int_env("GENIE_SUMMARY_MAX_TOKENS", 192)
 
 
@@ -682,8 +717,10 @@ def bundle_config_warnings():
     an outage.
     """
     # Nothing to say about a bundle that is not there. load_engine is about to
-    # exit naming the env vars, and a note in front of it reads as "your bundle
-    # is misconfigured" when the answer is "you have not pointed me at one".
+    # exit naming what is missing -- the unset variable, or the directory that
+    # holds no genie_config.json -- and a note in front of it reads as "your
+    # bundle is misconfigured" when the answer is "you have not pointed me at
+    # one".
     if not config_present():
         return []
     out = []
@@ -813,13 +850,34 @@ GENIE_STATUS_WARNING_ABORTED = 1
 GENIE_STATUS_WARNING_BOUND_HANDLE = 2
 GENIE_STATUS_WARNING_PAUSED = 3
 GENIE_STATUS_WARNING_CONTEXT_EXCEEDED = 4
+GENIE_STATUS_ERROR_MEM_ALLOC = -3
 GENIE_STATUS_NAMES = {
     GENIE_STATUS_SUCCESS: "SUCCESS",
     GENIE_STATUS_WARNING_ABORTED: "WARNING_ABORTED",
     GENIE_STATUS_WARNING_BOUND_HANDLE: "WARNING_BOUND_HANDLE",
     GENIE_STATUS_WARNING_PAUSED: "WARNING_PAUSED",
     GENIE_STATUS_WARNING_CONTEXT_EXCEEDED: "WARNING_CONTEXT_EXCEEDED",
+    # And the errors, verbatim from the same header, so that every exit and
+    # raise that prints a status prints its name too. The load failure is the
+    # one that needed it: GenieDialog.h lists MEM_ALLOC among GenieDialog_
+    # create's returns, and a bare "status=-3" printed over advice to rebuild
+    # the bundle read as an arch mismatch when it is memory.
+    -1: "ERROR_GENERAL",
+    -2: "ERROR_INVALID_ARGUMENT",
+    GENIE_STATUS_ERROR_MEM_ALLOC: "ERROR_MEM_ALLOC",
+    -4: "ERROR_INVALID_CONFIG",
+    -5: "ERROR_INVALID_HANDLE",
+    -6: "ERROR_QUERY_FAILED",
+    -7: "ERROR_JSON_FORMAT",
+    -8: "ERROR_JSON_SCHEMA",
+    -9: "ERROR_JSON_VALUE",
+    -10: "ERROR_GENERATE_FAILED",
+    -11: "ERROR_GET_HANDLE_FAILED",
+    -12: "ERROR_APPLY_CONFIG_FAILED",
+    -13: "ERROR_SET_PARAMS_FAILED",
+    -14: "ERROR_BOUND_HANDLE",
 }
+
 # The statuses a generation can END in, i.e. the ones _finish decodes. This
 # is ALSO what EngineHealth counts as "ok": an abort is this server's own
 # doing and a full window is a normal finish, and both used to be booked as
@@ -833,6 +891,14 @@ GENIE_STATUS_NAMES = {
 GENIE_FINISHED_STATUSES = frozenset((GENIE_STATUS_SUCCESS,
                                      GENIE_STATUS_WARNING_ABORTED,
                                      GENIE_STATUS_WARNING_CONTEXT_EXCEEDED))
+
+
+def status_text(st):
+    """A Genie status as `-3 (ERROR_MEM_ALLOC)`, or the bare number when the
+    header has no name for it."""
+    name = GENIE_STATUS_NAMES.get(st)
+    return "%s (%s)" % (st, name) if name else "%s" % st
+
 
 # GenieDialog_SentenceCode_t
 SENTENCE_COMPLETE = 0
@@ -1257,8 +1323,11 @@ class ChatML:
 # progress the calling thread is stuck inside the driver, holding the engine
 # lock, and Python cannot reclaim it -- no timeout, no interrupt, no kill. Every
 # later request then parks behind that lock until MAX_INFLIGHT is exhausted and
-# the rest get a fast 429, which is why this presents from the outside as a
-# server that 429s forever while sitting completely idle.
+# the rest get a fast 429, which is why this presented from the outside as a
+# server that 429s forever while sitting completely idle. That still holds for
+# the first 120-300s, while the stall is inside its limit and nothing can yet
+# tell it from a slow prefill; once HEALTH says stalled or wedged, do_POST
+# refuses new generations with the same 503 /health answers, by name.
 #
 # Two consequences shape everything below. First, /health MUST stop saying "ok",
 # because a health check that passes while nothing can be served is worse than
@@ -1279,7 +1348,10 @@ FAIL_THRESHOLD = max(1, _int_env("GENIE_FAIL_THRESHOLD", 3))
 # Exit rather than linger. 75 is EX_TEMPFAIL: "temporary failure, try again",
 # which is exactly what a supervisor should read from it.
 EXIT_WEDGED = 75
-WEDGE_EXIT = os.environ.get("GENIE_WEDGE_EXIT", "1") not in ("0", "false", "no")
+# Read through _bool_env: `False`, `off` and ` 0` all used to leave this ON,
+# and the one operator who sets it is the one with no supervisor to restart
+# the process it would then exit -- see _bool_env.
+WEDGE_EXIT = _bool_env("GENIE_WEDGE_EXIT", True)
 # How long shutdown waits for an aborted generation to release the engine lock
 # before giving up on GenieDialog_free. An abort takes effect within one decode
 # step (under a second at the slowest measured 3.3 t/s), so a lock still held
@@ -1492,13 +1564,17 @@ class _Turn:
     asked: the watchdog, because the turn had stopped making progress. That
     is the one abort that is the engine's fault rather than a client's
     choice, and _run_query books it as a failed generation -- see there.
+    `shutdown` is the other abort the SERVER sends: begin_shutdown marks the
+    live turn before it aborts it. Both are what query_stream reports as a
+    turn the server cut short (see there); a client's own abort is neither.
     """
-    __slots__ = ("aborted", "done", "stalled")
+    __slots__ = ("aborted", "done", "shutdown", "stalled")
 
     def __init__(self):
         self.aborted = False
         self.done = False
         self.stalled = False
+        self.shutdown = False
 
 
 class EngineClosing(RuntimeError):
@@ -1513,6 +1589,22 @@ class EngineClosing(RuntimeError):
     never started, nothing about it was wrong, and another leg can serve it
     now.
     """
+
+
+# What a client is told when the SERVER aborted its turn part-way, by who
+# aborted it (query_stream's result["aborted_by"]). Handler._run sends these as
+# an error -- a non-200 on a buffered response, the API's own error frame
+# mid-stream -- rather than as a finish, because the text is a fragment: 503
+# for shutdown (nothing was wrong with the request, and another engine can
+# serve it now) and 500 for the watchdog (the engine failed it, and books it
+# as a failed generation).
+SERVER_ABORTS = {
+    "shutdown": ("the server is shutting down: this generation was aborted "
+                 "part-way and did not finish. Retry on another engine."),
+    "watchdog": ("the engine stalled: no token arrived within its limit, so "
+                 "the watchdog aborted this generation part-way and it did "
+                 "not finish. GET /health reports the engine's state."),
+}
 
 
 class GenieEngine:
@@ -1593,9 +1685,20 @@ class GenieEngine:
         and close() has the lock one release later. It is set BEFORE the abort
         rather than inside close() because the gap between the two calls is
         itself the race -- the aborted turn can release the lock in it.
+
+        The live turn is MARKED as shutdown's in the same step, so that its
+        client is told the truth about it. Aborted like any other, it went out
+        as a 200 with the text cut wherever the abort landed, labelled "stop"
+        / "end_turn" -- a cut answer an agent files as complete, beside the
+        503 the queued turn behind it got. The mark alone decides nothing: a
+        turn that finishes before the abort lands is not `aborted`, and
+        query_stream reports it as the whole answer it is.
         """
         with self._abort_lock:
             self._closing = True
+            live = self._live
+            if live is not None and not live.done:
+                live.shutdown = True
         return self.signal_abort(any_turn=True)
 
     def close(self, timeout=None):
@@ -1658,7 +1761,11 @@ class GenieEngine:
 
         ABORTED is not a failure: it is this server's own signal_abort landing
         after the client hung up, so it reports like any other early stop
-        rather than raising into a request nobody is reading any more.
+        rather than raising into a request nobody is reading any more. The
+        status cannot say who sent the abort, so the two the SERVER sends on
+        a turn whose client is still there -- shutdown, and the watchdog on a
+        stall -- are reported by query_stream (result["aborted_by"]), never
+        as this "stop".
 
         Anything else raises, and raises by NAME where the header has one.
         BOUND_HANDLE and PAUSED are warnings too, but neither is a way a query
@@ -1702,8 +1809,9 @@ class GenieEngine:
         st = self.lib.GenieDialog_setStopSequence(self.dialog, payload.encode("utf-8"))
         if st != GENIE_STATUS_SUCCESS:
             raise RuntimeError(
-                "GenieDialog_setStopSequence failed, status=%d; refusing to "
-                "generate with %s" % (st, "another request's stop sequences "
+                "GenieDialog_setStopSequence failed, status=%s; refusing to "
+                "generate with %s" % (status_text(st),
+                                      "another request's stop sequences "
                                       "still armed" if self._stop_dirty else
                                       "this request's stop sequences unset"))
         self._stop_dirty = bool(seqs)
@@ -1793,8 +1901,9 @@ class GenieEngine:
         st = self.lib.GenieDialog_reset(self.dialog)
         if st != GENIE_STATUS_SUCCESS:
             raise RuntimeError(
-                "GenieDialog_reset failed, status=%d; refusing to generate "
-                "against a KV that may still hold another conversation" % st)
+                "GenieDialog_reset failed, status=%s; refusing to generate "
+                "against a KV that may still hold another conversation"
+                % status_text(st))
         return prompt, False
 
     def _commit(self, prompt, generated, ok):
@@ -1987,9 +2096,9 @@ class GenieEngine:
                     self.dialog, C.c_uint32(cap))
                 if cap_st != GENIE_STATUS_SUCCESS:
                     raise RuntimeError(
-                        "GenieDialog_setMaxNumTokens(%d) failed, status=%d; "
+                        "GenieDialog_setMaxNumTokens(%d) failed, status=%s; "
                         "refusing to generate under another request's token "
-                        "cap" % (cap, cap_st))
+                        "cap" % (cap, status_text(cap_st)))
                 cb = QUERY_CALLBACK(_cb)  # keep ref alive for the blocking call
                 with self._abort_lock:
                     # Checked and armed in one step, so an abort lands on one
@@ -2135,7 +2244,10 @@ class GenieEngine:
                      sampler=None, commit=True, internal=False):
         """Generator: yields text chunks, then sets result['finish'] (and
         result['error'] on failure, plus result['closing'] when that failure
-        is shutdown refusing the turn) when done. The blocking Genie query runs
+        is shutdown refusing the turn, or result['aborted_by'] -- "shutdown"
+        or "watchdog" -- when the SERVER aborted the turn part-way: the text
+        yielded is then a fragment, whatever `finish` says) when done. A
+        client's own abort sets none of these. The blocking Genie query runs
         on a WORKER thread so the consumer (the request/handler thread) can call
         signal_abort() on client disconnect -- a cross-thread signal, which is
         how Genie's abort is designed to be delivered. This is what actually
@@ -2164,7 +2276,19 @@ class GenieEngine:
                                          turn, max_tokens=max_tokens, stop=stop,
                                          sampler=sampler, commit=commit,
                                          internal=internal)
-                q.put(("done", finish))
+                # Whether the SERVER cut this turn short. _finish reports
+                # ABORTED as "stop" -- right for a client that aborted by
+                # leaving, since nobody reads the answer -- and it was also
+                # all a client heard when shutdown or the watchdog aborted
+                # its turn: a 200 carrying text cut wherever the abort landed,
+                # labelled "stop" / "end_turn" (or "stop_sequence"). Read
+                # after _run_query, when `done` has made the flags final.
+                with self._abort_lock:
+                    cut_by = None
+                    if turn.aborted:
+                        cut_by = ("shutdown" if turn.shutdown else
+                                  "watchdog" if turn.stalled else None)
+                q.put(("cut", (cut_by, finish)) if cut_by else ("done", finish))
             except EngineClosing as e:
                 # Kept apart from every other failure all the way to the
                 # consumer: the exception type is the only thing that survives
@@ -2184,6 +2308,12 @@ class GenieEngine:
                     yield val
                 elif kind == "done":
                     result["finish"] = val
+                    ended = True
+                    return
+                elif kind == "cut":
+                    by, result["finish"] = val
+                    result["aborted_by"] = by
+                    result["error"] = SERVER_ABORTS[by]
                     ended = True
                     return
                 else:
@@ -2813,18 +2943,187 @@ def _anthropic_to_prompt(req, tools=None, max_tokens=0):
 TOKENIZER_STATUS = None
 
 
+def _bundles_below(path, limit=5):
+    """Subdirectories of `path` that hold a genie_config.json -- the bundles
+    one level down, which is where a directory one level off has them."""
+    try:
+        names = sorted(os.listdir(path))
+    except OSError:
+        return []
+    return [n for n in names
+            if os.path.isfile(os.path.join(path, n, "genie_config.json"))][:limit]
+
+
+def bundle_files_missing():
+    """Files genie_config.json names that are not in the bundle, in order.
+
+    The context binaries (`ctx-bins`), the tokenizer's `path` and the backend
+    `extensions` file: every file Genie will go looking for, resolved the way
+    Genie resolves them -- against the bundle dir, which load_engine chdirs
+    into. Searched by key rather than addressed by path, for the reason
+    _find_all gives. [] when the config cannot be read: Genie parses it
+    itself and names the syntax error better than this could.
+
+    Checked because nobody else does. GenieDialogConfig_createFromJson
+    accepts a config whose files are gone -- measured here, it returned
+    SUCCESS for a ctx-bin renamed to a file that does not exist and for an
+    empty working directory -- so an incomplete copy of a multi-GB bundle went
+    all the way to GenieDialog_create, whose exit blames an arch or QAIRT
+    mismatch, and sent the operator to rebuild a bundle that was only
+    half-copied.
+    """
+    try:
+        cfg = _load_bundle_json("genie_config.json")
+    except Exception:
+        return []
+    named = []
+    for v, _p in _find_all(cfg, "ctx-bins"):
+        if isinstance(v, list):
+            named.extend(x for x in v if isinstance(x, str))
+    for v, _p in _find_all(cfg, "tokenizer"):
+        if isinstance(v, dict) and isinstance(v.get("path"), str):
+            named.append(v["path"])
+    for v, _p in _find_all(cfg, "extensions"):
+        if isinstance(v, str):
+            named.append(v)
+    out = []
+    for name in named:
+        if (name and name not in out
+                and not os.path.isfile(os.path.join(BUNDLE_DIR, name))):
+            out.append(name)
+    return out
+
+
+def _dll_load_failure(path, err):
+    """The exit for a Genie.dll that would not load: which of three it is.
+
+    ctypes says only "Could not find module ... (or one of its
+    dependencies). Try using the full path with constructor syntax." -- about
+    a path that is already full -- or "[WinError 193] %1 is not a valid Win32
+    application", and it said so as a traceback. The three causes need three
+    different fixes, and each is decidable from here.
+    """
+    plat = sysconfig.get_platform()
+    if plat != "win-arm64":
+        # The one a direct `python genie_server.py` walks into: the launcher
+        # refuses a non-ARM64 python by name, and this is that refusal for
+        # the run the launcher is not part of. WinError 193 is its symptom.
+        return ("cannot load %s: %s\nThis Python is %s (%s). Genie.dll and "
+                "its Qnn* dependencies are aarch64-windows-msvc, so only a "
+                "native ARM64 Python can load them: run this with an ARM64 "
+                "python.exe -- under run-genie-server.ps1, point GENIE_PYTHON "
+                "at one." % (path, err, plat, sys.executable))
+    if getattr(err, "winerror", None) == 193:
+        return ("cannot load %s: %s\nThis Python is ARM64, so the DLL is not "
+                "an ARM64 image: GENIE_SDK_DIR (%s) is not the Windows-on-"
+                "Snapdragon QAIRT 2.45, or its lib/aarch64-windows-msvc is "
+                "damaged. Point GENIE_SDK_DIR at a complete QAIRT 2.45 root."
+                % (path, err, SDK_DIR))
+    if not os.path.isfile(path):
+        return ("no Genie.dll at %s\nGENIE_SDK_DIR (%s) must be the QAIRT 2.45 "
+                "root -- the directory holding lib/aarch64-windows-msvc/"
+                "Genie.dll -- and that file is not there: an incomplete SDK "
+                "extract, or a path one level off." % (path, SDK_DIR))
+    return ("cannot load %s: %s\nThe file is there, so one of ITS dependencies "
+            "would not load: check that the Qnn*.dll files beside it are all "
+            "present (an incomplete SDK extract) and that the Microsoft Visual "
+            "C++ runtime for ARM64 is installed. GENIE_SDK_DIR is %s."
+            % (path, err, SDK_DIR))
+
+
+# When a model load has run long enough to say so, and how often after that.
+# The banner quotes ~11-15s warm and ~35s cold, and the slowest load in any log
+# kept here is 36.8s, so 60s is past every load seen rather than a tight
+# bound on one.
+LOAD_SLOW_AFTER_S = 60.0
+LOAD_SLOW_EVERY_S = 60.0
+
+
+def _watch_slow_load(loaded, t0, after=None, every=None):
+    """Print a line while the model load runs long; return once it has ended.
+
+    GenieDialog_create is ONE blocking native call, the watchdog does not
+    start until it returns, and the port refuses connections until then --
+    so a load that never finished looked, from every side, exactly like one
+    still working: the "loading model" line, then nothing, for as long as it
+    lasted. No load logged here has hung, and the two suspects have evidence
+    against them (a second model loaded beside a resident one; degraded-
+    interrupt boxes loaded normally and only decoded slowly), so the line
+    says what to suspect, not what happened.
+
+    Its own thread, handed only the Event that load_engine sets when the call
+    returns and the time it started: nothing here can reach the lib, the
+    dialog or the engine. Ctrl-C is named for what it is during the load --
+    Python acts on it only between bytecodes, and this thread's whole reason
+    to exist is a main thread that is not getting back to any.
+    """
+    after = LOAD_SLOW_AFTER_S if after is None else after
+    every = LOAD_SLOW_EVERY_S if every is None else every
+    wait = after
+    while not loaded.wait(wait):
+        print("[genie] still loading after %.0fs; a normal load takes ~11-15s, "
+              "up to ~35s cold. If it never finishes, suspect the HTP: held by "
+              "another process or degraded. Check that nothing else is using "
+              "the NPU (another genie_server or genie-t2t-run.exe -- "
+              "Get-Process python, genie*). Ctrl-C is not acted on until the "
+              "load returns, so to stop it now, end this process; if nothing "
+              "else holds the HTP, a degraded one is cleared only by a reboot."
+              % (time.time() - t0), flush=True)
+        wait = every
+
+
 def load_engine():
     """Load Genie.dll, create the dialog from the bundle config (resident).
 
     Returns the engine with its sampler restore baseline already set, because
     only this function knows which seed the dialog was created with (see
-    read_default_sampler)."""
+    read_default_sampler).
+
+    Every way the setup can be wrong ends in a sys.exit that names it -- an
+    unset variable, a bundle dir that is not a bundle, a file the config names
+    and the bundle lacks, an SDK without a loadable Genie.dll, an interpreter
+    that cannot load it -- and every one of those checks runs BEFORE the
+    11-35s model load. Three of them used to end in a raw traceback instead,
+    after both the launcher and this function had let the path through."""
     global TOKENIZER_STATUS
-    if not BUNDLE_DIR or not SDK_DIR:
-        sys.exit("set GENIE_BUNDLE_DIR (the Genie bundle dir) and GENIE_SDK_DIR "
-                 "(the QAIRT 2.45 root) -- see docs/GENIE_SERVER.md")
+    # Name only what is actually unset. Both used to be named whenever either
+    # was, so an operator who had just set the bundle was told to set it again.
+    required = (("GENIE_BUNDLE_DIR", "the Genie bundle dir", BUNDLE_DIR),
+                ("GENIE_SDK_DIR", "the QAIRT 2.45 root", SDK_DIR))
+    unset = ["%s (%s)" % (name, what) for name, what, value in required
+             if not value]
+    if unset:
+        also = "".join("; %s is set (%s)" % (name, value)
+                       for name, _what, value in required if value)
+        sys.exit("set %s -- see docs/GENIE_SERVER.md%s"
+                 % (" and ".join(unset), also))
     if not os.path.isdir(BUNDLE_DIR):
         sys.exit("bundle dir not found: %s" % BUNDLE_DIR)
+    # A directory that is not a bundle -- most often the one ABOVE it:
+    # `qai-hub-models fetch ... --extract -o <dir>` puts the bundle in a
+    # model-named folder inside <dir>, and pointing the variable at <dir>
+    # ended in a bare FileNotFoundError traceback from the open() below,
+    # after Genie.dll had been loaded. config_present() already knew;
+    # bundle_config_warnings stays quiet on this case precisely so that this
+    # is the one line that speaks.
+    if not config_present():
+        below = _bundles_below(BUNDLE_DIR)
+        hint = ("\nThese folders inside it do hold one -- point GENIE_BUNDLE_DIR "
+                "at one of them: %s" % ", ".join(below) if below else
+                "\nNothing directly inside it holds one either.")
+        sys.exit("no genie_config.json in %s\nGENIE_BUNDLE_DIR must be the "
+                 "bundle directory itself -- the one holding genie_config.json, "
+                 "the part*_of_*.bin context binaries and tokenizer.json -- not "
+                 "the folder above it.%s" % (BUNDLE_DIR, hint))
+    missing = bundle_files_missing()
+    if missing:
+        sys.exit("genie_config.json in %s names %d file%s that %s not there: "
+                 "%s\nAn incomplete copy or an interrupted download -- a bundle "
+                 "is several GB. Copy or fetch it again; nothing else here "
+                 "checks, and Genie would fail the load with a status that "
+                 "reads like an arch mismatch."
+                 % (BUNDLE_DIR, len(missing), "" if len(missing) == 1 else "s",
+                    "is" if len(missing) == 1 else "are", ", ".join(missing)))
     if not os.path.isdir(LIB_DIR):
         sys.exit("SDK lib dir not found: %s (check GENIE_SDK_DIR)" % LIB_DIR)
 
@@ -2846,7 +3145,11 @@ Check GENIE_SDK_DIR, or unset GENIE_HEXAGON_ARCH if you pinned an arch."""
     os.add_dll_directory(LIB_DIR)  # so Genie.dll's Qnn* deps resolve (py3.8+)
     os.environ["PATH"] = LIB_DIR + os.pathsep + os.environ.get("PATH", "")
 
-    lib = C.WinDLL(os.path.join(LIB_DIR, "Genie.dll"))
+    dll_path = os.path.join(LIB_DIR, "Genie.dll")
+    try:
+        lib = C.WinDLL(dll_path)
+    except OSError as e:
+        sys.exit(_dll_load_failure(dll_path, e))
 
     ConfigHandle = Handle
     lib.GenieDialogConfig_createFromJson.argtypes = [C.c_char_p, C.POINTER(ConfigHandle)]
@@ -2918,7 +3221,8 @@ Check GENIE_SDK_DIR, or unset GENIE_HEXAGON_ARCH if you pinned an arch."""
     cfg = ConfigHandle()
     st = lib.GenieDialogConfig_createFromJson(cfg_json, C.byref(cfg))
     if st != GENIE_STATUS_SUCCESS:
-        sys.exit("GenieDialogConfig_createFromJson failed, status=%d" % st)
+        sys.exit("GenieDialogConfig_createFromJson failed, status=%s"
+                 % status_text(st))
 
     dialog = Handle()
     t0 = time.time()
@@ -2928,22 +3232,50 @@ Check GENIE_SDK_DIR, or unset GENIE_HEXAGON_ARCH if you pinned an arch."""
     # load look like a hang to anyone watching the line.
     print("[genie] loading model on the NPU (~11-15s warm, up to ~35s cold)...",
           flush=True)
-    st = lib.GenieDialog_create(cfg, C.byref(dialog))
+    loaded = threading.Event()
+    # Only the Event and the start time: the thread has no way to reach the
+    # lib, the dialog or the engine, so a load that never returns cannot be
+    # made worse by it. A daemon, so it never holds the process open.
+    threading.Thread(target=_watch_slow_load, args=(loaded, t0),
+                     name="genie-load-watch", daemon=True).start()
+    try:
+        st = lib.GenieDialog_create(cfg, C.byref(dialog))
+    finally:
+        loaded.set()
     if st != GENIE_STATUS_SUCCESS:
-        # The overwhelmingly likely cause is an arch/version mismatch: a Genie
-        # context binary is compiled for ONE dsp_arch AND one QAIRT version, so
-        # a bundle built for another Hexagon cannot load here. A bare status
-        # code sends people hunting through their config; name the real suspect
-        # and show what this box can actually offer.
-        sys.exit("""GenieDialog_create failed, status=%d
+        # A bare status code sends people hunting through their config, so
+        # name the suspects -- ALL of them, because the status does not say
+        # which it was. This used to name one, the bundle built for another
+        # Hexagon or QAIRT, whatever the status: on a box whose HTP is shared
+        # or degraded that sent the operator to rebuild a bundle that was
+        # fine. A missing part file is no longer a suspect here -- load_engine
+        # checks for one before it gets this far (bundle_files_missing).
+        # Which status each cause produces has not been measured (that needs
+        # the device in each state), so MEM_ALLOC, the one the header ties to
+        # memory, only reorders the list; it never shortens it.
+        mem = st == GENIE_STATUS_ERROR_MEM_ALLOC
+        arch = ("  * The bundle was built for another Hexagon arch or QAIRT version. A\n"
+                "    Genie bundle is locked to one Hexagon arch AND one QAIRT version\n"
+                "    and loads nowhere else -- get a bundle matching one of the archs\n"
+                "    above, or rebuild it for this device.")
+        held = ("  * The HTP is %s.\n"
+                "    Check that nothing else is using the NPU -- another genie_server\n"
+                "    or genie-t2t-run.exe, or any QNN / ONNX session (Get-Process\n"
+                "    python, genie*) -- stop it, give the HTP a few seconds to\n"
+                "    settle, and retry. If nothing holds it, a degraded HTP is\n"
+                "    cleared only by a reboot."
+                % ("out of memory (another model resident), held by another "
+                   "process, or degraded" if mem else
+                   "held by another process, or degraded"))
+        causes = "\n".join((held, arch) if mem else (arch, held))
+        sys.exit("""GenieDialog_create failed, status=%s
   bundle:      %s
   SDK:         %s
   archs here:  %s
-A Genie bundle is locked to one Hexagon arch AND one QAIRT version.
-If this bundle was built for an arch this box does not have (or for a
-different QAIRT), it cannot load -- get a bundle matching one of the
-archs above, or rebuild it for this device."""
-                 % (st, BUNDLE_DIR, SDK_DIR, ", ".join(hex_archs)))
+The load failed inside Genie, and the status does not say why. Either:
+%s"""
+                 % (status_text(st), BUNDLE_DIR, SDK_DIR, ", ".join(hex_archs),
+                    causes))
     print("[genie] model resident on HTP in %.1fs" % (time.time() - t0), flush=True)
 
     tok = Handle()
@@ -2955,10 +3287,11 @@ archs above, or rebuild it for this device."""
         # max_tokens finish are silently the len//4 estimate -- the silent
         # degradation this server refuses everywhere else -- and the only
         # symptom is numbers that are plausibly wrong.
-        print("[genie] WARNING: GenieDialog_getTokenizer failed, status=%d. "
+        print("[genie] WARNING: GenieDialog_getTokenizer failed, status=%s. "
               "Token counts are now ESTIMATES (len/4): context budgets, "
               "overflow 400s, usage figures and the max_tokens finish are "
-              "approximate until this is fixed." % TOKENIZER_STATUS, flush=True)
+              "approximate until this is fixed."
+              % status_text(TOKENIZER_STATUS), flush=True)
     engine = GenieEngine(lib, dialog, tokenizer)
     # The restore baseline carries the seed the dialog was CREATED with, not
     # the shipped 42 still sitting on disk -- see read_default_sampler.
@@ -3840,11 +4173,13 @@ class _OpenAIEmitter(_Emitter):
         self.write(self.DONE)
 
     def error(self, msg, code=500):
-        # `code` is for the one failure that is not this server's fault and not
-        # the client's: a turn refused because shutdown began (503, "shed and
-        # try elsewhere"). It reaches only the non-streaming answer, because
-        # once a stream's 200 has gone out there is no status left to choose --
-        # the data frame below is the whole of what the client gets either way.
+        # `code` is for the failures that are not the client's: a turn refused
+        # because shutdown began, or cut short by it (503, "shed and try
+        # elsewhere"), against 500 for the engine's own failures -- a turn the
+        # watchdog cut on a stall among them. It reaches only the non-streaming
+        # answer, because once a stream's 200 has gone out there is no status
+        # left to choose -- the data frame below is the whole of what the
+        # client gets either way.
         if not self.streaming:
             self.h._json(code, {"error": {"message": msg, "type": "server_error"}})
             return
@@ -3953,8 +4288,9 @@ class _AnthropicEmitter(_Emitter):
         self._event("message_stop", {"type": "message_stop"})
 
     def error(self, msg, code=500):
-        # As the OpenAI twin: `code` carries the 503 a shutdown refusal gets,
-        # and only the non-streaming answer still has a status to carry it in.
+        # As the OpenAI twin: `code` carries the 503 a turn shutdown refused or
+        # cut short gets, and only the non-streaming answer still has a status
+        # to carry it in.
         if not self.streaming:
             self.h._anthropic_error(code, "api_error", msg)
             return
@@ -4127,6 +4463,21 @@ class Handler(BaseHTTPRequestHandler):
             # No modality field: absence reads as text-only, which is the
             # truth for this bundle. Claiming a modality it does not have
             # would be worse than saying nothing.
+            #
+            # Both flags are TRI-state, and null means "not known", never
+            # "no". `multi_length` is null when metadata.json gave no list
+            # (context_lengths is then []): it used to be `len(lengths) > 1`,
+            # i.e. false, which the docs define as a single-length bundle
+            # running 2-3x slower -- so a router down-ranked an endpoint
+            # whose build was merely unreadable, while the banner and the
+            # startup warnings both call that state unknown and warn about
+            # single-length only for a list of one. `poll` is null when no
+            # `poll` key was read: absent from the config, or the config
+            # unreadable. That is NOT the same as true -- the vendor config
+            # SHIPS "poll": true, but what QnnHtp does with the key absent is
+            # not measured here -- so a client should treat null as unknown
+            # and the startup note (bundle_config_warnings) as the place that
+            # says which.
             poll, _where = read_poll_setting()
             lengths = read_context_lengths()
             self._json(200, {
@@ -4137,7 +4488,7 @@ class Handler(BaseHTTPRequestHandler):
                     "engine": "npu-hexagon-htp",
                     "single_flight": True,
                     "context_lengths": lengths,
-                    "multi_length": len(lengths) > 1,
+                    "multi_length": len(lengths) > 1 if lengths else None,
                     "poll": poll,
                 },
             })
@@ -4275,6 +4626,26 @@ class Handler(BaseHTTPRequestHandler):
                    "no <tool_call> token, so %s cannot emit a parseable call. "
                    "Retry without `tools`." % MODEL_ID)
             self._request_error(400, msg, path)
+            return
+        # Refused, 503, when /health already says the engine cannot serve --
+        # and ahead of the permit, so the refusal says WHY. Admitted, a
+        # request parked behind the stuck turn's engine lock until the process
+        # exited (forever under GENIE_WEDGE_EXIT=0), and once the permits were
+        # gone every later one was told "server busy" about an engine the
+        # server already knew was wedged. 503 is what /health answers in the
+        # same state, and "503 = shed, try another engine" is the documented
+        # contract, so a router needs nothing new to act on it.
+        #
+        # stalled and wedged only. NOT failing: that clears when a generation
+        # SUCCEEDS, so refusing generations would make it permanent. And the
+        # health lock is all this takes -- never the engine lock, which is the
+        # one the stuck thread holds.
+        state, detail = HEALTH.assess(time.time())
+        if state in ("stalled", "wedged"):
+            self._request_error(
+                503, "engine %s: %s. Not queued behind it -- retry on another "
+                     "engine; GET /health reports when this one recovers."
+                     % (state, detail), path)
             return
         if not _INFLIGHT.acquire(blocking=False):
             # NPU is single-flight and the small queue is full -> shed load.
@@ -4547,16 +4918,24 @@ class Handler(BaseHTTPRequestHandler):
                 em.text(tail)
         if res.get("error"):
             closing = res.get("closing")
+            # A turn the server cut short -- shutdown or the watchdog -- is a
+            # failure too, not a finish (see SERVER_ABORTS): the text is a
+            # fragment, and "stop" / "end_turn" is what let a client file it
+            # as a complete answer. A client's own abort never gets here: it
+            # left, and `em.gone` returned above.
+            by = res.get("aborted_by")
             if stream:
                 # The 200 has already gone out, so the line _json prints for a
                 # non-2xx will never be written for this failure.
                 self._log_line("refused mid-stream" if closing
+                               else "aborted mid-stream (%s)" % by if by
                                else "engine failure mid-stream", res["error"])
-            # 503, not 500, for a turn shutdown refused at the door: the
-            # request was never started and nothing about it was wrong, which
-            # is this server's documented "503 = shed" contract -- a router
-            # can send it to another leg instead of counting it as a failure.
-            em.error(res["error"], code=503 if closing else 500)
+            # 503, not 500, for a turn shutdown refused at the door or cut
+            # short: nothing about the request was wrong, which is this
+            # server's documented "503 = shed" contract -- a router can send
+            # it to another leg instead of counting it as a failure.
+            em.error(res["error"],
+                     code=503 if closing or by == "shutdown" else 500)
             return
         raw = "".join(chunks)
         text, calls = "", []
@@ -4656,11 +5035,48 @@ def _exit_for_supervisor(detail):
         return None
     sys.stdout.flush()
     sys.stderr.flush()
-    # os._exit, not sys.exit: sys.exit unwinds to main's `finally`, which calls
+    # Not sys.exit: sys.exit unwinds to main's `finally`, which calls
     # GenieDialog_free on the very driver that is already stuck -- that call can
     # hang too, and then the process never leaves at all. There is nothing worth
-    # cleaning up in a process whose device is gone.
-    os._exit(EXIT_WEDGED)
+    # cleaning up in a process whose device is gone -- and for the same reason
+    # not os._exit either; see _terminate_self.
+    _terminate_self(EXIT_WEDGED)
+
+
+def _terminate_self(code):
+    """End this process now, with `code`, running no DLL's detach code.
+
+    os._exit is not that on Windows. It is the CRT's _exit, i.e. ExitProcess,
+    which stops the other threads and then runs DLL_PROCESS_DETACH in every
+    loaded DLL -- Genie.dll, the QnnHtp* libraries, libcdsprpc -- and a detach
+    that waits on the driver that just wedged hangs the exit. Measured with a
+    stand-in DLL whose detach sleeps 8s: os._exit took 8.02s and ran it,
+    TerminateProcess took 0.00s and did not. What that hang looks like is the
+    worst available ending: the /health thread already gone, the last line on
+    screen promising "Exiting 75 so a supervisor restarts a clean process",
+    and run-genie-server.ps1 waiting on the child with no timeout.
+
+    TerminateProcess on this process runs no user-mode code at all, which is
+    also the way an unhandled crash leaves -- the 0xC0000005 exits the
+    launcher already restarts from -- so it asks nothing of the driver that
+    a crash does not. It is NOT a cure for a thread stuck in KERNEL mode: no
+    exit completes until that thread lets go, and only a supervisor-side
+    deadline can see that. os._exit stays behind it for a platform without
+    kernel32, or a call that fails or returns.
+
+    Its own function so that tests can intercept it: reached any other way,
+    it ends the test runner -- see _exit_for_supervisor.
+    """
+    if os.name == "nt":
+        try:
+            k32 = C.WinDLL("kernel32", use_last_error=True)
+            k32.GetCurrentProcess.restype = C.c_void_p
+            k32.TerminateProcess.argtypes = [C.c_void_p, C.c_uint]
+            k32.TerminateProcess.restype = C.c_int
+            k32.TerminateProcess(k32.GetCurrentProcess(), code)
+        except Exception:
+            pass
+    os._exit(code)
 
 
 def _wedge_clearing_note():
@@ -4786,19 +5202,18 @@ def watchdog(engine, health, interval=5.0, on_wedge=None, iterations=None):
             # describe the other configuration's ending. Under
             # GENIE_WEDGE_EXIT=0 nothing exits: the process stays up with a
             # thread parked in the driver forever, /health answers 503, and
-            # every generation request queues behind the stuck call until
-            # GENIE_MAX_INFLIGHT sheds it. Only a restart by hand ends that,
-            # and saying "Exiting 75 so a supervisor restarts a clean process"
-            # told the one operator who has to do it that somebody else would.
+            # so does every generation request, refused at the door (do_POST).
+            # Only a restart by hand ends that, and saying "Exiting 75 so a
+            # supervisor restarts a clean process" told the one operator who
+            # has to do it that somebody else would.
             if WEDGE_EXIT:
                 ending = ("Exiting %d so a supervisor restarts a clean "
                           "process. (GENIE_WEDGE_EXIT=0 to stay up and keep "
                           "reporting 503.)" % EXIT_WEDGED)
             else:
                 ending = ("NOT exiting: GENIE_WEDGE_EXIT=0. This process "
-                          "stays up wedged -- /health answers 503 and "
-                          "generation requests queue behind the stuck call "
-                          "or are shed -- until you restart it by hand. "
+                          "stays up wedged -- /health and every generation "
+                          "request answer 503 -- until you restart it by hand. "
                           "(Unset GENIE_WEDGE_EXIT to exit %d instead, for a "
                           "supervisor to restart a clean process.)"
                           % EXIT_WEDGED)
@@ -4819,8 +5234,78 @@ def watchdog(engine, health, interval=5.0, on_wedge=None, iterations=None):
     return None
 
 
-def main():
+# What main() treats as a request for usage. The PowerShell spellings as well
+# as the POSIX ones, because this runs on Windows and `-?` is what a Windows
+# hand types first.
+HELP_FLAGS = ("-h", "--help", "-help", "-?", "/?")
+# The routes, printed by the startup banner once the model is resident and by
+# --help before anything is loaded -- one list, so the two cannot disagree.
+ENDPOINT_LINES = (
+    "POST /v1/chat/completions (OpenAI)   POST /v1/messages (Anthropic)",
+    "GET /v1/models   GET /v1/models/<id>   GET /props   "
+    "GET /health (alias /healthz)",
+)
+
+
+def usage():
+    """The --help text: what this is, what it needs, where the rest is written.
+
+    Deliberately NOT the environment table. The module docstring explains why
+    a second copy of that is how the first one went stale; this names the two
+    variables that have no default and points at the one table.
+    """
+    return """usage: python genie_server.py [--help]
+
+An OpenAI- and Anthropic-compatible HTTP server for one Qualcomm Genie LLM
+bundle, loaded once and kept resident on the Snapdragon NPU (Hexagon HTP).
+Needs a native ARM64 Python.
+
+It takes no arguments: it is configured entirely through GENIE_* environment
+variables. Two are required and have no default:
+  GENIE_BUNDLE_DIR  the bundle directory itself -- the one holding
+                    genie_config.json, the part*_of_*.bin files and
+                    tokenizer.json
+  GENIE_SDK_DIR     the QAIRT 2.45 root
+It serves on GENIE_HOST:GENIE_PORT, which here is %s:%d. Every variable, its
+default and what it decides is the "Environment" section of
+docs/GENIE_SERVER.md.
+
+The usual way to start it is run-genie-server.ps1 beside this file, which
+derives both required variables from GENIE_NPU_ROOT and restarts the server
+after an NPU wedge (exit %d).
+
+Endpoints, once the model is resident:
+  %s""" % (HOST, PORT, EXIT_WEDGED, "\n  ".join(ENDPOINT_LINES))
+
+
+def main(argv=()):
+    """Serve until Ctrl-C. Returns the process exit status for __main__.
+
+    `argv` is the command line less the program name, which __main__ passes
+    in from sys.argv; the default is NO arguments, so a caller in the same
+    process (a test, a wrapper) starts the server rather than having whatever
+    ITS own command line holds read as this one's.
+    """
     global ENGINE, TEMPLATE, TOOLS_OK
+    # The command line FIRST, ahead of the port check, the bundle reads, the
+    # bind and the load. This server used to ignore argv altogether, so
+    # `--help` on a configured box went straight into the 11-35s model load
+    # -- onto an NPU that other sessions here benchmark on -- and on an
+    # unconfigured one printed only the "set GENIE_BUNDLE_DIR" exit, which is
+    # not usage. Anything else on the line is refused by name rather than
+    # ignored: a flag that does nothing is a setting someone believes is
+    # applied (`--port 8081` still served 8080).
+    args = list(argv or ())
+    if any(a in HELP_FLAGS for a in args):
+        print(usage(), flush=True)
+        return 0
+    if args:
+        print("genie_server.py: unknown argument%s %s. This server takes no "
+              "arguments -- it is configured through GENIE_* environment "
+              "variables; --help lists the ones it needs."
+              % ("s" if len(args) > 1 else "",
+                 ", ".join(repr(a) for a in args)), file=sys.stderr, flush=True)
+        return 2
     # Before the model load, not after: loading is 11-35s of work (measured on
     # the 8192 multi bundle: 10.8-15.0s warm, 34.4s after heavy disk traffic --
     # the "30-50s" this said predated that measurement), and finding
@@ -4894,10 +5379,21 @@ def main():
         sys.exit("cannot bind %s:%d: %s%s\nSet GENIE_HOST to an address this "
                  "machine has (127.0.0.1, ::1, or 0.0.0.0 to expose it) and "
                  "GENIE_PORT to a free port." % (HOST, PORT, e, busy))
+    # Where it WILL answer, said before the load rather than after it. A
+    # direct run printed no address until the model was resident, so for the
+    # whole 11-35s every client tool here reported "nothing listening at ...
+    # start one" about a server that was starting, and the operator had
+    # nothing on screen to match that against. The port is the one actually
+    # bound (GENIE_PORT=0 means "any").
+    bound = getattr(srv, "server_address", (HOST, PORT))
+    print("[genie] port %s:%d is reserved; it refuses connections until the "
+          "model is resident" % (HOST, bound[1]), flush=True)
     try:
         ENGINE = load_engine()
     except BaseException:
-        # Every load_engine failure is a sys.exit. Give the port back on the
+        # load_engine's failures are sys.exits that name the cause (see its
+        # docstring), and anything it did not anticipate is still an
+        # exception on its way out. Either way, give the port back on the
         # way out rather than leave it to interpreter teardown: an in-process
         # caller (a test, a wrapper) that catches the exit would otherwise
         # hold a bound, dead socket for as long as it lives.
@@ -4917,10 +5413,8 @@ def main():
     _exposure = host_exposure_warning()
     if _exposure:
         print("[genie] %s" % _exposure, flush=True)
-    print("[genie]   POST /v1/chat/completions (OpenAI)   POST /v1/messages (Anthropic)",
-          flush=True)
-    print("[genie]   GET /v1/models   GET /v1/models/<id>   GET /props   "
-          "GET /health (alias /healthz)", flush=True)
+    for _line in ENDPOINT_LINES:
+        print("[genie]   %s" % _line, flush=True)
     _lengths = read_context_lengths()
     _poll, _ = read_poll_setting()
     # Printed even when nothing is wrong, so a log or a screenshot carries what
@@ -5010,4 +5504,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv[1:]))

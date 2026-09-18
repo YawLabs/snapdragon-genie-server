@@ -31,6 +31,18 @@ of this bundle, and the table is the one figure to quote.
   the mechanism was right and the hand-written example beside it was not.
 - A bundle is locked to one arch AND one QAIRT version; a mismatch fails at
   `GenieDialog_create` with a message naming the archs this box can offer.
+  That exit prints the status by its header name (`status=-3
+  (ERROR_MEM_ALLOC)`) and names BOTH suspects, because the status does not
+  say which it was: a bundle built for another arch or QAIRT, and an HTP held
+  by another process or degraded -- with what to check for the second (another
+  `genie_server`, `genie-t2t-run.exe` or QNN / ONNX session; `Get-Process
+  python, genie*`; a reboot if nothing holds it). `ERROR_MEM_ALLOC`, the one
+  status the header ties to memory, lists the held / out-of-memory HTP first;
+  it reorders the list and never shortens it. It used to name the arch
+  mismatch alone, whatever the status, which on a shared or degraded box sent
+  the operator to rebuild a bundle that was fine. Every other exit and error
+  that prints a Genie status names it the same way (`status=-6
+  (ERROR_QUERY_FAILED)`).
 
 - No pip packages. Pure Python stdlib.
 
@@ -49,6 +61,27 @@ powershell -File src\run-genie-server.ps1
 ```
 
 That serves on `127.0.0.1:8123`, and supervises: see Supervision below.
+`-Model qwen3-8b` or `-Model qwen3-8b-8192` picks another bundle (see Model
+swaps under the notes).
+
+On a stock Windows client the execution policy blocks every `.ps1`, and the
+launcher exits 1 with `... cannot be loaded because running scripts is
+disabled on this system`. Loosen it no further than you need to: either
+`powershell -ExecutionPolicy Bypass -File src\run-genie-server.ps1`, which
+applies to that one process and changes nothing on the machine, or
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, which covers your
+account only (and the venv's `Activate.ps1` with it). There is no need to
+change the machine-wide policy.
+
+`-Help` (or `-h`, or `--help` under `powershell -File`) prints the models,
+every environment variable the launcher reads with its default, and where the
+docs are, then exits 0 without touching the environment, the disk, the NPU or
+the network. `-?` shows the script's comment-based help (`Get-Help
+src\run-genie-server.ps1 -Full` has more); under `powershell -File` it prints
+to a console only and is silent when stdout is redirected, still starting
+nothing. The launcher is `[CmdletBinding()]`, so a mistyped parameter --
+`-Modle qwen3-8b`, `--hlep` -- is a PowerShell binding error with exit 1. It
+used to be ignored without a word, and the default 4B bundle was loaded.
 
 If the artifacts live elsewhere, point `GENIE_NPU_ROOT` at the directory
 holding them, or set the two paths directly. The launcher checks both exist
@@ -64,11 +97,57 @@ $env:GENIE_BUNDLE_DIR = "...\qwen3_4b-genie-w4a16-x-elite-ctx8192-multi"
 $env:GENIE_SDK_DIR    = "...\qairt\2.45.0.260326"
 ```
 
+It also checks that the bundle directory holds a `genie_config.json`, before
+it even looks for python. A directory one level above the bundle -- which is
+what `qai-hub-models fetch ... --extract -o <dir>` leaves, since the bundle
+goes in a model-named folder inside `<dir>` -- is refused (exit 1) naming up
+to five subdirectories one level down that do hold one, with advice that fits
+how the path was chosen (under `-Model`, which rewrites `GENIE_BUNDLE_DIR`
+every run, that is to move the files up a level or drop `-Model`). That used
+to be a bare `FileNotFoundError` traceback from the server after `Genie.dll`
+had loaded.
+
 Running `python src\genie_server.py` directly works too, but then nothing
 supervises it, the port defaults to 8080 rather than 8123, and
 `GENIE_BUNDLE_DIR` and `GENIE_SDK_DIR` have NO default -- the server exits at
-startup naming both when either is unset. (A relative path in either is made
-absolute first, so one works from wherever you launched.)
+startup naming whichever is unset (and the other's value, when that one is
+set). (A relative path in either is made absolute first, so one works from
+wherever you launched.)
+
+The server itself takes no arguments -- everything is a `GENIE_*` variable --
+and it reads its command line FIRST, before any environment check, bind or
+load. `-h`, `--help`, `-help`, `-?` and `/?` print a usage (what it is, the
+two required variables, the port it would serve on, the launcher, the
+endpoints) and exit 0; the full variable table stays here, under
+[Environment](#environment), rather than in a second copy. Any other argument
+is refused by name on stderr with exit 2 -- `genie_server.py: unknown
+arguments '--port', '8081'. This server takes no arguments -- ...` -- where it
+used to be ignored, so `--port 8081` served 8080 and `--help` on a configured
+box went straight into the model load. The launcher's own flags (`-Model`,
+`-Help`) are the launcher's and never reach the server.
+
+The server checks the setup itself too, so a direct run is covered. All of
+these run before the 11-35s model load begins -- the first two before
+`Genie.dll` is even loaded -- and each is an exit that names the fix, where
+all three used to be a traceback or a misleading status:
+
+- **`GENIE_BUNDLE_DIR` holds no `genie_config.json`** -- `no genie_config.json
+  in <dir>`, saying it must be the bundle directory itself and listing the
+  subfolders one level down that hold one.
+- **A file `genie_config.json` names is not in the bundle** -- the context
+  binaries (`ctx-bins`), the tokenizer `path` and the backend `extensions`
+  file, each looked up the way Genie resolves it. An incomplete copy or an
+  interrupted download of a multi-GB bundle used to go all the way to
+  `GenieDialog_create` (`GenieDialogConfig_createFromJson` accepts a config
+  whose files are gone), whose exit then blamed an arch mismatch.
+- **`Genie.dll` will not load**, told apart by cause: a Python that is not
+  ARM64 (`This Python is win-amd64 ...` -- run an ARM64 `python.exe`, or point
+  `GENIE_PYTHON` at one under the launcher); an ARM64 Python and a DLL that is
+  not an ARM64 image (the wrong QAIRT under `GENIE_SDK_DIR`); no `Genie.dll`
+  at all (an incomplete SDK extract, or a path one level off); and a
+  `Genie.dll` that is there but will not load because one of ITS dependencies
+  will not (the `Qnn*.dll` files beside it, or the Microsoft Visual C++
+  runtime for ARM64).
 
 The launcher leaves your shell as it found it: every `GENIE_*` variable it
 writes for the server (`GENIE_NPU_ROOT`, `GENIE_BUNDLE_DIR`, `GENIE_MODEL_ID`,
@@ -79,10 +158,28 @@ no log: the server's output is the console's, and only the llama launcher
 rotates log files.
 
 Startup order is cheap-things-first, so a mistake costs a second rather than a
-model load. Before the 11-35s load: the port-collision check (see the note
-below), the bundle-config warnings (`poll`, single-length, sampler penalty),
-and then the **bind itself** -- an address this machine does not have, or a
-`GENIE_PORT` outside 0-65535, exits with `cannot bind HOST:PORT: ...`.
+model load. Before the 11-35s load: the command line (above), the
+port-collision check (see the note below), the bundle-config warnings
+(`poll`, single-length, sampler penalty), then the **bind itself** -- an
+address this machine does not have, or a `GENIE_PORT` outside 0-65535, exits
+with `cannot bind HOST:PORT: ...` -- and last the setup checks listed above.
+Between the bind and those checks it prints where it WILL answer: `[genie]
+port HOST:PORT is reserved; it refuses connections until the model is
+resident` (the port actually bound, so `GENIE_PORT=0` shows the one it got). A direct
+run used to print no address until the model was resident, so for the whole
+load every client tool here said "nothing listening" and there was nothing on
+screen to match that against.
+
+The load itself is one blocking native call, `GenieDialog_create`, and nothing
+is printed while it runs -- so a load that never returned looked exactly like
+one still working. If it passes 60s (the slowest load logged here is 36.8s),
+and every 60s after that, the server prints `[genie] still loading after Ns;
+a normal load takes ~11-15s, up to ~35s cold. If it never finishes, suspect
+the HTP: held by another process or degraded. ...` -- naming what to check
+(another `genie_server` or `genie-t2t-run.exe`; `Get-Process python, genie*`),
+and that **Ctrl-C is not acted on until the load returns**, so stopping it
+means ending the process. No load logged here has hung; the line says what to
+suspect, not what happened.
 
 The socket is BOUND before the load and only LISTENS after it, once the model
 is resident. A connect made during the load is therefore refused exactly as
@@ -114,8 +211,7 @@ bundle's `n_ctx`, compiled lengths and `poll`, and after that every request
 reuses the resident model.
 
 Re-measured 2026-08-26 on the 8192 multi-length bundle (the launcher default),
-because the figures here were an older bundle's and the startup string still
-advertises a range no run has produced:
+because the figures here were an older bundle's:
 
 | | seconds | n |
 |---|---|---|
@@ -200,9 +296,9 @@ API the path names.
   |---|---|
   | `engine` | `npu-hexagon-htp` -- which silicon is answering |
   | `single_flight` | `true`; the constraint behind the 429/529, stated rather than discovered from one |
-  | `context_lengths` | the graphs compiled into the bundle |
-  | `multi_length` | `false` means 2-3x slower on short prompts at the SAME `n_ctx` |
-  | `poll` | `true` means an idle 2.7-core busy-wait, ~36% of decode, and about a quarter of the NPU+GPU concurrency win |
+  | `context_lengths` | the graphs compiled into the bundle; `[]` when `metadata.json` gave no list (build unknown) |
+  | `multi_length` | `false` means 2-3x slower on short prompts at the SAME `n_ctx`. **`null` means unknown** -- `context_lengths` is `[]` -- and must not be read as `false` (it used to be `false` then, which down-ranked an endpoint whose build was merely unreadable) |
+  | `poll` | `true` means an idle 2.7-core busy-wait, ~36% of decode, and about a quarter of the NPU+GPU concurrency win. **`null` means no `poll` key was read** -- absent from the config, or the config unreadable -- which is unknown, NOT the shipped `true` (what QnnHtp does with the key absent is not measured here); the startup note says which of the two it was |
 
   `n_ctx` alone is not enough to rank this endpoint against a GPU or CPU one,
   and on this engine it is actively misleading: it is the SOFTWARE cap
@@ -223,7 +319,7 @@ API the path names.
   |---|---|
   | `generating` | true from the moment a request takes the engine lock -- covering the dialog reset, stop-sequence, sampler and token-cap calls that precede the query, each of which is a call into the same driver and can wedge like one. It used to turn true only at `GenieDialog_query`, so a hang in any of the others read `ok` for as long as it lasted. |
   | `generations` | client generations only. The server's own summarisation calls are supervised identically but not counted, on the success path or the failure path. |
-  | `consecutive_failures` | generations that ended in an ERROR status or a throw. A client abort (`ABORTED`) and a full window (`CONTEXT_EXCEEDED`) are endings, not failures, so a user leaning on the stop button cannot flip `/health` to `failing`. The one abort that IS a failure is the WATCHDOG's, sent for a stall: that generation is booked as failed rather than resetting the streak, so a device that stalls on every turn but honours each abort still reaches `failing` (the client of such a turn receives an ordinary `stop`). A throw inside a generation DOES count -- it used to be booked as a success and reset the streak. |
+  | `consecutive_failures` | generations that ended in an ERROR status or a throw. A client abort (`ABORTED`) and a full window (`CONTEXT_EXCEEDED`) are endings, not failures, so a user leaning on the stop button cannot flip `/health` to `failing`. The one abort that IS a failure is the WATCHDOG's, sent for a stall: that generation is booked as failed rather than resetting the streak, so a device that stalls on every turn but honours each abort still reaches `failing` (the client of such a turn receives an error -- a 500, or an error frame on a stream -- not a finish; see Supervision). A throw inside a generation DOES count -- it used to be booked as a success and reset the streak. |
   | `token_counts` | `exact` when the Genie tokenizer is attached; `estimated` (chars/4) when `GenieDialog_getTokenizer` failed. It says whether every usage figure, window budget and `length` finish this server reports is a count or a guess -- the startup log carries the matching `WARNING: GenieDialog_getTokenizer failed` line. |
 
   The distinction is the entire point: a wedged HTP leaves this process
@@ -232,6 +328,15 @@ API the path names.
   as the outage lasts. The handler touches nothing on the engine, which is what
   lets it answer *during* a wedge -- the engine lock is exactly what the stuck
   thread is holding.
+
+  While it says `stalled` or `wedged`, the two generation routes say so too:
+  a `POST /v1/chat/completions` or `/v1/messages` is refused **503** at the
+  door (`server_error` / `api_error`, message `engine <stalled|wedged>:
+  <the /health detail>. Not queued behind it -- retry on another engine; GET
+  /health reports when this one recovers.`) instead of queueing behind the
+  stuck call or being told "server busy". Not for `failing`: that state
+  clears only when a generation succeeds, so refusing generations would make
+  it permanent.
 
 ```bash
 curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/json" \
@@ -270,8 +375,13 @@ server that is not there (connection refused, a timeout, a reset mid-stream),
 one that does not speak HTTP at all, a response that stops mid-body, a 200
 whose body is not JSON and a 200 of an unexpected SHAPE print `FAIL:
 <ExceptionName> during <stage>: ...` naming the request and exit 1 the same
-way, where each used to be a traceback. A REFUSED connection adds the two
-ports a server here is normally on, since the default moved.
+way, where each used to be a traceback. A REFUSED connection adds a
+`Nothing is listening at <BASE>.` line giving both readings, in
+`bench_endpoint`'s words: nothing is running there, or a `genie_server` there
+is still loading its bundle (it holds the port but refuses connections until
+the model is resident -- wait for its `endpoint on` line and re-run rather
+than start another). Otherwise it names the two ports a server here is
+normally on, since the default moved.
 
 ## Environment
 
@@ -300,17 +410,30 @@ which is how `-1` (llama.cpp's spelling of "no limit", and this repo runs a
 llama-server leg beside this one) turned every uncapped completion into a
 one-token answer with no line anywhere saying why.
 
+**The four on/off switches read every usual spelling, either way.**
+`GENIE_WEDGE_EXIT`, `GENIE_THINKING`, `GENIE_STRIP_THINK` and
+`GENIE_SUMMARIZE_EVICTED` are case-insensitive and ignore surrounding spaces:
+`1` / `true` / `yes` / `on` turn one on and `0` / `false` / `no` / `off` turn
+it off. Anything else is `[genie] WARNING: GENIE_THINKING='maybe' is not an
+on/off value (1/true/yes/on or 0/false/no/off); using off instead.` and the
+default. Each switch used to parse its own way, and each way read some value
+as the OPPOSITE of what was meant, silently: `GENIE_WEDGE_EXIT=False` (what
+PowerShell's `$env:GENIE_WEDGE_EXIT = $false` stores), `off` or ` 0` left the
+wedge exit ON; `GENIE_THINKING=True` or `on` left thinking off;
+`GENIE_STRIP_THINK` took nothing but `1`; and `GENIE_SUMMARIZE_EVICTED` read
+anything but `0` as on, `false` included.
+
 | var | default | meaning |
 |---|---|---|
-| `GENIE_BUNDLE_DIR` | **none -- required.** The launcher sets it to `<GENIE_NPU_ROOT>\bundles\<the -Model bundle>`: the 8192 multi-length 4B unless `-Model` says otherwise | dir with genie_config.json + part*_of_*.bin + tokenizer.json. **Prefer a MULTI-length bundle** -- check `genie.context_lengths` in its metadata.json; a single-length one is 2-3x slower on short prompts. A relative path is made absolute at startup (the server chdirs into the bundle, which used to turn a relative one into a bare FileNotFoundError after it had passed the existence check). Run directly with it unset and the server exits naming it. |
+| `GENIE_BUNDLE_DIR` | **none -- required.** The launcher sets it to `<GENIE_NPU_ROOT>\bundles\<the -Model bundle>`: the 8192 multi-length 4B unless `-Model` says otherwise | dir with genie_config.json + part*_of_*.bin + tokenizer.json. **Prefer a MULTI-length bundle** -- check `genie.context_lengths` in its metadata.json; a single-length one is 2-3x slower on short prompts. A relative path is made absolute at startup (the server chdirs into the bundle, which used to turn a relative one into a bare FileNotFoundError after it had passed the existence check). Run directly with it unset and the server exits naming it; a directory with no `genie_config.json` (usually the one ABOVE the bundle), or a bundle missing a file its config names, is refused by name before the load too -- see [Run](#run). |
 | `GENIE_SDK_DIR` | **none -- required.** The launcher sets it to the newest version directory under `<GENIE_NPU_ROOT>\qairt` | QAIRT 2.45 root (lib/aarch64-windows-msvc, lib/hexagon-v*). Made absolute like the bundle dir. |
 | `GENIE_HEXAGON_ARCH` | unset | pin one skel arch (`v81`); default offers all |
-| `GENIE_SUMMARIZE_EVICTED` | 1 | 0 disables summarising evicted turns (plain drop) |
+| `GENIE_SUMMARIZE_EVICTED` | 1 | `0` (or `false` / `no` / `off`, any case) disables summarising evicted turns (plain drop). An on/off switch -- see above; `false` used to leave it on. |
 | (not an env var) | -- | **`poll: false` in the bundle's `genie_config.json`** -- see the poll note below. Worth up to +55% decode and frees 2.7 idle cores. The server now CHECKS this at startup (before the 11-35s load) and warns loudly if the bundle ships `true`; it also warns on a single-length bundle. Both are warnings, never refusals -- a slow server is still a working one. |
 | `GENIE_SUMMARY_MAX_TOKENS` | 192 | cap on the retained note. Clamped at runtime to `n_ctx / 8` (floor 32) so the note cannot crowd out the window on a small-context bundle; the server logs the clamp when it bites. |
 | `GENIE_WINDOW_MARGIN` | 64 | headroom left between prompt and n_ctx. Must be >= 0: a negative margin is not more headroom, it is a budget past the window. A negative value is rejected with a WARNING line and the default 64 is used -- it is not clamped to 0. |
 | `GENIE_MAX_INFLIGHT` | 2 | requests admitted at once (1 running + queue). Floored at 1 -- it cannot be disabled, since the NPU is single-flight and an unbounded setting only parks threads on the engine lock. Set 1 to protect KV reuse: two interleaved conversations share one resident KV and reset each other's prefix. |
-| `GENIE_HOST` / `GENIE_PORT` | 127.0.0.1 / **8080** | bind address. Note the launcher overrides the port: `run-genie-server.ps1` sets **8123** unless `GENIE_PORT` is already set, because 8080 is where `run-llama-server.ps1` puts its CPU leg. It also PARSES and range-checks the value (1-65535) before exporting it, so a typo falls back to the launcher's 8123 with `[run] WARNING: GENIE_PORT='808O' is not a port number (1-65535); using 8123.` rather than reaching the server and degrading to ITS default 8080 -- which is the CPU leg. So the endpoint is `127.0.0.1:8123` when started the normal way, and `127.0.0.1:8080` only if you run `genie_server.py` directly. The tools follow the launcher: `bench_endpoint`, `bench_contention --npu` and `bench_servers --ours-port` default to 8123, and `genie_smoke.py` to 8123 with `GENIE_PORT` overriding the port -- it validates it too, printing `note: GENIE_PORT='abc' is not a port number (1-65535); using 8123.` and using 8123, where it used to die in an `http.client.InvalidURL: nonnumeric port` traceback. `::1` and `::` bind too (the address family is chosen from the host). A bind that cannot succeed -- an address this machine does not have, a `GENIE_PORT` outside 0-65535 (which now only a direct `python src/genie_server.py` run can reach) -- exits with `cannot bind HOST:PORT: ...` BEFORE the model load. **There is no authentication.** The loopback default is the security model: anyone who can reach the port can use the NPU, read what it generates, and wedge the device for everyone else. Binding `0.0.0.0` is supported and the server warns at startup when you do, but put something in front of it. |
+| `GENIE_HOST` / `GENIE_PORT` | 127.0.0.1 / **8080** | bind address. Note the launcher overrides the port: `run-genie-server.ps1` sets **8123** unless `GENIE_PORT` is already set, because 8080 is where `run-llama-server.ps1` puts its CPU leg. It also PARSES and range-checks the value (1-65535) before exporting it, so a typo falls back to the launcher's 8123 with `[run] WARNING: GENIE_PORT='808O' is not a port number (1-65535); using 8123.` rather than reaching the server and degrading to ITS default 8080 -- which is the CPU leg. So the endpoint is `127.0.0.1:8123` when started the normal way, and `127.0.0.1:8080` only if you run `genie_server.py` directly. The tools follow the launcher: `bench_endpoint`, `bench_contention --npu` and `bench_servers --ours-port` default to 8123, and `genie_smoke.py` to 8123 with `GENIE_PORT` overriding the port -- it validates it too, printing `note: GENIE_PORT='abc' is not a port number (1-65535); using 8123.` and using 8123, where it used to die in an `http.client.InvalidURL: nonnumeric port` traceback. A base URL without `http://` or `https://`, a host and a port in 1-65535 is refused before any request: `bench_endpoint --base` exits 1, and `bench_contention` refuses an `--npu` or `--gpu` at startup through argparse (exit 2), in the same words. `bench_contention`'s failed ping now says which of two things it saw: nothing listening (not running, or a `genie_server` there still loading -- wait for its `endpoint on` line), or something that took the connection and answered unusably (do not start another on that port). `::1` and `::` bind too (the address family is chosen from the host). A bind that cannot succeed -- an address this machine does not have, a `GENIE_PORT` outside 0-65535 (which now only a direct `python src/genie_server.py` run can reach) -- exits with `cannot bind HOST:PORT: ...` BEFORE the model load. **There is no authentication.** The loopback default is the security model: anyone who can reach the port can use the NPU, read what it generates, and wedge the device for everyone else. Binding `0.0.0.0` is supported and the server warns at startup when you do, but put something in front of it. |
 | `GENIE_MODEL_ID` | qwen3-4b-npu | id reported to clients. The launcher sets it from `-Model` (`qwen3-8b-npu`, `qwen3-8b-8192-npu`), or from the bundle directory name when that is one it knows. |
 | `GENIE_NPU_ROOT` | `../genie-npu` beside this repo | launcher only: where `bundles/` and `qairt/` live. Set this instead of the two paths above; the newest `qairt/*` BY VERSION NUMBER is picked automatically, and directories not named like a dotted version are ignored. "A dotted version" means what `[version]` can hold: two to four dot-separated components of at most nine ASCII digits each. So an all-digits stray -- a directory named for a full build stamp (`2.45.0.260326153000`), a timestamped backup -- is ignored like `latest` is, instead of killing the launcher with a cast error out of the sort while a valid SDK sits right beside it. |
 | `GENIE_PYTHON` | `python` (first on PATH) | launcher only: the interpreter to run the server with. It must be native ARM64 -- Genie.dll is aarch64-only -- and the launcher exits 1 naming the interpreter when it is missing or is not. (That used to be a warning followed by a DLL-load failure that named neither.) The question asked is the interpreter's own BUILD -- `python -c "import sysconfig;print('GENIE_ARCH=' + sysconfig.get_platform())"` -- and the answer is the last line matching `^GENIE_ARCH=`, which must contain arm64 (`win-arm64` accepted, `win-amd64` refused). `platform.machine()` was the old question and is wrong on this box: from CPython 3.12 on Windows it reports the HOST cpu, so an emulated x64 python answered `ARM64` and was accepted, differently from launch to launch (measured here: 10 of 10 accepted-then-refused flaps gone, 10 of 10 now refused). Because only a TAGGED line is read, a `.cmd` shim may print before python AND after it (`exit /b %ERRORLEVEL%`, for want of `@echo off`) and is still accepted -- the old wording promised that and the last-non-blank read broke it. The refusal quotes the build tag (`[run] python arch is 'win-amd64' (...)`), and an interpreter that prints no tagged line is refused with either `[run] (It printed no text on stdout; if it failed, its own error is above.)` or `[run] (It printed N line(s) but no GENIE_ARCH= line; its own error, if any, is above.)`; a silent one used to be accepted, and the server launched under an interpreter that had just failed to run one line. The start line reads `[run] starting Genie server (python win-arm64) on ...`, since the build tag is what was checked. |
@@ -320,26 +443,31 @@ one-token answer with no line anywhere saying why.
 | `GENIE_STALL_TIMEOUT` | 120 | seconds between tokens before being called stalled. This is the real wedge signal -- see Supervision. |
 | `GENIE_WEDGE_GRACE` | 60 | seconds an abort gets to take effect before the stall is escalated to a wedge |
 | `GENIE_FAIL_THRESHOLD` | 3 | consecutive failed generations before `/health` reports `failing`. Floored at 1. A client's abort and a full-window finish are not failures; an abort the watchdog sent for a stall is -- see `/health` above. |
-| `GENIE_WEDGE_EXIT` | 1 | `0` (or `false` / `no`) keeps the process up on a wedge instead of exiting for a supervisor. The watchdog then keeps watching and `/health` keeps answering 503 `wedged`; the WEDGED stanza is printed once, not every five seconds. |
+| `GENIE_WEDGE_EXIT` | 1 | `0` (or `false` / `no` / `off`, any case -- `False` and `off` used to leave the exit ON) keeps the process up on a wedge instead of exiting for a supervisor. The watchdog then keeps watching, and `/health` and every generation request answer 503 `wedged`; the WEDGED stanza is printed once, not every five seconds. |
 | `GENIE_MAX_RESTARTS` | 5 | launcher only: engine failures (wedges and native crashes) tolerated within `GENIE_RESTART_WINDOW` before it gives up. `0` is valid (give up on the first). A non-integer or negative value warns and uses the default. |
 | `GENIE_RESTART_WINDOW` | 3600 | launcher only: seconds of history the restart cap counts over. Failures older than this age out, and the launcher says so when they do. Minimum 1; junk warns and uses the default. |
 | `GENIE_RESTART_COOLDOWN` | 25 | launcher only: seconds between restarts. Not arbitrary -- a force-killed server needs roughly 20s of settling, and restarting sooner was measured costing about half of decode throughput. `0` is valid; a non-integer or negative value warns and uses the default (a negative one used to throw from `Start-Sleep` inside the restart path). |
 | `GENIE_MAX_TOKENS` | 512 | default cap when a request sets neither `max_tokens` nor `max_completion_tokens`. Must be >= 1: `0` or `-1` is rejected with a WARNING line and 512 is used (`-1` is llama.cpp's no-limit spelling; here it used to reach the engine as 4294967295, `0` skipped the cap call altogether, and a silent clamp to 1 made every uncapped answer one token long). |
-| `GENIE_STRIP_THINK` | 0 | 1 strips a well-formed `<think>...</think>` pair from every BUFFERED response -- non-streaming, and a tool stream on either API, which is generated in full before it is framed. Only an incremental (non-tool) stream is always faithful to the model, because a frame already sent cannot be retracted. Unrelated to the orphan-close strip below, which is always on because it removes a DUPLICATED answer rather than the model's reasoning. |
-| `GENIE_MIN_DECODE_STEPS` | 16 | `bench_endpoint`, and through it `bench_servers` and `bench_contention`: fewest decode steps a rate may rest on. Below it the delta is measuring per-request overhead rather than decode -- a 4-step window once reported **0.60 tok/s against a true 17.6**. Such a sample is refused with a line naming the count, not averaged in. `bench_contention` goes one further and refuses a `--tokens` below this floor at startup (exit 2), rather than running a sweep in which every leg is REFUSED; `bench_servers` now does the same, with the same wording, exiting 1 (a `sys.exit`, not argparse's `ap.error`). It also floors the probe that corrects prefill, which asks for exactly this many steps (16; it was 8). A non-integer value is reported at startup and the default used; the knob is described in `python src/bench_endpoint.py --help`. |
+| `GENIE_STRIP_THINK` | 0 | `1` (or `true` / `yes` / `on`, any case; it used to take only `1`) strips a well-formed `<think>...</think>` pair from every BUFFERED response -- non-streaming, and a tool stream on either API, which is generated in full before it is framed. Only an incremental (non-tool) stream is always faithful to the model, because a frame already sent cannot be retracted. Unrelated to the orphan-close strip below, which is always on because it removes a DUPLICATED answer rather than the model's reasoning. |
+| `GENIE_MIN_DECODE_STEPS` | 16 | `bench_endpoint`, and through it `bench_servers` and `bench_contention`: fewest decode steps a rate may rest on. Below it the delta is measuring per-request overhead rather than decode -- a 4-step window once reported **0.60 tok/s against a true 17.6**. Such a sample is refused with a line naming the count, not averaged in. `bench_contention` goes one further and refuses a `--tokens` below this floor at startup (exit 2), rather than running a sweep in which every leg is REFUSED; `bench_servers` now does the same, with the same wording, exiting 1 (a `sys.exit`, not argparse's `ap.error`). `bench_endpoint` itself now does too, exiting 1 before its /health check, except under `--prefill-only`, where `--tokens` only sizes the depth budget. It also floors the probe that corrects prefill, which asks for exactly this many steps (16; it was 8). A non-integer value is reported at startup and the default used; the knob is described in `python src/bench_endpoint.py --help`. |
 | `GENIE_LOW_CHARGE_PCT` | 25 | `bench_contention` only: pack percentage below which a timing run is flagged as not-a-settled-baseline **even on AC**. Measured on this box: at 13-20% charge, CPU pp512 comes back ~58 against a settled 130, while decode barely moves. Advisory, never fatal -- bandwidth-bound work is largely immune. A non-numeric value warns and falls back to 25; described in `python src/bench_contention.py --help`. |
 | `GENIE_SEED` | unset | pins the sampler seed. Unset means a fresh seed per PROCESS, which is what stops every fresh prompt replaying the same answer -- the bundles ship a fixed `42` and Genie re-seeds from it on every dialog reset. Pin it for reproducibility (comparing bundles, bisecting a bad generation); throughput does not depend on it. Per-REQUEST variation is not available -- see the note below. |
 | `GENIE_ORPHAN_HOLD_CHARS` | -1 | how much of a STREAM to withhold while deciding whether the model is about to close a `<think>` block the prefill opened. `-1` holds until that is settled (so a streamed reply arrives as one frame at the end -- correct, not incremental). `0` streams every chunk as it arrives and ships the occasional doubled answer. A positive value is a bounded hold, which was measured LEAKING. Non-streaming and tool paths are unaffected; they buffer anyway and always strip. |
-| `GENIE_THINKING` | **0** | Qwen3's reasoning block is **suppressed by default** -- it costs 10-17x on an agent turn (see the tool-calling note below). `1` re-enables it server-wide. Per request either way: `chat_template_kwargs.enable_thinking`, `reasoning_effort` (`"none"` / `"high"`), or `thinking:{"type":"disabled"|"enabled"}` -- an explicit request always beats the server default. |
+| `GENIE_THINKING` | **0** | Qwen3's reasoning block is **suppressed by default** -- it costs 10-17x on an agent turn (see the tool-calling note below). `1` (or `true` / `yes` / `on`, any case; `True` and `on` used to read as off) re-enables it server-wide. Per request either way: `chat_template_kwargs.enable_thinking`, `reasoning_effort` (`"none"` / `"high"`), or `thinking:{"type":"disabled"|"enabled"}` -- an explicit request always beats the server default. |
 
 ## Supervision: what happens when the HTP wedges
 
 The Genie query is a blocking call into native code. When the device stops
 making progress the calling thread is stuck inside the driver holding the
 engine lock, and Python cannot reclaim a thread blocked in native code -- no
-timeout, no interrupt, no kill. Later requests park behind that lock until
-`GENIE_MAX_INFLIGHT` is exhausted and the rest get a fast `429`, so from
-outside this looks like a server that 429s forever while sitting idle.
+timeout, no interrupt, no kill. Until the stall is past its limit nothing can
+tell it from a slow prefill, so for those first 120-300s later requests park
+behind that lock until `GENIE_MAX_INFLIGHT` is exhausted and the rest get a
+fast `429` / `529`. Once `/health` says `stalled` or `wedged`, every new
+generation request is refused **503** by name instead (see `/health` under
+[Endpoints](#endpoints)) -- where it used to go on parking or being told
+"busy", so from outside the server looked like one that 429s forever while
+sitting idle.
 
 Detection is by **stalled progress, not elapsed time**. A long generation is
 not a wedge -- 2000 tokens at the slowest measured 3.3 t/s is ten minutes of
@@ -357,8 +485,16 @@ Escalation, in order:
    engine returned to `ok` on its own. The turn is still booked as a FAILED
    generation -- a stall that an abort happened to clear is still the engine
    not serving -- so a device that stalls on every turn and honours every abort
-   reaches `failing` instead of reading healthy between stalls. Its client
-   receives an ordinary `stop` with whatever had been generated.
+   reaches `failing` instead of reading healthy between stalls. Its client is
+   told the turn failed, not that it finished: a non-streaming request gets a
+   **500** (`server_error` / `api_error`, `the engine stalled: no token
+   arrived within its limit, so the watchdog aborted this generation part-way
+   and it did not finish. GET /health reports the engine's state.`), and a
+   stream ends on its API's error frame (see the streaming-failure note) with
+   no `finish_reason` / `stop_reason`. It used to receive an ordinary 200
+   `stop` / `end_turn` carrying whatever had been generated -- a fragment an
+   agent files as a complete answer. The log line for a stream reads `aborted
+   mid-stream (watchdog)`.
 
    The first-token clock starts when the request takes the engine lock, not at
    `GenieDialog_query`, so a hang in the reset, stop-sequence, sampler or
@@ -393,9 +529,9 @@ Escalation, in order:
 2. **Wedged** -- the stall outlasted `GENIE_WEDGE_GRACE`, counted from the
    first time the watchdog acted on it. Nothing in-process can help, so the
    server exits **75** (`EX_TEMPFAIL`) and asks to be replaced.
-   `GENIE_WEDGE_EXIT=0` keeps it up instead: the watchdog goes on watching and
-   `/health` goes on answering 503. The WEDGED line and the `/health` detail end
-   on what was actually tried: `; an abort was signalled Ns ago and did not
+   `GENIE_WEDGE_EXIT=0` keeps it up instead: the watchdog goes on watching, and
+   `/health` and every generation request go on answering 503. The WEDGED
+   line and the `/health` detail end on what was actually tried: `; an abort was signalled Ns ago and did not
    take` when a native ABORT went out, and `; first seen Ns ago and still stuck.
    No ABORT was sent: the stall is outside GenieDialog_query, where none can be
    delivered` for the other two -- so nobody files "Genie ignores ABORT"
@@ -409,10 +545,21 @@ Escalation, in order:
    reclaim a thread blocked in native code.` and then ends either `Exiting 75
    so a supervisor restarts a clean process. (GENIE_WEDGE_EXIT=0 to stay up
    and keep reporting 503.)` or, under `GENIE_WEDGE_EXIT=0`, `NOT exiting:
-   GENIE_WEDGE_EXIT=0. This process stays up wedged -- /health answers 503 and
-   generation requests queue behind the stuck call or are shed -- until you
-   restart it by hand. (Unset GENIE_WEDGE_EXIT to exit 75 instead, for a
-   supervisor to restart a clean process.)`
+   GENIE_WEDGE_EXIT=0. This process stays up wedged -- /health and every
+   generation request answer 503 -- until you restart it by hand. (Unset
+   GENIE_WEDGE_EXIT to exit 75 instead, for a supervisor to restart a clean
+   process.)`
+
+   The exit itself is `TerminateProcess` on its own process, not `os._exit`:
+   on Windows `os._exit` is `ExitProcess`, which runs every loaded DLL's
+   detach code -- `Genie.dll`, the `QnnHtp*` libraries -- and a detach that
+   waits on the driver that just wedged hangs the exit (measured with a
+   stand-in DLL whose detach sleeps 8s: `os._exit` took 8.02s, `TerminateProcess`
+   0.00s). `TerminateProcess` runs no user-mode code, the way a crash leaves.
+   It is not a cure for a thread stuck in KERNEL mode -- no exit completes
+   until that thread lets go -- and `run-genie-server.ps1` waits on the child
+   with no deadline, so that case would still hang. None of this has run
+   against a real wedged NPU (see the README's untested list).
 3. **Restarted** -- `run-genie-server.ps1` restarts on exit 75 **and on a native
    crash**; any other code is a deliberate exit (Ctrl-C, a config error it
    already explained) and repeating it would be pointless. Restarts are capped
@@ -429,7 +576,14 @@ Escalation, in order:
    give-up branch was dead for the case it exists for.) The give-up message
    carries a `pnputil /restart-device` hint; the instance id in it is the dev
    box's, and the line beside it says how to find yours (`Get-PnpDevice
-   -FriendlyName '*Hexagon*'`).
+   -FriendlyName '*Hexagon*'`). The hint is now preceded by a machine-wide
+   warning -- restarting the Hexagon device, or rebooting, resets the NPU
+   under EVERY process on the box, other sessions' servers and benchmarks
+   included -- and by a check to run first, `tasklist /m QnnHtp.dll` from the
+   elevated shell (this server has already exited, so everything it lists is
+   someone else's; warn them). And it is scoped: the restart is verified only
+   against the interrupt-delivery crawl (`MODEL_OPTIONS.md`), and untested
+   against a wedge or a crash; a reboot is the other way back.
 
    The crash case is not hypothetical and is why "75 and only 75" was wrong:
    the driver can fault instead of hang, and WER on the dev box records
@@ -512,6 +666,19 @@ nothing was attempted and nothing about the request was wrong, which is this
 server's "503 = shed" contract, so a router can send it to another leg instead
 of booking a failure. On a stream whose 200 is already out it arrives as the
 usual error frame or event.
+
+The turn that was IN FLIGHT when Ctrl-C arrived -- the one the abort cut short
+-- is now told the same thing. `begin_shutdown` marks it before aborting it,
+and a turn the abort actually cut is answered **503** on a non-streaming
+request (`the server is shutting down: this generation was aborted part-way
+and did not finish. Retry on another engine.`), or, on a stream, the API's
+error frame after whatever text had gone out, with no `finish_reason` /
+`stop_reason` (log line: `aborted mid-stream (shutdown)`). It used to be a 200
+carrying the text cut wherever the abort landed, labelled `stop` / `end_turn`
+-- a fragment an agent files as complete, beside the 503 the queued turn got.
+A turn that finished before the abort landed is reported as the whole answer
+it is, and a client's OWN disconnect is unchanged: it left, so nothing is
+sent.
 
 ## Notes / limitations
 
@@ -1280,7 +1447,16 @@ usual error frame or event.
   detection -- Genie strips the matched text, so whether a sequence fired is
   not observable -- and `stop_sequence` (the field) is always `null`. The cap
   outranks it: a capped generation is `max_tokens` whatever stop list it
-  carried.
+  carried. None of these is ever a turn the server cut short: a stall the
+  watchdog aborted and a turn shutdown aborted are errors, not finishes (see
+  the streaming-failure note below), so `stop` / `end_turn` / `stop_sequence`
+  can no longer be a stall.
+
+  **How far the cap detection is verified:** only against device-free stubs.
+  How many token callbacks real Genie makes per token, and the exact count it
+  reaches at the cap, have not been measured on the NPU, so `length` at the
+  cap is the stubbed contract rather than an observed one -- see the README's
+  untested list.
 
 - **The output cap: both spellings, resolved once, applied every turn.**
   `max_tokens` and `max_completion_tokens` are both honoured. For either one
@@ -1319,6 +1495,13 @@ usual error frame or event.
   server old enough to send it.) Non-streaming failures are an ordinary 500 in
   the endpoint's envelope.
 
+  A turn the SERVER aborted part-way is one of these failures now, not a
+  finish: the watchdog cutting a stalled turn (500 non-streaming) and shutdown
+  cutting the turn in flight (503 non-streaming) both end a stream on the
+  frames above, after whatever text had already gone out. Both used to end on
+  `finish_reason: "stop"` / `stop_reason: "end_turn"` over a fragment. A
+  client that disconnects is not sent anything, as before.
+
 - **Malformed requests are refused at the door, in the envelope of the API they
   were sent to** -- `{"error": {...}}` on the OpenAI leg, `{"type": "error",
   "error": {...}}` on `/v1/messages` -- and before anything that costs NPU time
@@ -1340,9 +1523,10 @@ usual error frame or event.
   `GENIE_MAX_BODY_BYTES` (413), JSON that does not parse or is not an object
   (400). Any other unhandled exception is a 500 (`server_error` / `api_error`)
   rather than a dropped connection; once headers are out, the connection is
-  closed and the reason logged. The one exception is a turn refused because
-  shutdown had begun, which is a **503** in the same envelope -- see Shutdown
-  above.
+  closed and the reason logged. The exceptions are **503**s in the same
+  envelope: a turn refused because shutdown had begun, or cut short by it
+  (see Shutdown above), and a generation request refused because `/health`
+  says the engine is `stalled` or `wedged` (see `/health` under Endpoints).
 
 - **The log is silent on success and never silent on a refusal.** There is no
   per-request access line (an agent makes hundreds). What IS printed is one
@@ -1350,11 +1534,14 @@ usual error frame or event.
   <path>: <message>` for every non-2xx the server writes (400 / 404 / 411 / 413
   / 429 / 503 / 529 / 500, and the stdlib's own refusals such as 501), plus
   `engine failure mid-stream`, `dropped ... stopped sending its N-byte body`
-  and `failed mid-response`. The 503 there is the shutdown refusal, not
-  `/health`: a turn the closing engine would not start. When that happens to a
-  STREAM whose 200 is already out, the line reads `refused mid-stream` rather
-  than `engine failure mid-stream` -- nothing about the engine failed, it
-  declined. One line, ASCII, message capped at 300 characters. A `/health` 503
+  and `failed mid-response`. The 503 there is a generation refused, not
+  `/health`: a turn the closing engine would not start or cut short, or one
+  refused because the engine is `stalled` or `wedged`. When shutdown refuses
+  a STREAM whose 200 is already out, the line reads `refused mid-stream`
+  rather than `engine failure mid-stream` -- nothing about the engine failed,
+  it declined -- and a stream the server cut part-way reads `aborted
+  mid-stream (shutdown)` or `aborted mid-stream (watchdog)`. One line, ASCII,
+  message capped at 300 characters. A `/health` 503
   is deliberately NOT logged per poll -- it is the answer, not a refusal, and
   the watchdog announces the state change once.
 
@@ -1416,7 +1603,21 @@ had paid for it.
   yourself, or pass another port. It used to `taskkill /IM geniex.exe` and
   force-stop whatever owned both ports before pass 1, which killed a
   co-tenant's normally-launched server mid-session with no notice on either
-  side.
+  side. Before pass 1 and before every start it also lists the box's
+  processes (`Win32_Process`, read-only). A `genie_server` (a Python process
+  whose script is `genie_server.py`, run directly or under `-m pdb` / `-m
+  cProfile`), a `geniex` or a `GenieAPIService` that this run did not start,
+  on ANY port, is refused by pid and command line: `NOT starting: N other NPU
+  server(s) running on this box that this run did not start: ... Stop them
+  yourself, or pass --allow-other-npu-servers to measure beside them
+  deliberately`. Found mid-sweep, it ends the run as `outcome: "refused:
+  ..."` with the rows so far written (exit 1). `--allow-other-npu-servers`
+  goes on beside them, prints a `WARNING: running beside N other NPU
+  server(s)` block naming them, and the results file records them. A listing
+  that cannot be taken (off-Windows, PowerShell failed) prints a note --
+  `(could not list this box's processes, so NPU servers on ports other than
+  the arms' were NOT looked for; the arm ports still are)` -- and is not a
+  refusal.
 - Each arm's stdout and stderr go to `bench_servers-<arm>.log` beside `--out`.
   A child that exits before its port answers fails that arm-run at once, with
   its exit code and the log's last lines. For `genie_server` that covers the
@@ -1444,9 +1645,20 @@ had paid for it.
   a foreign mid-load instance on `0.0.0.0` can no longer let this run's
   `127.0.0.1` arm bind beside it and measure against the wrong server.
 - `--out` (default `sweep-results.json`, in the current directory; `''` for
-  none) is NOT overwritten without `--force`, and an existing file or a missing
-  directory is refused BEFORE the sweep rather than after twenty minutes of it.
-  The repo's `.gitignore` covers the default name and the logs.
+  none) is NOT overwritten without `--force`, and an existing file, a
+  directory (`NOT starting: --out X is a directory -- it names the results
+  FILE.`, `--force` or not) or a missing directory is refused BEFORE the sweep
+  rather than after twenty minutes of it. The path is looked at again when the
+  record is written: a file that appeared there during the sweep, or replaced
+  the one `--force` was given, is left alone -- `--force` or not -- and the
+  record goes to a timestamped file beside it (`sweep-results.<UTC
+  stamp>.json`, i.e. `<out-root>.<YYYYMMDDTHHMMSSZ><ext>`), as it does when
+  writing `--out` fails for any other reason (the directory gone, the volume
+  full). The closing lines say where it went (one sentence, then `wrote
+  <actual path>`), and the run exits 1 whatever `outcome` says. If the
+  fallback write fails too, the output says the numbers exist only in the
+  terminal. The repo's `.gitignore` covers the default name, the timestamped
+  fallback and the logs.
 - Every arm gets the cap under BOTH spellings (`max_tokens` and
   `max_completion_tokens`), `cache_prompt: false`, thinking off
   (`chat_template_kwargs.enable_thinking=false`, `reasoning_effort: "none"`)
@@ -1461,9 +1673,11 @@ had paid for it.
 - `--repeat` and `--depth` are accepted as aliases of `--passes` and
   `--depths`, because the other bench CLIs spell them that way. Progress reads
   `[run R/T, pass P/N]`: a pass is one A/B pair, a run is one arm's turn in it.
-- **Exit status is 0 only when the sweep completed.** Interrupted, refused or
-  errored is 1 -- and a Ctrl-C or a bug mid-run still stops the servers this
-  run started and still writes the rows gathered so far, with `outcome` saying
+- **Exit status is 0 only when the sweep completed** and its record is at
+  `--out`. Interrupted, refused (another NPU server included) or errored is 1,
+  and so is a record that went to the timestamped fallback -- and a Ctrl-C
+  or a bug mid-run still stops the servers this run started and still writes
+  the rows gathered so far, with `outcome` saying
   which it was. That includes a Ctrl-C during the port wait: the child is
   registered the moment it exists, before the wait, so it is stopped rather
   than left holding the Hexagon and its port. `outcome` is about the LOOP: it
@@ -1488,10 +1702,14 @@ The results file says which sweep it was. Top level: `tool`, `outcome`,
 `started`, `finished`, `bundle_dir`, `n_ctx`, `n_ctx_source`, `arms`, `passes`,
 `order`, `depths`, `tokens`, `timeout`, `acceptance`, `cap_spellings`,
 `request_settings`, `depth_means`, `token_counter`, `clock_instrument`, `logs`,
-`failed_starts`, `died_mid_run`, `rows`. `failed_starts` is a list of `{arm,
-pass, run, reason}` and also holds an arm whose server died during the warmup
-after its port had answered; `died_mid_run` is a list of `{arm, pass, run,
-depth, reason}`. Each row: `arm`, `pass`, `run`, `depth`, `rate`,
+`failed_starts`, `died_mid_run`, `other_npu_servers`, `rows`. `failed_starts`
+is a list of `{arm, pass, run, reason}` and also holds an arm whose server
+died during the warmup after its port had answered; `died_mid_run` is a list
+of `{arm, pass, run, depth, reason}`. `other_npu_servers` is `{allowed, seen,
+unscanned_runs}`: `seen` lists `{pid, ppid, name, cmdline, kind, run}` for
+every server the run went on beside (run 0 = the startup check), and
+`unscanned_runs` lists the runs whose process listing could not be taken --
+"none seen" and "not looked" are different facts about a number. Each row: `arm`, `pass`, `run`, `depth`, `rate`,
 `steps`, `secs`, `prompt_tokens`, `on_ac`, `charge_pct`, `charge_w`,
 `clock_pct`. The old row key `clock` (the `Win32_Processor` ratio, `-1` on a
 failed read) is gone; `clock_pct` is the performance counter and is `null`
@@ -1504,6 +1722,17 @@ when it could not be read.
 ```powershell
 python src\probe_server_semantics.py http://127.0.0.1:8123 qwen3-4b-npu max_tokens
 ```
+
+`-h` / `--help` / `/?` print the usage and exit 0 without `GENIE_BUNDLE_DIR`.
+A BASE that is not an http(s) URL (`127.0.0.1:8123`, `localhost:8123`), a
+fourth positional and an unknown option are refused by name, exit 1, before
+anything is loaded. Before PROBE 1 it GETs `BASE/v1/models` once. If nothing
+takes that connection, it exits 1 with `cannot reach <BASE>/v1/models (...)
+-- nothing was probed`, plus the 18181 / 8123 hint when the connect was
+refused, instead of eight refused rows over ~20 s and exit 0; any answer, an
+HTTP error included, is enough to go on. The first line of output names the
+base, model and cap key (`probing <BASE> -- model <MODEL>, cap sent as
+<CAP>`), and a completed run exits 0.
 
 `GENIE_BUNDLE_DIR` must be the bundle the server under test is serving, and
 must hold `genie_config.json` as well as `tokenizer.json`: PROBE 2's three

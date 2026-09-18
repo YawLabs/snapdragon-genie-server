@@ -278,6 +278,35 @@ def test_health_failure_names_the_launcher_and_both_ports_when_nothing_listens(b
     assert "GENIE_PORT" in msg and "8080" in msg, "genie_server.py direct serves elsewhere"
 
 
+def test_nothing_listening_also_names_a_genie_server_still_loading(be):
+    # genie_server binds before its 11-35 s load and listens only after it,
+    # so a connect during the load is refused exactly like one to a closed
+    # port. The line used to assert absence -- "start one" -- which, taken
+    # during a load, queues a second bundle on a shared NPU. It now names
+    # both readings and says how to tell them apart.
+    err = urllib.error.URLError(
+        ConnectionRefusedError(10061, "No connection could be made"))
+    msg = be._health_failure("http://127.0.0.1:8123", err)
+    assert "either no server is running there" in msg
+    assert be.STILL_LOADING in msg
+    assert msg.index(be.STILL_LOADING) < msg.index("start one"), (
+        "the wait-and-re-run reading comes before the advice to start one")
+    for said in ("still loading its bundle", "11-35 s", "refuses connections",
+                 "`endpoint on`", "rather than starting another"):
+        assert said in be.STILL_LOADING, said
+
+
+@pytest.mark.parametrize("err", [TimeoutError("timed out"),
+                                 urllib.error.HTTPError(
+                                     "u", 503, "Service Unavailable", {},
+                                     io.BytesIO(b"{}"))],
+                         ids=["unanswered", "http-503"])
+def test_the_still_loading_reading_is_only_on_the_refused_line(be, err):
+    # A server that took the connection is not a genie_server mid-load: that
+    # one takes no connection at all.
+    assert be.STILL_LOADING not in be._health_failure("http://127.0.0.1:8123", err)
+
+
 # What urllib raises BARE from waiting for or reading the response, for a
 # listener that ENGAGED with the request and then gave nothing usable back.
 # Each was reproduced against a real loopback socket before being listed here:
@@ -1378,6 +1407,18 @@ def _stub_server(be, monkeypatch, argv, served="qwen3-4b-npu", content="1, 2, 3,
     return calls
 
 
+def _record_health(be):
+    """Every /health (or other GET) main() makes, in order; answers 200 {}."""
+    seen = []
+
+    def get(base, path, timeout=15):
+        seen.append((base, path))
+        return {}
+
+    be._get = get
+    return seen
+
+
 def test_main_prints_the_served_model_beside_the_flag(be, monkeypatch, capsys):
     # run-genie-server.ps1 -Model qwen3-8b on the default port, benched under
     # the default --model: the header is what gets copied into the docs.
@@ -1452,10 +1493,34 @@ def test_main_does_not_blame_the_sampler_when_every_point_failed(be, monkeypatch
     # nothing was accepted, so nothing was sampled, and the closing line must
     # say that rather than "box state could not be sampled".
     _stub_server(be, monkeypatch, ["--depths", "250"], fail_after_warmup=True)
-    be.main()
+    with pytest.raises(SystemExit):
+        be.main()
     out = capsys.readouterr().out
     assert "no measurements were accepted" in out
     assert "could not be sampled" not in out
+
+
+def test_main_exits_non_zero_when_nothing_was_accepted(be, monkeypatch, capsys):
+    # It exited 0, which a wrapper reads as a finished benchmark: the shape
+    # the reproduction hit with `--tokens -3 --decode-only`, every point a
+    # 400 and then "(no measurements were accepted...)" over a clean exit.
+    # bench_servers exits non-zero for a run that left an arm with no rows.
+    _stub_server(be, monkeypatch, ["--decode-only", "--depths", "250"],
+                 fail_after_warmup=True)
+    with pytest.raises(SystemExit) as e:
+        be.main()
+    assert e.value.code not in (0, None)
+    assert "no measurement was accepted" in str(e.value)
+    # The trailer is still printed first, so the screen says the same thing.
+    assert "no measurements were accepted" in capsys.readouterr().out
+
+
+def test_main_exits_zero_when_some_point_was_accepted(be, monkeypatch, capsys):
+    # The other side of the line: one accepted prefill row is a result, and
+    # the exit is the ordinary one.
+    _stub_server(be, monkeypatch, ["--prefill-only", "--depths", "250"])
+    be.main()                    # returns; a SystemExit would fail the test
+    assert "no measurements were accepted" not in capsys.readouterr().out
 
 
 # --- the decode groups main() assembles -----------------------------------
@@ -1549,11 +1614,14 @@ def test_main_refuses_tokens_that_leave_no_room_in_the_window(be, monkeypatch, c
 
 
 def test_main_turns_a_mistyped_depth_into_a_sentence_not_a_traceback(be, monkeypatch):
+    # Before ANY request now. The integer parse needs no server, and it used
+    # to run after /health and the warmup generation (calls == [WARMUP_CAP]).
     calls = _stub_server(be, monkeypatch, ["--depths", "250,abc"])
+    health = _record_health(be)
     with pytest.raises(SystemExit) as e:
         be.main()
     assert "--depths wants comma-separated integers" in str(e.value)
-    assert calls == [be.WARMUP_CAP]
+    assert calls == [] and health == []
 
 
 def test_main_refuses_depths_that_all_exceed_the_budget_with_its_sentence(be, monkeypatch):
@@ -1562,3 +1630,102 @@ def test_main_refuses_depths_that_all_exceed_the_budget_with_its_sentence(be, mo
         be.main()
     assert "every requested depth exceeds the budget" in str(e.value)
     assert calls == [be.WARMUP_CAP]
+
+
+# --- the arguments, refused before the first request -----------------------
+# argparse checks types, not ranges. Each of these used to be found out on the
+# box: a below-floor --tokens spent the whole decode phase to print every row
+# REFUSED, --tokens -1 sent max_tokens=0 (genie_server's "not set", so a 511-
+# step rate was printed as the one asked for), --repeat 0 quietly ran one, and
+# a scheme-less --base told the operator to start a server that was already
+# answering. bench_contention._validate refuses its share in the same words.
+
+@pytest.mark.parametrize("argv,said", [
+    (["--base", "127.0.0.1:8123"],
+     "--base must start with http:// or https:// (got '127.0.0.1:8123' -- "
+     "try http://127.0.0.1:8123)"),
+    (["--base", "localhost:8123"], "try http://localhost:8123"),
+    (["--tokens", "0"], "--tokens must be >= 1 (got 0)"),
+    (["--tokens", "-3"], "--tokens must be >= 1 (got -3)"),
+    # Non-positive is refused in every mode, --prefill-only included.
+    (["--prefill-only", "--tokens", "-1"], "--tokens must be >= 1 (got -1)"),
+    (["--tokens", "15"], "--tokens 15 is below the decode floor of 16 steps "
+                         "(GENIE_MIN_DECODE_STEPS"),
+    (["--decode-only", "--tokens", "5"], "--tokens 5 is below the decode floor"),
+    (["--repeat", "0"], "--repeat must be >= 1 (got 0)"),
+    (["--repeat-deep", "-5"], "--repeat-deep must be >= 1 (got -5)"),
+    # Not consulted in this mode, and still no meaning: refused, not raised.
+    (["--decode-every", "--repeat-deep", "0"], "--repeat-deep must be >= 1 (got 0)"),
+], ids=lambda v: " ".join(v) if isinstance(v, list) else None)
+def test_main_refuses_an_argument_before_any_request(be, monkeypatch, argv, said):
+    calls = _stub_server(be, monkeypatch, argv)
+    health = _record_health(be)
+    with pytest.raises(SystemExit) as e:
+        be.main()
+    assert said in str(e.value)
+    assert e.value.code not in (0, None)
+    assert health == [] and calls == [], "refused AFTER touching the server"
+
+
+def test_the_floor_is_not_applied_when_no_decode_is_measured(be, monkeypatch, capsys):
+    # Under --prefill-only --tokens only sizes the depth budget, and the
+    # probe asks for the floor itself, so a short --tokens costs nothing.
+    calls = _stub_server(be, monkeypatch,
+                         ["--prefill-only", "--tokens", "5", "--depths", "250"])
+    be.main()
+    assert calls and "PREFILL" in capsys.readouterr().out
+
+
+def test_the_floor_follows_the_env_var_and_admits_a_full_window(be, monkeypatch):
+    # AT the floor is a full window and runs; the refusal reads the live
+    # floor, not a copy of the default.
+    _stub_server(be, monkeypatch, ["--decode-only", "--depths", "250",
+                                   "--tokens", "16", "--repeat", "1"])
+    be.main()
+    monkeypatch.setattr(be, "MIN_DECODE_STEPS", 250)
+    calls = _stub_server(be, monkeypatch, ["--decode-only"])
+    with pytest.raises(SystemExit) as e:
+        be.main()
+    assert "--tokens 200 is below the decode floor of 250 steps" in str(e.value)
+    assert calls == []
+
+
+def test_repeat_is_taken_as_given(be, monkeypatch):
+    # --repeat 1 at the shallow depth, --repeat-deep 2 at the deep one: two
+    # requests per measurement, nothing raised or lowered.
+    _stub_server(be, monkeypatch, ["--decode-only", "--depths", "250,3300",
+                                   "--repeat", "1", "--repeat-deep", "2"])
+    asked = _depths_asked(be)
+    be.main()
+    assert asked == [250, 250, 3300, 3300, 3300, 3300]
+
+
+@pytest.mark.parametrize("base,said", [
+    ("127.0.0.1:8123", "try http://127.0.0.1:8123"),
+    # urlsplit reads "localhost" as the scheme here; the fix is the same.
+    ("localhost:8123", "try http://localhost:8123"),
+    ("ftp://host:21", "must start with http:// or https://"),
+    ("http://", "names no host"),
+    ("http:8123", "names no host"),
+    # A bare http.client.InvalidURL out of urllib, which the health check
+    # would have read as a listener that took the connection.
+    ("http://127.0.0.1:abc", "not a number in 1-65535"),
+    ("http://127.0.0.1:99999", "not a number in 1-65535"),
+    ("http://127.0.0.1:0", "not a number in 1-65535"),
+])
+def test_base_url_problem_names_the_flag_the_value_and_the_fix(be, base, said):
+    msg = be.base_url_problem("--npu", base)
+    assert msg and said in msg
+    assert msg.startswith("--npu ") and repr(base) in msg
+
+
+def test_base_url_problem_offers_http_only_where_it_is_the_fix(be):
+    assert "try" not in be.base_url_problem("--base", "ftp://host:21")
+
+
+@pytest.mark.parametrize("base", [
+    "http://127.0.0.1:8123", "http://127.0.0.1:8123/", "https://example.org",
+    "HTTP://127.0.0.1:8123", "http://[::1]:8123", "http://localhost",
+])
+def test_base_url_problem_accepts_every_url_urllib_can_open(be, base):
+    assert be.base_url_problem("--base", base) is None

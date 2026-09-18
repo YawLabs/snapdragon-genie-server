@@ -10,9 +10,14 @@ the machine does not have -- while the LISTEN waits until the model is
 resident, so nothing connects to a server that may yet fail to load -- that
 shutdown closes the engine rather than only freeing its dialog, that the IPv6
 loopback the server lists as recognised can actually be bound, what
-probe_tool_support decides from the bundle's files, and the Python side of
-load_engine itself: the tokenizer warning and the sampler baseline, driven
-through a stand-in for Genie.dll that returns scripted statuses.
+probe_tool_support decides from the bundle's files, that --help and a stray
+argument are answered before anything is touched, and the Python side of
+load_engine itself: the named exit for every setup it cannot use (an unset
+variable, a directory that is not a bundle, a file the config names and the
+bundle lacks, a Genie.dll that will not load and why), what a failed load
+blames, the line a slow load prints, the tokenizer warning and the sampler
+baseline, driven through a stand-in for Genie.dll that returns scripted
+statuses.
 
 Device-free. The SDK and the bundle are a handful of files under tmp_path,
 and the DLL is a recorder -- nothing here asserts what Genie wants, only what
@@ -29,6 +34,26 @@ import pytest
 
 
 # --- every config reader degrades instead of refusing to boot -------------
+
+@pytest.fixture
+def bare_env(monkeypatch):
+    """No GENIE_* variable in the environment but the one the test sets.
+
+    The reader tests below reload the module and then read what it PRINTED,
+    and a reload re-reads EVERY GENIE_* variable, not only the one under test.
+    With a developer's own exports in place (GENIE_PORT=808O,
+    GENIE_MAX_TOKENS=0, GENIE_WINDOW_MARGIN=-5 -- each one a documented
+    degradation) every other reader's WARNING landed in the same capture: the
+    quiet tests failed on a line about a different variable, and the loud ones
+    could pass on one ("808O" in out was satisfied by GENIE_PORT while the test
+    was about GENIE_MAX_TOKENS). Scrubbed, so each capture is about one
+    variable. The `gs` fixture's pins cannot do this: these tests reload past
+    them on purpose.
+    """
+    for name in list(os.environ):
+        if name.upper().startswith("GENIE_"):
+            monkeypatch.delenv(name)
+
 
 READERS = [
     ("GENIE_PORT", "PORT", 8080),
@@ -49,7 +74,7 @@ READERS = [
 
 @pytest.mark.parametrize("var,attr,default", READERS)
 def test_a_malformed_env_var_degrades_to_its_default_and_says_so(
-        gs, monkeypatch, capsys, var, attr, default):
+        bare_env, gs, monkeypatch, capsys, var, attr, default):
     # `808O` -- the typo that used to kill the process at IMPORT with a bare
     # `invalid literal for int()`, before any startup line had printed, on a
     # server whose whole banner exists to explain itself. Every reader, not
@@ -69,6 +94,65 @@ def test_no_reader_bypasses_the_degrading_helpers(gs):
     with open(gs.__file__, encoding="utf-8") as f:
         src = f.read()
     assert not re.search(r"\b(?:int|float)\(\s*os\.environ", src)
+    # ...and the on/off flags' version of the same hole: a GENIE_* value
+    # compared in place against a hand-picked set of spellings. Every one of
+    # the four did that, and every one read some ordinary spelling as the
+    # opposite of what was meant -- see _bool_env.
+    assert not re.search(
+        r'os\.environ\.get\(\s*"GENIE_\w+"[^)]*\)\s*(?:==|!=|in\b|not\s+in\b)',
+        src)
+
+
+FLAGS = [
+    ("GENIE_WEDGE_EXIT", "WEDGE_EXIT", True),
+    ("GENIE_THINKING", "THINKING_DEFAULT", False),
+    ("GENIE_STRIP_THINK", "STRIP_THINK", False),
+    ("GENIE_SUMMARIZE_EVICTED", "SUMMARIZE_EVICTED", True),
+]
+
+
+@pytest.mark.parametrize("var,attr,default", FLAGS)
+@pytest.mark.parametrize("value,expected", [
+    ("1", True), ("true", True), ("True", True), ("YES", True), ("on", True),
+    (" 1", True),
+    ("0", False), ("false", False), ("False", False), ("No", False),
+    ("off", False), ("OFF", False), ("0 ", False),
+])
+def test_every_flag_reads_every_usual_spelling_both_ways(
+        bare_env, gs, monkeypatch, capsys, var, attr, default, value, expected):
+    # Each flag used to parse its own way and each way had a hole that read a
+    # spelling as its OPPOSITE, with no line: GENIE_WEDGE_EXIT=False (what
+    # PowerShell's `$env:X = $false` stores) left the wedge exit on,
+    # GENIE_THINKING=True left reasoning off, GENIE_STRIP_THINK took only
+    # "1", and GENIE_SUMMARIZE_EVICTED=false left summarising on.
+    monkeypatch.setenv(var, value)
+    importlib.reload(gs)
+    assert getattr(gs, attr) is expected
+    assert "WARNING" not in capsys.readouterr().out, "a spelling it knows"
+
+
+@pytest.mark.parametrize("var,attr,default", FLAGS)
+def test_an_unrecognised_flag_value_degrades_to_the_default_and_says_so(
+        bare_env, gs, monkeypatch, capsys, var, attr, default):
+    # The _int_env contract, for flags: not a silent reading either way.
+    monkeypatch.setenv(var, "disabled")
+    importlib.reload(gs)
+    assert getattr(gs, attr) is default
+    out = capsys.readouterr().out
+    assert "WARNING" in out and var in out and "disabled" in out, (
+        "name the variable AND the value")
+
+
+@pytest.mark.parametrize("var,attr,default", FLAGS)
+def test_an_unset_or_empty_flag_is_its_default_quietly(
+        bare_env, gs, monkeypatch, capsys, var, attr, default):
+    monkeypatch.setenv(var, "")
+    importlib.reload(gs)
+    assert getattr(gs, attr) is default
+    monkeypatch.delenv(var)
+    importlib.reload(gs)
+    assert getattr(gs, attr) is default
+    assert "WARNING" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("var,attr,value,default", [
@@ -77,7 +161,7 @@ def test_no_reader_bypasses_the_degrading_helpers(gs):
     ("GENIE_WINDOW_MARGIN", "WINDOW_MARGIN", "-5", 64),
 ])
 def test_an_out_of_range_value_degrades_like_a_malformed_one(
-        gs, monkeypatch, capsys, var, attr, value, default):
+        bare_env, gs, monkeypatch, capsys, var, attr, value, default):
     # The values that PARSE and are still not usable. GENIE_MAX_TOKENS=-1
     # reached c_uint32 and wrapped to 4294967295, the unbounded generation
     # _max_tokens exists to refuse, and 0 skipped setMaxNumTokens and left the
@@ -256,6 +340,81 @@ def main_env(gs, monkeypatch):
     return order, eng
 
 
+@pytest.mark.parametrize("flag", ["-h", "--help", "-help", "-?", "/?"])
+def test_help_prints_usage_before_anything_is_touched(
+        gs, main_env, monkeypatch, capsys, flag):
+    # This server used to ignore argv altogether, so `--help` on a box with
+    # GENIE_BUNDLE_DIR and GENIE_SDK_DIR set went straight into the 11-35s
+    # model load, on an NPU other sessions here benchmark on. Usage, exit 0,
+    # and NOTHING before it: no port probe, no bundle read, no bind, no load.
+    order, _eng = main_env
+    monkeypatch.setattr(gs, "port_in_use",
+                        lambda h, p: pytest.fail("probed the port for --help"))
+    monkeypatch.setattr(gs, "bundle_config_warnings",
+                        lambda: pytest.fail("read the bundle for --help"))
+    assert gs.main([flag]) == 0
+    assert order == [], "no socket, bind or load for --help"
+    out = capsys.readouterr().out
+    for must in ("usage:", "GENIE_BUNDLE_DIR", "GENIE_SDK_DIR",
+                 "genie_config.json", "docs/GENIE_SERVER.md",
+                 "run-genie-server.ps1", "native ARM64"):
+        assert must in out, "usage must say %r" % must
+    for line in gs.ENDPOINT_LINES:
+        assert line in out, "and list the endpoints the banner lists"
+    assert "%s:%d" % (gs.HOST, gs.PORT) in out, "and where it would serve"
+
+
+def test_a_help_flag_anywhere_on_the_line_still_means_help(gs, main_env, capsys):
+    order, _eng = main_env
+    assert gs.main(["--bogus", "--help"]) == 0
+    assert order == [] and "usage:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv", [["--port", "8081"], ["serve"], ["-v"]])
+def test_an_unknown_argument_is_refused_by_name_before_anything(
+        gs, main_env, monkeypatch, capsys, argv):
+    # Refused, not ignored: `--port 8081` used to serve on 8080 with nothing
+    # on screen to say the flag had done nothing.
+    order, _eng = main_env
+    monkeypatch.setattr(gs, "port_in_use",
+                        lambda h, p: pytest.fail("probed the port"))
+    assert gs.main(argv) == 2
+    assert order == [], "no socket, bind or load"
+    err = capsys.readouterr().err
+    for a in argv:
+        assert repr(a) in err, "name every argument it refused"
+    assert "--help" in err and "GENIE_" in err, "and say what to do instead"
+
+
+def test_the_script_passes_its_command_line_to_main(gs, tmp_path):
+    # End to end, in a real child process: the __main__ block is what hands
+    # sys.argv to main(), and a main() that handles --help is no use if the
+    # script never gives it the flag. Both variables are SET (to empty dirs),
+    # which is the case that used to reach the model load; with them set the
+    # old server went on to the bind and exited 1 on the SDK check. No NPU is
+    # reachable from here either way -- the dirs hold nothing.
+    import subprocess
+    import sys
+    env = dict(os.environ)
+    (tmp_path / "bundle").mkdir()
+    (tmp_path / "sdk").mkdir()
+    env.update(GENIE_BUNDLE_DIR=str(tmp_path / "bundle"),
+               GENIE_SDK_DIR=str(tmp_path / "sdk"),
+               GENIE_PORT=str(_free_port()), GENIE_HOST="127.0.0.1")
+    r = subprocess.run([sys.executable, gs.__file__, "--help"], env=env,
+                       cwd=str(tmp_path), capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "usage:" in r.stdout and "GENIE_BUNDLE_DIR" in r.stdout
+    both = r.stdout + r.stderr
+    assert "SDK lib dir not found" not in both and "archs usable" not in both, (
+        "it went on towards the load")
+    r = subprocess.run([sys.executable, gs.__file__, "--nope"], env=env,
+                       cwd=str(tmp_path), capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 2 and "'--nope'" in r.stderr, r.stdout + r.stderr
+
+
 def test_main_binds_before_it_loads_the_model_and_listens_after(gs, main_env):
     # A bind that cannot succeed should cost nothing, not 11-35s of loading a
     # bundle first -- so the bind is early. The listen is LATE: a port that
@@ -267,6 +426,25 @@ def test_main_binds_before_it_loads_the_model_and_listens_after(gs, main_env):
     order, _eng = main_env
     gs.main()
     assert order == ["socket", "bind", "load", "listen", "serve"]
+
+
+def test_the_reserved_address_is_printed_before_the_load(
+        gs, main_env, monkeypatch, capsys):
+    # A direct run printed no address until the model was resident, so for
+    # the whole 11-35s every client tool here said "nothing listening at ...
+    # start one" about a server that WAS starting, with nothing on screen to
+    # match that against.
+    order, eng = main_env
+    seen = {}
+
+    def load():
+        seen["before_load"] = capsys.readouterr().out
+        order.append("load")
+        return eng
+    monkeypatch.setattr(gs, "load_engine", load)
+    gs.main()
+    assert ("port %s:%d is reserved" % (gs.HOST, gs.PORT)) in seen["before_load"]
+    assert "refuses connections until the model is resident" in seen["before_load"]
 
 
 def test_a_bind_failure_exits_by_name_before_the_load(gs, monkeypatch):
@@ -322,7 +500,7 @@ def test_a_taken_port_says_the_holder_can_be_on_another_host(
 
 
 def test_a_load_failure_gives_the_port_back(gs, main_env, monkeypatch):
-    # Every load_engine failure is a sys.exit, and the socket is bound by
+    # load_engine's failures are named sys.exits, and the socket is bound by
     # then. It must not stay bound behind an exit somebody caught.
     order, _eng = main_env
 
@@ -635,7 +813,7 @@ def test_a_missing_tokenizer_is_announced_not_swallowed(gs, fake_sdk, capsys):
     assert eng.tokenizer is None
     assert gs.TOKENIZER_STATUS == -1
     out = capsys.readouterr().out
-    assert "GenieDialog_getTokenizer failed, status=-1" in out
+    assert "GenieDialog_getTokenizer failed, status=-1 (ERROR_GENERAL)" in out
     assert "ESTIMATES" in out
 
 
@@ -701,6 +879,190 @@ def test_no_hexagon_this_os_can_drive_exits_naming_the_skels_it_found(
     assert fake_sdk.calls == [], "it exits before Genie.dll is even asked"
 
 
+@pytest.fixture
+def dll_loads(gs, fake_sdk, monkeypatch):
+    """fake_sdk, with every attempt to load a DLL recorded by path."""
+    loads = []
+
+    def load(path):
+        loads.append(path)
+        return fake_sdk
+    monkeypatch.setattr(gs.C, "WinDLL", load)
+    return loads
+
+
+@pytest.mark.parametrize("unset,other", [("GENIE_BUNDLE_DIR", "GENIE_SDK_DIR"),
+                                         ("GENIE_SDK_DIR", "GENIE_BUNDLE_DIR")])
+def test_one_unset_variable_is_the_only_one_named(gs, fake_sdk, unset, other):
+    # Both used to be named whenever either was unset, so an operator who had
+    # just set the bundle was told to set it again.
+    attr = {"GENIE_BUNDLE_DIR": "BUNDLE_DIR", "GENIE_SDK_DIR": "SDK_DIR"}
+    kept = getattr(gs, attr[other])
+    setattr(gs, attr[unset], "")
+    with pytest.raises(SystemExit) as e:
+        gs.load_engine()
+    msg = str(e.value)
+    assert msg.startswith("set %s (" % unset), msg
+    assert "set %s" % other not in msg and "and %s" % other not in msg
+    assert "%s is set (%s)" % (other, kept) in msg, "and what the other one is"
+
+
+def test_both_unset_are_both_named(gs, fake_sdk):
+    gs.BUNDLE_DIR = gs.SDK_DIR = ""
+    with pytest.raises(SystemExit) as e:
+        gs.load_engine()
+    assert str(e.value) == ("set GENIE_BUNDLE_DIR (the Genie bundle dir) and "
+                            "GENIE_SDK_DIR (the QAIRT 2.45 root) -- see "
+                            "docs/GENIE_SERVER.md")
+
+
+def test_a_bundle_dir_with_no_config_exits_by_name_before_the_dll(
+        gs, dll_loads, tmp_path):
+    # An existing directory that is not a bundle -- empty, or a half-made
+    # one. It used to pass the isdir check, load Genie.dll, and die in a bare
+    # FileNotFoundError traceback from the open() of genie_config.json.
+    (tmp_path / "bundle" / "genie_config.json").unlink()
+    gs._CONFIG_PRESENT = None             # the fixture pins it present
+    with pytest.raises(SystemExit) as e:
+        gs.load_engine()
+    msg = str(e.value)
+    assert msg.startswith("no genie_config.json in %s" % gs.BUNDLE_DIR)
+    assert "bundle directory itself" in msg and "not the folder above it" in msg
+    assert "Nothing directly inside it" in msg
+    assert dll_loads == [], "it exits before Genie.dll is loaded"
+
+
+def test_the_folder_above_a_bundle_names_the_bundles_inside_it(
+        gs, dll_loads, tmp_path):
+    # The likeliest first-run shape: `qai-hub-models fetch --extract -o <dir>`
+    # puts the bundle in a model-named folder inside <dir>, and the variable
+    # gets <dir>. The fix is one folder down, so say which one.
+    gs.BUNDLE_DIR = str(tmp_path)
+    (tmp_path / "not-a-bundle").mkdir()
+    gs._CONFIG_PRESENT = None
+    with pytest.raises(SystemExit) as e:
+        gs.load_engine()
+    msg = str(e.value)
+    assert "no genie_config.json in %s" % tmp_path in msg
+    assert "point GENIE_BUNDLE_DIR at one of them: bundle" in msg
+    assert "not-a-bundle" not in msg
+    assert dll_loads == []
+
+
+def _write_config(bundle, **dialog):
+    cfg = {"dialog": {"context": {"size": 4096},
+                      "sampler": {"version": 1, "seed": 42, "temp": 0.8}}}
+    cfg["dialog"].update(dialog)
+    (bundle / "genie_config.json").write_text(json.dumps(cfg))
+
+
+def _full_config(bundle):
+    _write_config(
+        bundle, tokenizer={"version": 1, "path": "tokenizer.json"},
+        engine={"backend": {"type": "QnnHtp", "QnnHtp": {"poll": False},
+                            "extensions": "htp_backend_ext_config.json"},
+                "model": {"type": "binary", "binary": {
+                    "ctx-bins": ["part1_of_2.bin", "part2_of_2.bin"]}}})
+
+
+def test_a_file_the_config_names_and_the_bundle_lacks_exits_by_name(
+        gs, dll_loads, tmp_path):
+    # An interrupted copy of a multi-GB bundle. GenieDialogConfig_createFromJson
+    # does not check the files exist (measured: SUCCESS for a renamed ctx-bin),
+    # so this used to reach GenieDialog_create -- whose exit blames an arch or
+    # QAIRT mismatch and sends the operator to rebuild a bundle that is only
+    # half-copied.
+    bundle = tmp_path / "bundle"
+    _full_config(bundle)
+    (bundle / "part1_of_2.bin").write_bytes(b"")
+    (bundle / "tokenizer.json").write_text("{}")
+    with pytest.raises(SystemExit) as e:
+        gs.load_engine()
+    msg = str(e.value)
+    named = msg.split("names 2 files that are not there: ", 1)[1].split(chr(10))[0]
+    assert named == "part2_of_2.bin, htp_backend_ext_config.json", (
+        "the missing ones, in config order, and none of the present ones")
+    assert "incomplete copy" in msg
+    assert dll_loads == []
+
+
+def test_a_bundle_with_every_file_it_names_goes_on_to_load(gs, dll_loads, tmp_path):
+    bundle = tmp_path / "bundle"
+    _full_config(bundle)
+    for name in ("part1_of_2.bin", "part2_of_2.bin", "tokenizer.json",
+                 "htp_backend_ext_config.json"):
+        (bundle / name).write_bytes(b"")
+    assert gs.bundle_files_missing() == []
+    assert gs.load_engine() is not None
+    assert len(dll_loads) == 1
+
+
+def test_an_unreadable_config_is_left_for_genie_to_name(gs, fake_sdk, tmp_path):
+    # Not a claim about files in a config nobody could parse: Genie parses it
+    # itself and says where the syntax error is.
+    (tmp_path / "bundle" / "genie_config.json").write_text("{not json")
+    assert gs.bundle_files_missing() == []
+
+
+def test_an_x64_interpreter_is_told_to_use_an_arm64_one(gs, fake_sdk, monkeypatch):
+    # What a direct `python genie_server.py` under an x64 python gets: the
+    # launcher refuses one by name, the server used to die in a ctypes
+    # traceback ending "%1 is not a valid Win32 application".
+    def load(path):
+        raise OSError(22, "%1 is not a valid Win32 application", None, 193)
+    monkeypatch.setattr(gs.C, "WinDLL", load)
+    monkeypatch.setattr(gs.sysconfig, "get_platform", lambda: "win-amd64")
+    with pytest.raises(SystemExit) as e:
+        gs.load_engine()
+    msg = str(e.value)
+    assert "win-amd64" in msg and "native ARM64 Python" in msg
+    assert "GENIE_PYTHON" in msg, "and what to point at one under the launcher"
+    assert fake_sdk.calls == []
+
+
+def test_an_sdk_without_genie_dll_names_the_sdk_dir(gs, fake_sdk, monkeypatch):
+    def load(path):
+        raise FileNotFoundError("Could not find module '%s' (or one of its "
+                                "dependencies)." % path)
+    monkeypatch.setattr(gs.C, "WinDLL", load)
+    monkeypatch.setattr(gs.sysconfig, "get_platform", lambda: "win-arm64")
+    with pytest.raises(SystemExit) as e:
+        gs.load_engine()
+    msg = str(e.value)
+    assert msg.startswith("no Genie.dll at %s" % os.path.join(gs.LIB_DIR, "Genie.dll"))
+    assert "GENIE_SDK_DIR (%s)" % gs.SDK_DIR in msg and "QAIRT 2.45 root" in msg
+
+
+def test_a_genie_dll_whose_dependencies_fail_says_so(gs, fake_sdk, monkeypatch):
+    # The file is there, so ctypes' "or one of its dependencies" is the half
+    # that is true: a Qnn*.dll missing beside it, or no VC++ runtime.
+    with open(os.path.join(gs.LIB_DIR, "Genie.dll"), "wb"):
+        pass
+
+    def load(path):
+        raise FileNotFoundError("Could not find module '%s' (or one of its "
+                                "dependencies)." % path)
+    monkeypatch.setattr(gs.C, "WinDLL", load)
+    monkeypatch.setattr(gs.sysconfig, "get_platform", lambda: "win-arm64")
+    with pytest.raises(SystemExit) as e:
+        gs.load_engine()
+    msg = str(e.value)
+    assert "one of ITS dependencies" in msg and "Visual C++" in msg
+    assert "Qnn*.dll" in msg and gs.SDK_DIR in msg
+
+
+def test_a_non_arm64_dll_on_an_arm64_python_blames_the_sdk(gs, fake_sdk, monkeypatch):
+    def load(path):
+        raise OSError(22, "%1 is not a valid Win32 application", None, 193)
+    monkeypatch.setattr(gs.C, "WinDLL", load)
+    monkeypatch.setattr(gs.sysconfig, "get_platform", lambda: "win-arm64")
+    with pytest.raises(SystemExit) as e:
+        gs.load_engine()
+    msg = str(e.value)
+    assert "not an ARM64 image" in msg and "GENIE_SDK_DIR" in msg
+    assert "GENIE_PYTHON" not in msg, "the interpreter is not the problem here"
+
+
 def test_a_config_genie_refuses_exits_with_the_status_it_gave(gs, fake_sdk):
     # The seed patch above it is allowed to fail quietly -- Genie parses the
     # config itself and gives a better error. This is that error, and it is
@@ -713,20 +1075,114 @@ def test_a_config_genie_refuses_exits_with_the_status_it_gave(gs, fake_sdk):
     assert "GenieDialog_create" not in fake_sdk.calls
 
 
-def test_a_bundle_that_will_not_load_names_the_arch_and_qairt_mismatch(
-        gs, fake_sdk):
-    # A bare status code sends people hunting through their config. The
-    # overwhelmingly likely cause is that the bundle was compiled for another
-    # Hexagon or another QAIRT, so the message says so and prints what this
-    # box can actually offer.
+def test_a_bundle_that_will_not_load_names_every_suspect(gs, fake_sdk):
+    # A bare status code sends people hunting through their config, so the
+    # message names the suspects and prints what this box can offer. ALL of
+    # them: it used to name only the bundle built for another Hexagon or
+    # QAIRT, whatever the status, and on a box whose HTP is shared or
+    # degraded that sent the operator to rebuild a bundle that was fine.
     fake_sdk.statuses["GenieDialog_create"] = -1
     with pytest.raises(SystemExit) as e:
         gs.load_engine()
     msg = str(e.value)
-    assert "GenieDialog_create failed, status=-1" in msg
+    assert "GenieDialog_create failed, status=-1 (ERROR_GENERAL)" in msg
     assert "locked to one Hexagon arch AND one QAIRT version" in msg
+    assert "held by another process, or degraded" in msg
+    assert "Get-Process" in msg and "reboot" in msg, "and what to check"
     assert "v73" in msg, "the archs THIS box has, not a general statement"
     assert gs.BUNDLE_DIR in msg and gs.SDK_DIR in msg, (
         "the two paths whoever reads this has to compare")
     assert "GenieDialog_getTokenizer" not in fake_sdk.calls, (
         "and no engine is built over a dialog Genie refused to make")
+    assert msg.index("Hexagon arch AND") < msg.index("held by another"), (
+        "an unnamed failure keeps the arch mismatch first")
+
+
+def test_a_memory_failure_leads_with_memory_not_the_bundle(gs, fake_sdk):
+    # GenieDialog.h lists MEM_ALLOC (-3) among GenieDialog_create's returns.
+    # Printed bare over advice to rebuild the bundle, it read as an arch
+    # mismatch. Which status each cause really produces is unmeasured, so the
+    # name reorders the suspects; it does not drop any.
+    fake_sdk.statuses["GenieDialog_create"] = -3
+    with pytest.raises(SystemExit) as e:
+        gs.load_engine()
+    msg = str(e.value)
+    assert "status=-3 (ERROR_MEM_ALLOC)" in msg
+    assert "out of memory" in msg
+    assert msg.index("out of memory") < msg.index("Hexagon arch AND")
+
+
+def _slow_create(fake_sdk, seconds, status=0):
+    """GenieDialog_create that takes `seconds` -- a load, stood in for."""
+    import time
+
+    def impl(name, *args):
+        fake_sdk.calls.append(name)
+        time.sleep(seconds)
+        return status
+    fake_sdk.__dict__["GenieDialog_create"] = FakeFn("GenieDialog_create", impl)
+
+
+def _watcher_gone(gs):
+    import threading
+    for t in threading.enumerate():
+        if t.name == "genie-load-watch":
+            t.join(timeout=2)
+            if t.is_alive():
+                return False
+    return True
+
+
+def test_a_slow_load_says_so_and_names_what_to_suspect(gs, fake_sdk, capsys):
+    # GenieDialog_create is one blocking native call, nothing supervises it,
+    # and the port refuses connections throughout -- so a load that never
+    # finished looked exactly like one still working: one line, then nothing.
+    gs.LOAD_SLOW_AFTER_S, gs.LOAD_SLOW_EVERY_S = 0.05, 30.0
+    _slow_create(fake_sdk, 0.5)
+    gs.load_engine()
+    out = capsys.readouterr().out
+    assert out.count("still loading after") == 1, out
+    assert "held by another process or degraded" in out
+    assert "Get-Process" in out, "and what to check"
+    assert out.index("still loading") < out.index("model resident on HTP")
+    assert _watcher_gone(gs), "the watcher ends with the load"
+
+
+def test_a_normal_load_prints_no_slow_line(gs, fake_sdk, capsys):
+    gs.load_engine()
+    assert "still loading" not in capsys.readouterr().out
+    assert _watcher_gone(gs)
+
+
+def test_the_watcher_ends_with_a_failed_load_too(gs, fake_sdk, capsys):
+    gs.LOAD_SLOW_AFTER_S = 0.05
+    _slow_create(fake_sdk, 0.2, status=-1)
+    with pytest.raises(SystemExit):
+        gs.load_engine()
+    assert _watcher_gone(gs), "a failed load must not leave it ticking"
+
+
+def test_the_watcher_is_handed_nothing_that_reaches_the_engine(
+        gs, fake_sdk, monkeypatch):
+    # The point of doing this from a thread at all is that it cannot make a
+    # stuck load worse: it gets the Event and the start time, never the lib,
+    # the config handle or the dialog.
+    import threading
+    made = []
+    real = threading.Thread
+
+    def recording(*a, **k):
+        made.append(k)
+        return real(*a, **k)
+    monkeypatch.setattr(gs.threading, "Thread", recording)
+    gs.load_engine()
+    watch = [k for k in made if k.get("name") == "genie-load-watch"]
+    assert len(watch) == 1 and watch[0]["daemon"] is True
+    event, t0 = watch[0]["args"]
+    assert isinstance(event, threading.Event) and isinstance(t0, float)
+    assert event.is_set(), "set once the load returned"
+
+
+def test_a_status_the_header_does_not_name_is_printed_bare(gs):
+    assert gs.status_text(-99) == "-99"
+    assert gs.status_text(-6) == "-6 (ERROR_QUERY_FAILED)"

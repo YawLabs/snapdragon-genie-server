@@ -43,8 +43,17 @@ costs about half a second of interpreter start-up, which is why several
 no-exit cases share one process through a module-scoped fixture while anything
 that ends in `exit` -- which ends the harness too -- gets its own.
 
-Device-free: no NPU, no bundle, no server, and neither launcher is ever
-executed as a script.
+WHOLE-SCRIPT RUNS, the one exception to "run only pieces". What a help flag,
+a stray argument or a missing binary does is decided by PowerShell's own
+parameter binding before a single statement runs, so those are run as the
+operator runs them -- `powershell -File <launcher> <args>`, or `& <launcher>`
+in-shell -- and only ever under an environment that stops the script at its
+first real check should the path under test regress: a GENIE_NPU_ROOT with no
+bundle and a GENIE_PYTHON that does not exist, or a LLAMA_BIN_DIR with no
+llama-server.exe in it. See launcher_env().
+
+Device-free: no NPU, no bundle, no server, and no launcher run that could get
+as far as starting one.
 """
 
 import base64
@@ -96,12 +105,15 @@ def test_the_launcher_reemits_the_same_code_when_it_gives_up():
 # --- literals read from Python -------------------------------------------------
 
 def launcher_code(launcher=LAUNCHER):
-    """The launcher's text without its full-line comments.
+    """The launcher's text without its comments: full-line ones, and the
+    `<# ... #>` comment-based help block at the top.
 
     The comments here are long and say what the code USED to do, by name, so a
-    pin on the raw text would be met (or broken) by prose.
+    pin on the raw text would be met (or broken) by prose. The help block is
+    prose too -- Get-Help's, not the code's.
     """
-    return "\n".join(line for line in launcher.read_text(encoding="utf-8").splitlines()
+    text = re.sub(r"<#.*?#>", "", launcher.read_text(encoding="utf-8"), flags=re.S)
+    return "\n".join(line for line in text.splitlines()
                      if not line.lstrip().startswith("#"))
 
 
@@ -395,6 +407,20 @@ def test_a_device_that_wedges_every_few_minutes_reaches_the_give_up():
     # with the way to find one's own.
     assert "pnputil /restart-device" in out
     assert "Get-PnpDevice -FriendlyName '*Hexagon*'" in out
+    # ...and with its blast radius, BEFORE it: a device restart resets the NPU
+    # under every process on the machine -- on this shared box, another
+    # session's server or benchmark -- and the hint used to hand the command
+    # out with no word of that. The check it offers is one read-only line.
+    warning = out.index("resets the NPU under EVERY")
+    assert warning < out.index("pnputil /restart-device"), out
+    assert "another session's server or benchmark" in out
+    assert "tasklist /m QnnHtp.dll" in out
+    assert out.index("tasklist /m QnnHtp.dll") < out.index("pnputil /restart-device")
+    # "Verified" is scoped to what was verified: the crawl, which never reaches
+    # this branch. It used to read as a verified fix for the wedge in hand.
+    assert "verified only" in out and "not against" in out
+    assert "a wedge or a crash" in out
+    assert "(Verified fix for the" not in out
 
 
 @needs_powershell
@@ -1041,7 +1067,7 @@ def test_llama_launcher_writes_no_env_vars(llama):
 
 # --- run-llama-server.ps1: the port it refuses to bind -----------------------------
 
-def listener_table(cases, port="8080"):
+def listener_table(cases, port="8080", holder=None):
     """Run the launcher's real listener check against a scripted table.
 
     `cases` is [(label, the address we are about to bind, [(listening address,
@@ -1051,10 +1077,26 @@ def listener_table(cases, port="8080"):
     serving cannot decide the result. [CmdletBinding()] is what makes the
     launcher's -ErrorAction bind to a function.
 
+    Get-CimInstance, which the refusal asks who the holder is, is shadowed the
+    same way, ALWAYS: the scripted pid is a real pid on this box as often as
+    not, and a real process must not decide what the refusal says. `holder` is
+    (process name, command line) for the one it answers with, "throw" for a
+    lookup that fails, or None for a pid with no process behind it (it exited).
+
     The refusal ends in `exit 1`, which ends the harness too, so a case that
     conflicts must be the last one in its call.
     """
-    body = ""
+    if holder == "throw":
+        answer = "    throw 'Access denied'\n"
+    elif holder is None:
+        answer = ""
+    else:
+        answer = ("    [pscustomobject]@{ ProcessId = 0; Name = %s; CommandLine = %s }\n"
+                  % (ps_quote(holder[0]), ps_quote(holder[1]) if holder[1] is not None else "$null"))
+    body = ("function Get-CimInstance {\n"
+            "    [CmdletBinding()] param([string]$ClassName, [string]$Filter)\n"
+            "    Write-Host \"STUB: Get-CimInstance $ClassName $Filter\"\n"
+            + answer + "}\n")
     for label, bind, rows in cases:
         table = "".join(
             "    [pscustomobject]@{ LocalAddress = %s; LocalPort = %s; OwningProcess = %d }\n"
@@ -1087,14 +1129,47 @@ def test_llama_refuses_a_port_that_something_is_already_serving(label, bind, add
     # answering, so a clean startup log proves nothing about who the requests
     # reach -- it happened here (GENIE_SERVER.md), and it silently attributes
     # one engine's numbers to another.
-    code, out = listener_table([(label, bind, [(addr, 9876)])])
+    code, out = listener_table([(label, bind, [(addr, 9876)])],
+                               holder=("llama-server.exe", "llama-server.exe -hf some/Repo-GGUF:Q4_0 --port 8080"))
     assert code == 1, out
     assert ("[run] something is already listening on %s:8080 (pid 9876) "
             "-- refusing to double-bind." % addr) in out
-    # Named so it can be acted on, both ways: stop that one, or move this one.
-    assert "Stop-Process 9876" in out
-    assert "LLAMA_PORT" in out
     assert "RESULT bound.%s=yes" % label not in out, "it must not start anyway"
+    # Named, so the operator can tell whose it is -- and the lookup is for
+    # THAT pid.
+    assert "STUB: Get-CimInstance Win32_Process ProcessId = 9876" in out
+    assert ("[run] pid 9876 is llama-server.exe -- llama-server.exe -hf some/Repo-GGUF:Q4_0 "
+            "--port 8080") in out
+    # The way round that harms nobody comes first; a kill is the operator's
+    # own call. It used to print a ready-to-paste `Stop-Process 9876` for a
+    # pid it had never looked at, and on this shared box the likeliest holder
+    # of 8080 is another session's llama-server.
+    assert "Stop-Process" not in out
+    assert "LLAMA_PORT" in out
+    assert "another session's server" in out
+    assert "only once you have confirmed it is yours" in out
+
+
+@needs_powershell
+@pytest.mark.parametrize("holder, said", [
+    # The pid has no process behind it any more (Win32_Process answers nothing).
+    (None, "[run] pid 9876: its name could not be read"),
+    # The lookup itself fails -- the refusal must still be a refusal, with its
+    # own words, not a CIM error in place of them.
+    ("throw", "[run] pid 9876: its name could not be read"),
+    # Another user's or an elevated process: the name reads, the command line
+    # does not. Say what can be said.
+    (("svchost.exe", None), "[run] pid 9876 is svchost.exe\n"),
+    # A long command line is cut, not dumped: this is one line of a refusal.
+    (("llama-server.exe", "llama-server.exe " + "x" * 400),
+     "[run] pid 9876 is llama-server.exe -- llama-server.exe " + "x" * 283 + " ...\n"),
+])
+def test_llama_names_a_holder_it_cannot_fully_identify_without_offering_a_kill(holder, said):
+    code, out = listener_table([("exact", "127.0.0.1", [("127.0.0.1", 9876)])], holder=holder)
+    assert code == 1, out
+    assert said in out.replace("\r\n", "\n"), out
+    assert "Stop-Process" not in out
+    assert "only once you have confirmed it is yours" in out
 
 
 @needs_powershell
@@ -1114,13 +1189,21 @@ def test_llama_binds_past_a_listener_it_cannot_collide_with():
 
 # --- run-llama-server.ps1: startup failure and the placement report ----------------
 
-def startup_failure(has_exited, exit_code):
+def startup_failure(has_exited, exit_code, log="C:\\logs\\x.log", hf=None, setup=""):
+    """Run the launcher's real startup-failure block over a scripted child.
+
+    `log` is the log path the block reads (its .err is where a refused resume
+    shows up); `hf` the -hf spec, if the model came from one; `setup` any
+    PowerShell to run first, such as pointing the HF cache somewhere.
+    """
     body = ("function Drain-Logs { }\nfunction Flush-Carry { }\n"
             "function Stop-Process { param($Id, [switch]$Force, [switch]$Confirm)\n"
             "    Write-Host \"STUB: Stop-Process $Id\" }\n"
-            "$log = 'C:\\logs\\x.log'; $timeout = 1800; $up = $false\n"
+            + setup + piece("function Get-HfPartials")
+            + "$log = %s; $timeout = 1800; $up = $false\n$hf = %s\n"
             "$proc = [pscustomobject]@{ HasExited = $%s; ExitCode = %d; Id = 4242 }\n"
-            % ("true" if has_exited else "false", exit_code)
+            % (ps_quote(log), ps_quote(hf) if hf else "$null",
+               "true" if has_exited else "false", exit_code)
             + piece("if (-not $up)") + "Write-Host 'RESULT fell=through'\n")
     return run_pieces(LLAMA_LAUNCHER, body)
 
@@ -1216,3 +1299,491 @@ def test_llama_placement_reports_what_it_saw_and_names_what_it_could_not(tmp_pat
     gpu_unreadable = section(out, "gpu-unreadable")
     assert "placement: could not read the log -- " in gpu_unreadable
     assert "WARNING: gpu leg requested but no 'using device GPUOpenCL' in the log." in gpu_unreadable
+
+
+# --- run-genie-server.ps1: the bundle dir must BE a bundle ------------------------
+
+def bundle_preflight(bundle_dir, model="qwen3-4b", explicit=False):
+    """Run the launcher's real genie_config.json pre-flight against `bundle_dir`."""
+    body = (piece("$Bundles = @{")
+            + "$Model = %s\n$modelExplicit = $%s\n" % (ps_quote(model), "true" if explicit else "false")
+            + piece("$DefaultBundle =")
+            + "$env:GENIE_BUNDLE_DIR = %s\n" % ps_quote(bundle_dir)
+            + piece("$bundleConfig =") + piece("if (-not (Test-Path -LiteralPath $bundleConfig")
+            + "Write-Host 'RESULT reached=the-end'\n")
+    return run_pieces(LAUNCHER, body)
+
+
+def make_bundle(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "genie_config.json").write_text("{}", encoding="ascii")
+    return path
+
+
+@needs_powershell
+def test_a_real_bundle_dir_passes_the_preflight(tmp_path):
+    code, out = bundle_preflight(make_bundle(tmp_path / "some-bundle"))
+    assert code == 0, out
+    assert results(out) == {"reached": "the-end"}
+    assert "[run]" not in out
+
+
+@needs_powershell
+def test_the_directory_above_the_bundles_is_refused_naming_the_ones_below(tmp_path):
+    # The likeliest wrong value exists as a directory, so the existence check
+    # passed it and the server died in load_engine with a bare FileNotFoundError
+    # traceback -- after Genie.dll had loaded. `qai-hub-models fetch --extract
+    # -o <dir>` puts the bundle in a subdirectory it names itself, so <dir>, or
+    # bundles\, is exactly one level off; the fix is the directories below.
+    above = tmp_path / "bundles"
+    one = make_bundle(above / "qwen3_4b-a")
+    two = make_bundle(above / "qwen3_8b-b")
+    (above / "not-a-bundle").mkdir()
+    code, out = bundle_preflight(above)
+    assert code == 1, out
+    assert "reached" not in results(out)
+    assert "[run] GENIE_BUNDLE_DIR has no genie_config.json: %s" % above in out
+    assert "It must be ONE bundle directory" in out
+    assert "One level down, these hold one:" in out
+    lines = out.splitlines()
+    assert "        %s" % one in lines and "        %s" % two in lines
+    assert "not-a-bundle" not in out
+    assert "Set GENIE_BUNDLE_DIR to the one you mean." in out
+
+
+@needs_powershell
+def test_under_model_the_nested_bundle_fix_is_one_the_next_run_keeps(tmp_path):
+    # -Model rewrites GENIE_BUNDLE_DIR on every run, so "set GENIE_BUNDLE_DIR"
+    # is advice the next run undoes; the fix under -Model is to move the files.
+    bundle_dir = tmp_path / "bundles" / BUNDLE_8B
+    make_bundle(bundle_dir / "qwen3_8b-extracted")
+    code, out = bundle_preflight(bundle_dir, model="qwen3-8b", explicit=True)
+    assert code == 1, out
+    assert "-Model qwen3-8b always serves <root>\\bundles\\%s itself" % BUNDLE_8B in out
+    assert "move" in out and "drop -Model" in out
+    assert "Set GENIE_BUNDLE_DIR to the one you mean." not in out
+
+
+@needs_powershell
+@pytest.mark.parametrize("shape", ["empty", "config-is-a-directory"])
+def test_a_dir_with_no_config_anywhere_near_is_refused(tmp_path, shape):
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    if shape == "config-is-a-directory":
+        (bundle_dir / "genie_config.json").mkdir()     # a name is not a file
+    code, out = bundle_preflight(bundle_dir)
+    assert code == 1, out
+    assert "[run] GENIE_BUNDLE_DIR has no genie_config.json" in out
+    assert "No directory one level down holds one either" in out
+
+
+@needs_powershell
+def test_the_preflight_runs_before_python_is_even_looked_for(tmp_path):
+    # Whole-script, on the default route: the launcher's own
+    # <root>\bundles\<default bundle>, extracted one level too deep. The
+    # interpreter does not exist, so "python not found" is how far a run gets
+    # once the bundle is right -- the control that proves the refusal came
+    # first rather than instead.
+    root = tmp_path / "npu-root"
+    nested = make_bundle(root / "bundles" / BUNDLE_4B / "qwen3_4b-extracted")
+    (root / "qairt" / "2.45.0.1").mkdir(parents=True)
+    env = {"GENIE_NPU_ROOT": str(root), "GENIE_PYTHON": "no-such-python-for-this-test"}
+    code, out, err = run_launcher(LAUNCHER, [], env)
+    assert code == 1, out + err
+    assert "[run] GENIE_BUNDLE_DIR has no genie_config.json: %s" % (root / "bundles" / BUNDLE_4B) in out
+    assert "        %s" % nested in out.splitlines()
+    assert "python not found" not in out
+    code, out, err = run_launcher(LAUNCHER, [], dict(env, GENIE_BUNDLE_DIR=str(nested)))
+    assert code == 1, out + err
+    assert "has no genie_config.json" not in out
+    assert "[run] python not found: 'no-such-python-for-this-test'" in out
+
+
+# --- run-llama-server.ps1: a download llama.cpp can never resume ------------------
+
+HF_SPEC = "unsloth/Qwen3.5-9B-GGUF:Q4_0"
+HF_REPO_DIR = "models--unsloth--Qwen3.5-9B-GGUF"
+# Where llama.cpp looks for its HF cache, in its own order (common/hf-cache.cpp).
+HF_CACHE_VARS = ("LLAMA_CACHE", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE",
+                 "HF_HOME", "XDG_CACHE_HOME", "USERPROFILE")
+BLOB = "17670346b4260ddcb0173965145155885024f3c9a4a24389a3370751edbcde24"
+RESUME_REFUSED = ("common_pull_file: server did not respond with 206 Partial Content "
+                  "for a resume request. Status: 416\n")
+
+
+def hf_cache_env(**values):
+    """PowerShell that sets exactly these HF cache variables and unsets the rest,
+    so the real cache on this box can never decide a result."""
+    return "".join("$env:%s = %s\n" % (name, ps_quote(values[name]) if name in values else "$null")
+                   for name in HF_CACHE_VARS)
+
+
+def partial_download(hub, repo_dir=HF_REPO_DIR, size=4096, suffix=".downloadInProgress"):
+    blobs = hub / repo_dir / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+    blob = blobs / (BLOB + suffix)
+    blob.write_bytes(b"\0" * size)
+    return blob
+
+
+@needs_powershell
+def test_llama_finds_partial_downloads_where_llama_cpp_would_resume_them(tmp_path):
+    # llama.cpp resolves its cache LLAMA_CACHE first, then HF_HUB_CACHE,
+    # HUGGINGFACE_HUB_CACHE, HF_HOME\hub, XDG_CACHE_HOME\huggingface\hub and
+    # USERPROFILE\.cache\huggingface\hub; a partial is blobs\<etag> plus
+    # .downloadInProgress. Looking anywhere else names the wrong file, or none.
+    cases = []
+    lc, hh = tmp_path / "lc", tmp_path / "hh"
+    found_lc = partial_download(lc)
+    partial_download(hh / "hub")      # a decoy: LLAMA_CACHE wins over HF_HOME
+    cases.append(("llama-cache", HF_SPEC, {"LLAMA_CACHE": str(lc), "HF_HOME": str(hh)},
+                  found_lc, lc / HF_REPO_DIR / "blobs"))
+    hc = tmp_path / "hc"
+    cases.append(("hf-hub-cache", HF_SPEC, {"HF_HUB_CACHE": str(hc)}, partial_download(hc),
+                  hc / HF_REPO_DIR / "blobs"))
+    cases.append(("hf-home", HF_SPEC, {"HF_HOME": str(hh)}, hh / "hub" / HF_REPO_DIR / "blobs" /
+                  (BLOB + ".downloadInProgress"), hh / "hub" / HF_REPO_DIR / "blobs"))
+    xdg = tmp_path / "xdg"
+    cases.append(("xdg", HF_SPEC, {"XDG_CACHE_HOME": str(xdg)},
+                  partial_download(xdg / "huggingface" / "hub"),
+                  xdg / "huggingface" / "hub" / HF_REPO_DIR / "blobs"))
+    up = tmp_path / "up"
+    cases.append(("userprofile", HF_SPEC, {"USERPROFILE": str(up)},
+                  partial_download(up / ".cache" / "huggingface" / "hub"),
+                  up / ".cache" / "huggingface" / "hub" / HF_REPO_DIR / "blobs"))
+    done = tmp_path / "done"
+    partial_download(done, suffix="")            # a FINISHED blob is not a partial
+    cases.append(("finished-only", HF_SPEC, {"LLAMA_CACHE": str(done)}, None,
+                  done / HF_REPO_DIR / "blobs"))
+    other = tmp_path / "other"
+    partial_download(other, repo_dir="models--someone--Other-GGUF")
+    cases.append(("other-repo", HF_SPEC, {"LLAMA_CACHE": str(other)}, None,
+                  other / HF_REPO_DIR / "blobs"))
+    cases.append(("no-spec", "", {"LLAMA_CACHE": str(lc)}, None, None))
+    body = piece("function Get-HfPartials")
+    for label, spec, env, _, _ in cases:
+        body += (hf_cache_env(**env)
+                 + "$__p = @(Get-HfPartials %s)\n" % ps_quote(spec)
+                 + "Write-Host ('RESULT %s.found=' + (($__p | ForEach-Object { $_.FullName }) -join '|'))\n" % label
+                 + "Write-Host ('RESULT %s.blobs=' + $hfBlobs)\n" % label)
+    code, out = run_pieces(LLAMA_LAUNCHER, body)
+    assert code == 0, out
+    got = results(out)
+    for label, _, _, found, blobs in cases:
+        assert got[label + ".found"] == (str(found) if found else ""), (label, out)
+        assert got[label + ".blobs"] == (str(blobs) if blobs else ""), (label, out)
+
+
+@needs_powershell
+def test_llama_names_an_unfinished_download_before_the_start(tmp_path):
+    # Before the start, every partial is named with its size: the full size
+    # cannot be known offline (the blob is named for its hash), so the note
+    # says what to look for rather than guessing -- and says it only for an
+    # -hf source, the one llama-server will try to resume.
+    cache = tmp_path / "cache"
+    blob = partial_download(cache, size=5000)
+    note = piece("$hfPartials =") + piece("if ($hfPartials.Count")
+    body = piece("function Get-HfPartials") + hf_cache_env(LLAMA_CACHE=str(cache))
+    for label, hf in (("partial", HF_SPEC), ("gguf", None)):
+        body += ("Write-Host 'BEGIN %s'\n$hf = %s\n" % (label, ps_quote(hf) if hf else "$null")
+                 + note + "Write-Host 'END %s'\n" % label)
+    body += (hf_cache_env(LLAMA_CACHE=str(tmp_path / "empty-cache"))
+             + "Write-Host 'BEGIN clean'\n$hf = %s\n" % ps_quote(HF_SPEC) + note + "Write-Host 'END clean'\n")
+    code, out = run_pieces(LLAMA_LAUNCHER, body)
+    assert code == 0, out
+    seen = section(out, "partial")
+    assert "[run] note: the HF cache holds an unfinished download for unsloth/Qwen3.5-9B-GGUF:" in seen
+    assert "[run]   %s  (5000 bytes, last written 20" % blob in seen
+    assert "Status: 416" in seen
+    assert section(out, "gguf") == "", "a local GGUF is never resumed from the cache"
+    assert section(out, "clean") == ""
+
+
+@needs_powershell
+def test_llama_a_refused_resume_is_named_with_its_file_and_nothing_is_deleted(tmp_path):
+    # HTTP 416 on a resume means the partial is already at or past the full
+    # size -- on this box one was 277 MiB OVER, two downloads having appended
+    # to it at once -- and this llama.cpp build retries it unchanged, so the
+    # leg died the same way on every run while the launcher said only "see its
+    # stderr above". Now the file is named, with what to do; and the launcher
+    # does not do it: the cache is shared, and another session may be
+    # mid-download.
+    cache = tmp_path / "cache"
+    blob = partial_download(cache, size=6000)
+    log = tmp_path / "llama.log"
+    Path(str(log) + ".err").write_text("load_model: loading\n" + RESUME_REFUSED * 3
+                                       + "download failed after 3 attempts\n", encoding="ascii")
+    code, out = startup_failure(True, 1, log=log, hf=HF_SPEC,
+                                setup=hf_cache_env(LLAMA_CACHE=str(cache)))
+    assert code == 1, out
+    assert "llama-server exited 1 during startup" in out
+    assert "[run] cause: llama-server could not RESUME a partial download. HTTP 416" in out
+    assert "at or past the full file's size" in out
+    assert "[run]   %s  (6000 bytes)" % blob in out
+    assert "The launcher deletes nothing." in out
+    assert "move that file aside (or delete it)" in out
+    assert "Do not just drop the" in out
+    # Detection only: the file is exactly as it was.
+    assert blob.exists() and blob.stat().st_size == 6000
+
+
+@needs_powershell
+def test_llama_a_refused_resume_with_no_partial_in_sight_says_where_it_looked(tmp_path):
+    log = tmp_path / "llama.log"
+    Path(str(log) + ".err").write_text(RESUME_REFUSED, encoding="ascii")
+    cache = tmp_path / "cache"
+    code, out = startup_failure(True, 1, log=log, hf=HF_SPEC,
+                                setup=hf_cache_env(LLAMA_CACHE=str(cache)))
+    assert code == 1, out
+    assert "cause: llama-server could not RESUME" in out
+    assert "(no *.downloadInProgress found in %s" % (cache / HF_REPO_DIR / "blobs") in out
+
+
+@needs_powershell
+def test_llama_any_other_startup_death_gets_no_resume_diagnosis(tmp_path):
+    log = tmp_path / "llama.log"
+    Path(str(log) + ".err").write_text("llama_model_load: error loading model\n", encoding="ascii")
+    partial_download(tmp_path / "cache")     # a partial exists, but nothing refused it
+    code, out = startup_failure(True, 3, log=log, hf=HF_SPEC,
+                                setup=hf_cache_env(LLAMA_CACHE=str(tmp_path / "cache")))
+    assert code == 3, out
+    assert "cause:" not in out
+
+
+# What the partial-download code may call: it reads and reports, and nothing it
+# runs can move, delete or rewrite a file -- the pin that holds the "detection
+# only" promise as the code around it changes.
+HF_EFFECTS = r"""
+$__scopes = @($__ast.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-HfPartials') -or
+        ($n -is [System.Management.Automation.Language.IfStatementAst] -and
+         @('$hfPartials.Count -gt 0', '$resumeRefused') -contains $n.Clauses[0].Item1.Extent.Text) }, $true))
+Write-Host ("RESULT scopes=" + $__scopes.Count)
+foreach ($s in $__scopes) {
+    foreach ($c in $s.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+        Write-Host ("CALLS " + $c.GetCommandName())
+    }
+}
+"""
+
+
+@needs_powershell
+def test_llama_the_partial_download_code_can_only_look():
+    code, out = run_pieces(LLAMA_LAUNCHER, HF_EFFECTS)
+    assert code == 0, out
+    assert results(out)["scopes"] == "3", out
+    calls = {line.split(" ", 1)[1] for line in out.splitlines() if line.startswith("CALLS ")}
+    assert "Get-ChildItem" in calls, "the scan is what is being pinned; it must be found"
+    assert calls <= {"Get-ChildItem", "Get-HfPartials", "Write-Host", "ForEach-Object"}, calls
+
+
+# --- whole-script runs: help, stray arguments, a missing binary --------------------
+
+def launcher_env(tmp_path, launcher):
+    """An environment in which `launcher`, run whole, stops at its first check.
+
+    run-genie-server.ps1: a GENIE_NPU_ROOT with nothing in it, bundle and SDK
+    dirs that do not exist, and a GENIE_PYTHON that is no program at all -- so
+    a run that gets past what it is meant to stop at exits 1 at the bundle
+    check, and could not start python even past that. run-llama-server.ps1:
+    the same root and a LLAMA_BIN_DIR with no llama-server.exe in it.
+    """
+    root = tmp_path / "npu-root"
+    root.mkdir(exist_ok=True)
+    env = {"GENIE_NPU_ROOT": str(root)}
+    if launcher == LAUNCHER:
+        env.update(GENIE_BUNDLE_DIR=str(root / "no-bundle"), GENIE_SDK_DIR=str(root / "no-sdk"),
+                   GENIE_PYTHON="no-such-python-for-this-test")
+    else:
+        env.update(LLAMA_BIN_DIR=str(tmp_path / "no-bin"))
+    return env
+
+
+def run_launcher(launcher, args, env, in_shell=False):
+    """Run the WHOLE launcher; returns (exit code, stdout, stderr).
+
+    `powershell -File` is the documented route. `in_shell` runs
+    `& '<launcher>' <args>` inside a PowerShell instead, which binds some
+    spellings differently (see the launchers' headers). GENIE_* / LLAMA_* are
+    stripped from the inherited environment first, as in run_pieces, so `env`
+    -- normally from launcher_env() -- is all the launcher sees of them.
+    """
+    assert "GENIE_NPU_ROOT" in env, "never run a launcher whole against the real root"
+    child_env = {k: v for k, v in os.environ.items()
+                 if not k.upper().startswith(("GENIE_", "LLAMA_"))}
+    child_env.update(env)
+    if in_shell:
+        script = "& %s %s\nexit $LASTEXITCODE\n" % (ps_quote(launcher), " ".join(args))
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        cmd = [POWERSHELL, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
+    else:
+        cmd = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+               "-File", str(launcher), *args]
+    done = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace",
+                          timeout=120, env=child_env)
+    return done.returncode, done.stdout, done.stderr
+
+
+# Every environment variable each launcher reads, from its code: the usage has
+# to mention all of them, so a new knob cannot ship undocumented at -Help.
+def env_vars_read(launcher):
+    code = launcher_code(launcher)
+    return (set(re.findall(r"\$env:((?:GENIE|LLAMA)_\w+)", code))
+            | set(re.findall(r'Get-EnvInt "(GENIE_\w+)"', code)))
+
+
+HELP_SPELLINGS = [["-Help"], ["-h"], ["-help"], ["--help"]]
+
+
+@needs_powershell
+@pytest.mark.parametrize("args", [*HELP_SPELLINGS, ["-Model", "qwen3-8b", "-h"]], ids=" ".join)
+def test_genie_help_prints_usage_and_starts_nothing(tmp_path, args):
+    # Every one of these used to start the server -- on a provisioned box, an
+    # 11-35 s bundle load onto an NPU another session may be benchmarking.
+    # --help counts because `powershell -File` hands it over as -help.
+    code, out, err = run_launcher(LAUNCHER, args, launcher_env(tmp_path, LAUNCHER))
+    assert code == 0, out + err
+    assert out.startswith("usage: powershell -File src\\run-genie-server.ps1 [-Model <name>] [-Help]"), out
+    # Each -Model, with the bundle and id it serves, read out of $Bundles.
+    for name, bundle, model_id in (("qwen3-4b", BUNDLE_4B, "qwen3-4b-npu"),
+                                   ("qwen3-8b", BUNDLE_8B, "qwen3-8b-npu"),
+                                   ("qwen3-8b-8192", BUNDLE_8192, "qwen3-8b-8192-npu")):
+        assert re.search(r"^ +%s +%s -> %s" % (re.escape(name), re.escape(bundle), re.escape(model_id)),
+                         out, re.M), name
+    for var in sorted(env_vars_read(LAUNCHER)):
+        assert var in out, "%s is read by the launcher but missing from -Help" % var
+    assert "docs/GENIE_SERVER.md" in out
+    # Nothing past the usage: no bundle check, no discovery, no interpreter.
+    assert "[run]" not in out
+
+
+@needs_powershell
+@pytest.mark.parametrize("args", HELP_SPELLINGS, ids=" ".join)
+def test_llama_help_prints_usage_and_starts_nothing(tmp_path, args):
+    code, out, err = run_launcher(LLAMA_LAUNCHER, args, launcher_env(tmp_path, LLAMA_LAUNCHER))
+    assert code == 0, out + err
+    assert out.startswith("usage: powershell -File src\\run-llama-server.ps1 [-Leg cpu|gpu] [-Help]"), out
+    for var in sorted(env_vars_read(LLAMA_LAUNCHER)):
+        assert var in out, "%s is read by the launcher but missing from -Help" % var
+    assert "-Leg cpu" in out and "-Leg gpu" in out
+    assert "docs/MODEL_OPTIONS.md" in out
+    assert "[run]" not in out
+
+
+@needs_powershell
+@pytest.mark.parametrize("launcher, synopsis", [
+    (LAUNCHER, "Launch the Genie NPU OpenAI-compatible server"),
+    (LLAMA_LAUNCHER, "Launch a Qwen3.5-9B llama-server leg"),
+], ids=["genie", "llama"])
+def test_question_mark_is_powershells_own_help_and_never_runs_the_script(tmp_path, launcher, synopsis):
+    # -? never reaches a script that has a comment-based help block (or
+    # [CmdletBinding()]): PowerShell answers it. Without either, it fell into
+    # $args and the launcher ran -- a reviewer's in-shell `-?` loaded the real
+    # bundle onto the NPU that way.
+    env = launcher_env(tmp_path, launcher)
+    code, out, err = run_launcher(launcher, ["-?"], env, in_shell=True)
+    flat = "".join(out.split())             # Get-Help wraps at the console width
+    assert "".join(synopsis.split()) in flat, out + err
+    assert "[-Help]" in flat, "the switch shows in the SYNTAX line"
+    assert "[run]" not in out
+    # Under -File, PowerShell prints that help to a console only; with stdout
+    # captured it prints nothing at all (probe-verified on 5.1). What matters
+    # is the same: exit 0 and nothing started.
+    code, out, err = run_launcher(launcher, ["-?"], env)
+    assert code == 0, out + err
+    assert "[run]" not in out
+
+
+@needs_powershell
+@pytest.mark.parametrize("launcher, args, named", [
+    # A typo'd parameter name used to land in $args unremarked: `-Modle
+    # qwen3-8b` served the 4B, and a stray switch started the server.
+    (LAUNCHER, ["-Modle", "qwen3-8b"], "Modle"),
+    (LAUNCHER, ["--hlep"], "hlep"),
+    # /? is not a PowerShell help spelling; it is a positional value, and the
+    # ValidateSet refuses it with the valid names.
+    (LAUNCHER, ["/?"], "qwen3-4b,qwen3-8b,qwen3-8b-8192"),
+    (LLAMA_LAUNCHER, ["-Legg", "gpu"], "Legg"),
+], ids=["genie-typo", "genie-stray", "genie-slash", "llama-typo"])
+def test_a_stray_argument_is_a_binding_error_not_a_default_run(tmp_path, launcher, args, named):
+    code, out, err = run_launcher(launcher, args, launcher_env(tmp_path, launcher))
+    assert code != 0, out + err
+    # PowerShell wraps its error text at the console width, mid-word.
+    assert named in "".join((out + err).split()), out + err
+    assert "[run]" not in out, "the launcher ran on past an argument it did not understand"
+
+
+# Where the -Help branch sits, against everything that reads or changes state:
+# every env write, the try whose finally restores them, every filesystem,
+# network and process call, and the interpreter itself. All of them come AFTER
+# the branch ends, so asking for usage cannot touch anything.
+HELP_FIRST = r"""
+$__help = @($__ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.IfStatementAst] -and
+        $n.Clauses[0].Item1.Extent.Text -eq '$Help' }, $true))
+Write-Host ("RESULT helps=" + $__help.Count)
+Write-Host ("RESULT help-end=" + $__help[0].Extent.EndOffset)
+$__watch = @('New-Item', 'Move-Item', 'Remove-Item', 'Set-Item', 'Start-Process', 'Stop-Process',
+             'Get-ChildItem', 'Get-Command', 'Test-Path', 'Get-NetTCPConnection',
+             'Get-CimInstance', 'Select-String', 'Invoke-WebRequest')
+foreach ($c in $__ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+    $__name = $c.GetCommandName()
+    if ($c.InvocationOperator -eq 'Ampersand' -and $c.CommandElements[0].Extent.Text -eq '$python') {
+        Write-Host ("EFFECT " + $c.Extent.StartOffset + " python")
+    } elseif ($__watch -contains $__name) {
+        Write-Host ("EFFECT " + $c.Extent.StartOffset + " " + $__name)
+    }
+}
+foreach ($w in $__ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+        $n.Left.VariablePath.DriveName -eq 'env' }, $true)) {
+    Write-Host ("EFFECT " + $w.Extent.StartOffset + " env-write")
+}
+foreach ($t in $__ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TryStatementAst] }, $true)) {
+    Write-Host ("EFFECT " + $t.Extent.StartOffset + " try")
+}
+"""
+
+
+@needs_powershell
+@pytest.mark.parametrize("launcher, must_see", [
+    (LAUNCHER, {"env-write", "try", "python", "Get-ChildItem", "Get-Command", "Test-Path"}),
+    (LLAMA_LAUNCHER, {"New-Item", "Move-Item", "Start-Process", "Test-Path", "Get-NetTCPConnection"}),
+], ids=["genie", "llama"])
+def test_the_help_branch_comes_before_anything_that_reads_or_changes_state(launcher, must_see):
+    code, out = run_pieces(launcher, HELP_FIRST)
+    assert code == 0, out
+    got = results(out)
+    assert got["helps"] == "1", out
+    help_end = int(got["help-end"])
+    effects = [line.split(" ", 2)[1:] for line in out.splitlines() if line.startswith("EFFECT ")]
+    kinds = {kind for _, kind in effects}
+    assert must_see <= kinds, "the scan lost track of %s" % (must_see - kinds)
+    early = [(int(at), kind) for at, kind in effects if int(at) < help_end]
+    assert early == [], "runs before -Help can answer: %s" % early
+
+
+@needs_powershell
+def test_llama_a_missing_binary_names_the_fork_how_to_build_it_and_whether_stock_will_do(tmp_path):
+    # It used to say only "Set LLAMA_BIN_DIR to a directory containing the fork
+    # build" -- which fork, from where, built how, and whether a stock
+    # llama.cpp would do were in no tracked file.
+    env = launcher_env(tmp_path, LLAMA_LAUNCHER)
+    code, out, err = run_launcher(LLAMA_LAUNCHER, [], env)
+    assert code == 1, out + err
+    assert "[run] llama-server.exe not found at: %s" % (
+        Path(env["LLAMA_BIN_DIR"]) / "llama-server.exe") in out
+    assert "https://github.com/YawLabs/llama.cpp" in out
+    assert "cmake --preset arm64-windows-llvm-release -DGGML_OPENCL=ON" in out
+    assert "cmake --build build-arm64-windows-llvm-release" in out
+    assert "Stock llama.cpp is UNTESTED here" in out
+    assert "LLAMA_BIN_DIR" in out
+    # The build it describes lands where the launcher looks by default:
+    # <parent of this repo>\llama-qnn-fork\build-<preset>\bin.
+    m = re.search(r'Join-Path \$yaw "llama-qnn-fork\\(build-[\w-]+)\\bin"', launcher_code(LLAMA_LAUNCHER))
+    assert m, "the default LLAMA_BIN_DIR moved; update this test"
+    assert "cmake --build %s" % m.group(1) in out
+    assert "llama-qnn-fork\\" in out
+    # It stopped at the check: no slot dir, no log dir, no child.
+    assert sorted(p.name for p in (tmp_path / "npu-root").iterdir()) == []

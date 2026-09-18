@@ -11,6 +11,12 @@ recording: the newest model here is the one the NPU cannot run.
 | Qwen3.5-9B Q4_0 | CPU (KleidiAI) | `src\run-llama-server.ps1` | 8080 | `unsloth/Qwen3.5-9B-GGUF:Q4_0` |
 | Qwen3.5-9B Q4_K_M | GPU (Adreno OpenCL) | `src\run-llama-server.ps1 -Leg gpu` | 8124 | `qwen3.5-9b-gpu` |
 
+Each launch is run from the repo root as `powershell -File <script> [args]`;
+on a box whose execution policy still blocks scripts, add `-ExecutionPolicy
+Bypass` before `-File` (it applies to that one process only -- see the README's
+[Run the server](../README.md#run-the-server)). Both launchers print their
+usage with `-Help`.
+
 The two llama-server rows are ONE model with two leg-specific quants -- see
 "the quant is per-leg" below. All four speak OpenAI chat completions; the
 Genie rows also speak Anthropic `/v1/messages`.
@@ -82,10 +88,25 @@ have.
 
 ## The Qwen3.5-9B llama-server legs
 
-`src\run-llama-server.ps1` encodes the operator's known-good serving command
-(fork build `llama-qnn-fork\build-arm64-windows-llvm-release` -- it carries
-the agent-mode flags and its llama-server initialises OpenCL; an earlier
-build's server could not reach the Adreno at all). Env overrides: `LLAMA_HF`
+`src\run-llama-server.ps1` encodes the operator's known-good serving command.
+The build it runs is the YawLabs llama.cpp fork,
+[github.com/YawLabs/llama.cpp](https://github.com/YawLabs/llama.cpp) (`master`),
+cloned beside this repo as `llama-qnn-fork\` -- which is where the launcher
+looks by default -- and built there with
+
+```
+cmake --preset arm64-windows-llvm-release -DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON -DGGML_CPU_KLEIDIAI=ON
+cmake --build build-arm64-windows-llvm-release
+```
+
+(OpenCL prerequisites are in that repo's `docs/build.md`; `LLAMA_BIN_DIR`
+points the launcher at any other build's `bin\`). An earlier build's server
+could not reach the Adreno at all. **Stock llama.cpp is untested here.** Every
+flag the launcher passes exists upstream and the fork's QNN backend is not
+used, so a recent upstream build with the same options may serve -- but the
+fork also carries a KleidiAI patch for the Windows (COFF) assembler and makes
+the OpenCL staging allocation recoverable, which upstream does not have. The
+launcher's missing-binary message says all of this too. Env overrides: `LLAMA_HF`
 / `LLAMA_GGUF`, `LLAMA_HOST`, `LLAMA_PORT`, `LLAMA_CTX`, `LLAMA_THREADS`,
 `LLAMA_ALIAS`, `LLAMA_SLOT_DIR`, `LLAMA_BIN_DIR`, `LLAMA_EXTRA_ARGS`,
 `LLAMA_HEALTH_TIMEOUT`, `LLAMA_CACHE_RAM`. Three of them have behaviour worth
@@ -102,6 +123,33 @@ knowing:
   (`-m` and `-hf` cannot both reach the server, and a local file is the more
   deliberate of the two). The quant warnings run against the selected source
   only.
+
+Three more things the launcher does before or around the start:
+
+- **A port someone else holds is refused, and the holder is named.** The
+  refusal prints the holder's pid, process name and command line (cut at 300
+  characters, or a line saying it could not be read -- another user's or an
+  elevated process, or one that just exited), and says to set `LLAMA_PORT`
+  and run beside it. It never prints a `Stop-Process`: on a shared box the
+  holder may be another session's server, so stopping it is left to whoever
+  has confirmed it is theirs.
+- **An unfinished Hugging Face download is named before the start.** For an
+  `-hf` source it looks in the HF cache for that repo's
+  `blobs\*.downloadInProgress` files and lists any it finds (`[run] note:`,
+  with size and last-write time); llama-server will try to resume them. If the
+  server then dies at startup with `Status: 416` on the resume -- the partial
+  file is already at or past the full size, typically two downloads appending
+  to it at once, and this build retries it unchanged forever -- a `[run]
+  cause:` block names the file. Move it aside, or delete it, and rerun -- but
+  only if nothing else is fetching that repo right now; never just drop the
+  `.downloadInProgress` suffix, since an oversize partial is not a valid GGUF.
+  **The launcher deletes and moves nothing.**
+- **`-Help` / `-h` print usage** (and `--help` under `powershell -File`): the
+  legs, the `LLAMA_*` variables and their defaults, and the docs, then exit 0
+  without touching the env, the disk or the network. `-?` / `Get-Help -Full`
+  show the full comment-based help. The script is `[CmdletBinding()]`, so a
+  mistyped argument -- `-Legg gpu` -- is a binding error (exit 1) rather than
+  a silently ignored one that started the default cpu leg.
 
 Like the Genie launcher, it writes nothing into the calling shell: every
 `LLAMA_*` value is computed into a local. Unlike it, it keeps logs:
@@ -272,6 +320,10 @@ documented interrupt-degradation signature, and
 `pnputil /restart-device "ACPI\QCOM0D0A\2&DABA3FF&0"` from an elevated
 PowerShell restored it immediately -- 107 tokens in 10.7s. Suspect the
 device, not the bundle, when a fresh export seems catastrophically slow.
+Restarting the Hexagon device resets the NPU for EVERY process on the
+machine, so check first, from the elevated shell, with `tasklist /m
+QnnHtp.dll` and warn whoever else is using it; and the restart is verified
+only for this interrupt-delivery crawl (see the next section).
 
 ## 2026-09-03: interrupt delivery can degrade, and then `poll: false` is the slow setting
 
@@ -301,7 +353,18 @@ pnputil /restart-device "ACPI\QCOM0D0A\2&DABA3FF&0"
 ```
 
 (the "Snapdragon X Elite - Hexagon NPU" ComputeAccelerator node; enumerate
-with `Get-PnpDevice` if the instance id differs on another box). Measured:
+with `Get-PnpDevice` if the instance id differs on another box).
+
+**It is machine-wide.** Restarting the Hexagon device resets the NPU for
+EVERY process on the machine -- another session's server or benchmark dies
+mid-run with it. Check first with `tasklist /m QnnHtp.dll` from the elevated
+shell (the one that sees every process) and warn whoever owns what it lists.
+The restart is verified only for this interrupt-delivery crawl; it is
+untested against a wedge or a crash; a reboot is the other way back.
+`run-genie-server.ps1`'s give-up message now says the same before it prints
+the `pnputil` line.
+
+Measured:
 the identical request went from >120s before the restart to **4.6s** after,
 at `poll: false`. The `aihost.exe` / `AIXHost.exe` pair kept the same PIDs
 through the restart, so this state lives in the driver itself -- it is a

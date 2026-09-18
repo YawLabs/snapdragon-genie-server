@@ -56,7 +56,9 @@ Method, and its limits:
     because each of them would otherwise produce a table that looks measured.
   * A failed request (429 backpressure, a 400, a dropped connection) skips that
     data point and the sweep carries on. Losing a twenty-minute run to one
-    transient 429 would be worse than a gap in the table.
+    transient 429 would be worse than a gap in the table. A run in which NO
+    point was accepted exits non-zero, so a wrapper cannot take it for a
+    result.
   * CHECK THE BOX FOR CO-TENANTS FIRST. This tool cannot see them and will
     happily report a contended number as a clean one. On a shared machine that
     is not hypothetical: a batch measured here was invalidated by another
@@ -79,6 +81,7 @@ import statistics
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Roughly 4 characters per token for ordinary English prose. Only used to hit a
@@ -419,10 +422,14 @@ def _connected_but_unanswered(err):
     bare reset or disconnect, a reply that is not HTTP at all, and a 200 whose
     body _get could not parse. A bare ConnectionRefusedError is kept out for
     a caller that hands one in unwrapped: nothing took that connection. An
-    allowlist rather than "not a URLError", because a malformed --base raises
+    allowlist rather than "not a URLError", because a malformed URL can raise
     a plain ValueError before any socket is opened, and that is not a listener
     either (JSONDecodeError and UnicodeDecodeError are ValueErrors too, which
-    is why they are named rather than caught by their base).
+    is why they are named rather than caught by their base). main() no longer
+    lets a malformed --base get this far -- base_url_problem refuses it before
+    any request, which matters because one shape of it, a non-numeric port,
+    raises a bare http.client.InvalidURL: an HTTPException, which this
+    function would read as a listener that took the connection.
     """
     if isinstance(err, urllib.error.URLError):
         return _torn_down_connection(err)
@@ -431,6 +438,56 @@ def _connected_but_unanswered(err):
     return isinstance(err, (TimeoutError, ConnectionError,
                             http.client.HTTPException,
                             json.JSONDecodeError, UnicodeDecodeError))
+
+
+def base_url_problem(flag, base):
+    """Why `base` cannot be a server's base URL, as a sentence, or None.
+
+    Checked before any request, by the flag's name and the value given. A
+    base without its scheme -- `127.0.0.1:8123`, `localhost:8123` -- used to
+    reach urllib, fail as "unknown url type", and come out as "nothing
+    listening at 127.0.0.1:8123 -- start one" while a server sat on that
+    port answering: advice to start a second one on a box whose NPU is
+    shared. The suggestion is offered only where prefixing http:// is the
+    fix; `ftp://host` gets the rule without a guess.
+
+    The port is parsed here too. urllib turns a non-numeric one into a BARE
+    http.client.InvalidURL, which _connected_but_unanswered reads as a
+    listener that took the connection -- a false "a listener IS there" for a
+    port nothing was ever sent to. Public because bench_contention checks its
+    --npu and --gpu with it, in the same words.
+    """
+    parts = urllib.parse.urlsplit(base)
+    if parts.scheme not in ("http", "https"):
+        return ("%s must start with http:// or https:// (got %r%s): without "
+                "it every request fails before reaching any server"
+                % (flag, base,
+                   " -- try %s" % ("http://" + base) if "://" not in base else ""))
+    if not parts.hostname:
+        return ("%s names no host (got %r) -- it wants the form "
+                "http://127.0.0.1:8123" % (flag, base))
+    try:
+        port = parts.port
+    except ValueError:
+        port = 0
+    if port == 0:
+        return ("%s has a port that is not a number in 1-65535 (got %r)"
+                % (flag, base))
+    return None
+
+
+# The clause every client tool here adds to a connection nothing took. A
+# genie_server binds its port BEFORE its 11-35 s model load and listens only
+# once the model is resident, so during the load a connect is refused (on
+# Windows after ~2 s of SYN retries) exactly as one to a closed port is: from
+# this side of the socket "nothing running" and "still loading" are the same
+# symptom. The line used to assert the first and say "start one", which on a
+# shared NPU is advice to queue a second bundle behind the first. Public, and
+# one string, so bench_contention says it in the same words.
+STILL_LOADING = ("a genie_server there is still loading its bundle (11-35 s: "
+                 "it holds the port but refuses connections until the model is "
+                 "resident) -- if you just started one, wait for its "
+                 "`endpoint on` line and re-run rather than starting another")
 
 
 def _health_failure(base, err):
@@ -467,7 +524,11 @@ def _health_failure(base, err):
       LOADING lands here and not above: it binds its port before the load
       and listens only once the model is resident, so until then a connect
       is refused (or times out) like one to a closed port. "Still starting"
-      in the case above is some other server's behaviour.
+      in the case above is some other server's behaviour. Because the two
+      cannot be told apart at the TCP level, the line names BOTH -- nothing
+      running, or a genie_server still loading (STILL_LOADING) -- rather
+      than asserting absence and saying "start one": that advice, taken
+      during a load, queues a second bundle on a shared NPU.
 
     The launcher advice names the actual launcher and the port it serves on,
     because `python genie_server.py` directly serves on GENIE_PORT (default
@@ -512,10 +573,11 @@ def _health_failure(base, err):
                 "and this tool cannot tell which from outside: re-run in a "
                 "moment, and if it keeps happening look at that server's own "
                 "console or log" % (base, _describe(err)))
-    return ("nothing listening at %s (%s) -- start one: run-genie-server.ps1 "
-            "serves on 8123, `python src/genie_server.py` directly serves on "
+    return ("nothing listening at %s (%s) -- either no server is running "
+            "there, or %s. Otherwise start one: run-genie-server.ps1 serves "
+            "on 8123, `python src/genie_server.py` directly serves on "
             "GENIE_PORT (default 8080), so pass --base to match"
-            % (base, _describe(err)))
+            % (base, _describe(err), STILL_LOADING))
 
 
 def n_ctx(base):
@@ -975,12 +1037,29 @@ def _verdict(shallow, deep, deep_flag="--repeat-deep"):
 DEFAULT_DEPTHS = (500, 1500, 3000, 7000, 12000)
 
 
+def _parse_depths(spec):
+    """The integers in a --depths spec, or ValueError with a user's sentence.
+
+    Its own function so main() can run it before the first request: the
+    budget resolve_depths applies needs /props, but whether `250,abc` is a
+    list of integers does not, and a typo there used to cost the /health
+    check and a warmup generation before `exit 1`.
+    """
+    try:
+        return [int(d) for d in spec.split(",") if d.strip()]
+    except ValueError as e:
+        raise ValueError(
+            "--depths wants comma-separated integers (%s)" % e) from e
+
+
 def resolve_depths(spec, limit, ctx, tokens):
     """Depths to probe, given the caller's --depths and the token budget.
 
     Lifted out of main() so it can be tested without standing up a server: the
     health check runs first, so a bad --depths was previously unreachable from
-    any test and only discoverable by a user hitting a traceback.
+    any test and only discoverable by a user hitting a traceback. (main() now
+    also runs the integer parse, _parse_depths, before any request; this
+    repeats it harmlessly, and is what bench_servers calls.)
 
     Raises ValueError with a message fit to show a user; returns (depths, note)
     where note is a line to print or None. Depths past the budget are DROPPED
@@ -993,11 +1072,7 @@ def resolve_depths(spec, limit, ctx, tokens):
         asked = list(DEFAULT_DEPTHS)
         what = "default depth(s)"
     else:
-        try:
-            asked = [int(d) for d in spec.split(",") if d.strip()]
-        except ValueError as e:
-            raise ValueError(
-                "--depths wants comma-separated integers (%s)" % e) from e
+        asked = _parse_depths(spec)
         what = "depth(s)"
     depths = [d for d in asked if 0 < d < limit]
     dropped = [d for d in asked if d not in depths]
@@ -1131,8 +1206,61 @@ def _parser():
     return ap
 
 
+def _validate(args):
+    """Why these arguments would spend the server before failing, or None.
+
+    argparse checks types, not ranges, and every one of these used to be
+    found out on the box: `--tokens 5` spent the whole decode phase (8
+    requests and ~17k prompt tokens on the run that reproduced it) to print
+    every decode row REFUSED; `--tokens -1` sent max_tokens=0, which genie_server
+    reads as "not set" and answers with its 512-token default, so the run
+    printed a ~511-step rate as if it were the one asked for; `--repeat 0`
+    quietly ran one repetition; and `--depths 250,abc` was caught only after
+    /health and a warmup generation. Each is refused here, by the flag's
+    name and the value given, before the first request -- the way
+    bench_contention._validate refuses them, in the same words where the
+    two share a flag. Nothing is raised to a working value behind the
+    operator's back.
+    """
+    problem = base_url_problem("--base", args.base)
+    if problem:
+        return problem
+    if args.tokens < 1:
+        return "--tokens must be >= 1 (got %d)" % args.tokens
+    if not args.prefill_only and args.tokens < MIN_DECODE_STEPS:
+        # The floor is this module's own, and the same sentence
+        # bench_contention and bench_servers refuse with. A decode delta asks
+        # for --tokens steps and can come back with fewer, never more, so
+        # below the floor EVERY decode row is refused after its two requests
+        # have been paid for. Not checked under --prefill-only, where --tokens
+        # only sizes the depth budget and the probe asks for the floor itself.
+        return ("--tokens %d is below the decode floor of %d steps "
+                "(GENIE_MIN_DECODE_STEPS, read by bench_endpoint; default "
+                "16): every decode measurement would be REFUSED as too short "
+                "a window to be a rate, so the run would spend the box and "
+                "report no decode figure. Raise --tokens or lower the "
+                "variable" % (args.tokens, MIN_DECODE_STEPS))
+    for flag, v in (("--repeat", args.repeat), ("--repeat-deep", args.repeat_deep)):
+        # Checked in every mode, including the ones that do not consult the
+        # flag: no mode gives 0 or a negative count a meaning, and the decode
+        # loop used to run max(1, n) of them, so `--repeat-deep 0` meant as
+        # "skip the deep sample" silently took one.
+        if v < 1:
+            return ("%s must be >= 1 (got %d): it is how many decode "
+                    "measurements to take at that depth" % (flag, v))
+    if args.depths:
+        try:
+            _parse_depths(args.depths)
+        except ValueError as e:
+            return str(e)
+    return None
+
+
 def main():
     args = _parser().parse_args()
+    problem = _validate(args)
+    if problem:
+        sys.exit(problem)
 
     base = args.base.rstrip("/")
     try:
@@ -1213,7 +1341,9 @@ def main():
 
         def at(depth, reps):
             out = []
-            for _ in range(max(1, reps)):
+            # `reps` as given: _validate refused anything below 1 before the
+            # first request, where this used to raise it to 1 unannounced.
+            for _ in range(reps):
                 r = measure_decode(base, args.model, depth, args.tokens, args.timeout)
                 if r:
                     out.append(r)
@@ -1259,6 +1389,15 @@ def main():
     # this is the only place that state is written down.
     for line in _box_state_trailer(box_state_summary(), accepted):
         print(line, flush=True)
+    if not accepted:
+        # Non-zero, as bench_servers exits for a run that left an arm with no
+        # rows: a run that accepted NOTHING -- every point failed, was skipped
+        # or was refused -- used to exit 0, which a wrapper script reads as a
+        # finished benchmark. A run that accepted SOME points still exits 0;
+        # its gaps are on the lines where they happened.
+        sys.exit("no measurement was accepted -- every point above failed, "
+                 "was skipped or was refused (the reason is on its line), so "
+                 "this run produced no figure")
 
 
 if __name__ == "__main__":

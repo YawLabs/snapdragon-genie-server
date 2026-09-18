@@ -11,7 +11,10 @@ it, so every handler in the suite only ever saw "stop". Hardcoding "stop" in
 any of the six response paths below -- or deleting the line that carries the
 engine's verdict out of a stream -- passed all of it.
 
-Device-free, like everything beside it: the engine is conftest's StubEngine.
+Device-free, like everything beside it: the engine is conftest's StubEngine,
+except in the last section -- a turn the SERVER aborted (shutdown, or the
+watchdog on a stall) -- where the real GenieEngine runs over a small fake of
+the Genie calls, because who aborted a turn is the engine's to know.
 """
 
 import json
@@ -128,3 +131,145 @@ def test_the_request_helper_covers_the_shapes_the_local_copies_did(gs, handler):
                              "stream": True})
     assert code == 200 and body is None
     assert h.wfile.text().rstrip().endswith("data: [DONE]")
+
+
+# --- a turn the SERVER cut short is not a finish ----------------------------
+# Shutdown (Ctrl-C) and the watchdog (a stall) abort a live generation, and
+# Genie then returns WARNING_ABORTED, which _finish reports as "stop" -- right
+# for a client that left, since nobody reads that answer. For a client that is
+# still there it was a 200 carrying text cut wherever the abort landed,
+# labelled stop / end_turn (stop_sequence when it sent stop sequences): a
+# fragment an agent files as a complete answer, beside the 503 the queued turn
+# behind it got. These drive the REAL GenieEngine over a fake of the handful
+# of Genie calls one generation makes, so what is under test is the engine's
+# account of who aborted the turn AND every response path's use of it.
+
+
+class CutShort:
+    """Genie, for one generation that the server aborts part-way.
+
+    GenieDialog_query hands back two chunks, then runs `during` (the abort,
+    from inside the query, as shutdown or the watchdog would land it) and
+    returns WARNING_ABORTED -- or SUCCESS when nothing aborted it.
+    """
+
+    def __init__(self, during):
+        self.during = during
+        self.signals = []
+
+    def GenieDialog_reset(self, dialog):
+        return 0
+
+    def GenieDialog_setStopSequence(self, dialog, payload):
+        return 0
+
+    def GenieDialog_setMaxNumTokens(self, dialog, n):
+        return 0
+
+    def GenieDialog_getSampler(self, dialog, out):
+        return -1               # the apply is inert on QAIRT 2.45 anyway
+
+    def GenieDialog_query(self, dialog, data, code, cb, udata):
+        for chunk in CHUNKS:
+            cb(chunk.encode("utf-8"), 2, None)
+        self.during()
+        return 1 if self.signals else 0
+
+    def GenieDialog_signal(self, dialog, action):
+        self.signals.append(action)
+        return 0
+
+
+def _real_engine(gs, by):
+    eng = gs.GenieEngine(None, "DIALOG")
+    abort = {"shutdown": eng.begin_shutdown,
+             "watchdog": lambda: eng.signal_abort(any_turn=True, stalled=True),
+             None: lambda: None}[by]
+    eng.lib = CutShort(abort)
+    gs.ENGINE = eng
+    return eng
+
+
+BODIES = {
+    "openai": ("/v1/chat/completions",
+               {"messages": [{"role": "user", "content": "hi"}]}),
+    "anthropic": ("/v1/messages",
+                  {"messages": [{"role": "user", "content": "hi"}],
+                   "max_tokens": 64, "stop_sequences": ["END"]}),
+}
+CODES = {"shutdown": 503, "watchdog": 500}
+
+
+@pytest.mark.parametrize("by", ["shutdown", "watchdog"])
+@pytest.mark.parametrize("api", ["openai", "anthropic"])
+def test_a_buffered_answer_the_server_cut_is_an_error_not_a_finish(
+        gs, handler, by, api):
+    # Non-streaming: there is still a status to choose, so the fragment is
+    # not sent at all -- 503 for shutdown (shed, retry elsewhere: nothing was
+    # wrong with the request), 500 for the watchdog (the engine failed it).
+    _real_engine(gs, by)
+    path, body = BODIES[api]
+    code, resp, _h = request(gs, handler, "POST", path, body)
+    assert code == CODES[by], resp
+    if api == "openai":
+        assert "choices" not in resp and resp["error"]["type"] == "server_error"
+        msg = resp["error"]["message"]
+    else:
+        assert "stop_reason" not in resp and resp["type"] == "error"
+        assert resp["error"]["type"] == "api_error"
+        msg = resp["error"]["message"]
+    assert "did not finish" in msg
+    assert ("shutting down" if by == "shutdown" else "stalled") in msg
+
+
+@pytest.mark.parametrize("by", ["shutdown", "watchdog"])
+@pytest.mark.parametrize("tools_active", [False, True])
+def test_a_stream_the_server_cut_ends_on_an_error_frame_not_a_finish(
+        gs, handler, by, tools_active):
+    # The 200 has gone out, so the API's own mid-stream error shape is the
+    # whole signal: an `error` frame, and NO finish_reason anywhere -- saying
+    # how the turn "ended" is the lie. [DONE] still closes it.
+    _real_engine(gs, by)
+    h = handler()
+    h._stream("prompt", 64, "cid", 0, tools_active=tools_active)
+    frames = h.wfile.sse_frames()
+    reasons = [f["choices"][0]["finish_reason"] for f in frames if f.get("choices")]
+    assert [r for r in reasons if r] == [], "no finish on a cut turn: %r" % reasons
+    errors = [f["error"] for f in frames if "error" in f]
+    assert len(errors) == 1 and "did not finish" in errors[0]["message"]
+    assert "error" in frames[-1], "the error is the last word"
+    assert h.wfile.text().rstrip().endswith("data: [DONE]")
+
+
+@pytest.mark.parametrize("by", ["shutdown", "watchdog"])
+@pytest.mark.parametrize("tools_active", [False, True])
+def test_a_message_stream_the_server_cut_ends_on_an_error_event(
+        gs, handler, by, tools_active):
+    # Anthropic's spelling of the same: an `error` event, no message_delta --
+    # so no stop_reason, where this used to say end_turn, or stop_sequence
+    # for a request that had sent stop sequences.
+    _real_engine(gs, by)
+    h = handler()
+    h._anthropic_stream("prompt", 64, "some-model", "msg_1",
+                        tools_active=tools_active, stop=["END"])
+    frames = h.wfile.sse_frames()
+    types = [f.get("type") for f in frames]
+    assert "message_delta" not in types, "a stop_reason on a cut turn"
+    assert types[-2:] == ["error", "message_stop"], types
+    assert "did not finish" in frames[-2]["error"]["message"]
+
+
+@pytest.mark.parametrize("api", ["openai", "anthropic"])
+def test_a_turn_nobody_aborted_still_finishes_normally(gs, handler, api):
+    # The control: the same real engine and fake, nothing aborts, and the
+    # answer is whole and labelled the way it always was.
+    _real_engine(gs, None)
+    path, body = BODIES[api]
+    code, resp, _h = request(gs, handler, "POST", path, body)
+    assert code == 200
+    if api == "openai":
+        assert resp["choices"][0]["finish_reason"] == "stop"
+        assert resp["choices"][0]["message"]["content"] == "".join(CHUNKS)
+    else:
+        assert resp["stop_reason"] == "stop_sequence"
+        assert resp["content"][0]["text"] == "".join(CHUNKS)

@@ -1,7 +1,49 @@
-# Launch a Qwen3.5-9B llama-server leg beside the Genie NPU server.
+<#
+.SYNOPSIS
+Launch a Qwen3.5-9B llama-server leg (llama.cpp) beside the Genie NPU server.
+
+.DESCRIPTION
+Starts llama-server.exe for one leg, waits for /health, reports where the
+model was placed, and streams the server's log until it exits or Ctrl-C.
+
+The cpu leg serves unsloth/Qwen3.5-9B-GGUF:Q4_0 through -hf (fetched into the
+Hugging Face cache, ~5.4 GB on the first run) on port 8080. The gpu leg
+serves <GENIE_NPU_ROOT>\gguf\Qwen3.5-9B-Q4_K_M.gguf on the Adreno (OpenCL) on
+port 8124. LLAMA_* environment variables override every default; they are
+inputs only and this script never writes them.
+
+llama-server.exe comes from the YawLabs llama.cpp fork
+(https://github.com/YawLabs/llama.cpp), which LLAMA_BIN_DIR can point at;
+the launcher says how to build it when it cannot find the binary.
+
+.PARAMETER Leg
+cpu (default) or gpu.
+
+.PARAMETER Help
+Print a short usage -- legs, environment variables, docs -- and exit 0
+without starting anything. -h is the same; so is --help under powershell -File.
+
+.EXAMPLE
+powershell -File src\run-llama-server.ps1
+The CPU leg (default).
+
+.EXAMPLE
+powershell -File src\run-llama-server.ps1 -Leg gpu
+The Adreno leg.
+
+.LINK
+docs/MODEL_OPTIONS.md
+#>
+
+# (The blank line above is load-bearing: Get-Help reads a comment that touches
+# the help block as more of it.)
 #
-#   powershell -File src\run-llama-server.ps1            # CPU leg (default)
-#   powershell -File src\run-llama-server.ps1 -Leg gpu   # Adreno leg
+# Help flags reach this script the way they reach run-genie-server.ps1, whose
+# header has the probe-verified detail: -? is PowerShell's own and shows the
+# block above without running a line; -Help, -h, and --help under
+# `powershell -File`, bind to the switch below and print the usage before
+# anything is read or created; and [CmdletBinding()] turns any other stray
+# argument into a binding error instead of a silent cpu-leg start.
 #
 # Why this leg exists: the Genie/HTP chain cannot serve this model. Qwen3.5-9B
 # has no Genie export upstream (qai-hub-models has no qwen3_5_9b target -- open
@@ -37,12 +79,45 @@
 # calling shell's process, so a launcher that exported its own defaults would
 # leave the cpu leg's port and model in the environment and silently feed them
 # to a later `-Leg gpu` run in the same window. Locals cannot leak.
+[CmdletBinding()]
 param(
     [ValidateSet("cpu", "gpu")]
-    [string]$Leg = "cpu"
+    [string]$Leg = "cpu",
+    [Alias("h")]
+    [switch]$Help
 )
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# -Help: the usage, then out -- before the binary lookup and before anything
+# below creates a directory, rotates a log or starts a process.
+if ($Help) {
+    $yawDir = Split-Path -Parent (Split-Path -Parent $here)
+    Write-Host "usage: powershell -File src\run-llama-server.ps1 [-Leg cpu|gpu] [-Help]"
+    Write-Host ""
+    Write-Host "Starts one Qwen3.5-9B llama-server leg (llama.cpp) beside the Genie NPU server,"
+    Write-Host "waits for /health, reports the model's placement and streams the server's log."
+    Write-Host ""
+    Write-Host "  -Leg cpu   unsloth/Qwen3.5-9B-GGUF:Q4_0 via -hf (HF cache; ~5.4 GB on the first"
+    Write-Host "             run) on port 8080 (default)"
+    Write-Host "  -Leg gpu   <GENIE_NPU_ROOT>\gguf\Qwen3.5-9B-Q4_K_M.gguf on the Adreno, port 8124"
+    Write-Host "  -Help, -h  this text. -? shows the full help (Get-Help -Full has more)."
+    Write-Host ""
+    Write-Host "Environment, all optional and read only -- this script never writes them:"
+    Write-Host "  LLAMA_BIN_DIR         holds llama-server.exe; default:"
+    Write-Host ("                        " + (Join-Path $yawDir "llama-qnn-fork\build-arm64-windows-llvm-release\bin"))
+    Write-Host "  LLAMA_HF, LLAMA_GGUF  the model: an -hf spec, or a local .gguf (it wins if both)"
+    Write-Host "  LLAMA_HOST, LLAMA_PORT            default 127.0.0.1, and the leg's port"
+    Write-Host "  LLAMA_CTX, LLAMA_THREADS          default 64000, 6"
+    Write-Host "  LLAMA_CACHE_RAM                   prompt cache in MiB; default 16384"
+    Write-Host "  LLAMA_HEALTH_TIMEOUT              seconds to wait for /health; default 1800"
+    Write-Host "  LLAMA_ALIAS, LLAMA_SLOT_DIR, LLAMA_EXTRA_ARGS"
+    Write-Host "  GENIE_NPU_ROOT        holds gguf\, cache_slots\ and logs\; default:"
+    Write-Host ("                        " + (Join-Path $yawDir "genie-npu"))
+    Write-Host ""
+    Write-Host "Docs: docs/MODEL_OPTIONS.md, section 'The Qwen3.5-9B llama-server legs'."
+    exit 0
+}
 
 # Large external artifacts resolve like the Genie launcher's: relative to the
 # directory holding this repo. Env vars already set in the shell win.
@@ -50,13 +125,37 @@ $yaw = Split-Path -Parent (Split-Path -Parent $here)
 $root = if ($env:GENIE_NPU_ROOT) { $env:GENIE_NPU_ROOT } else { Join-Path $yaw "genie-npu" }
 # The fork build, not genie-npu\llama-bin: it carries the agent-mode flags
 # this launcher uses (--agent, --cache-idle-slots, --ctx-checkpoints,
-# --reasoning) and its llama-server initialises OpenCL (an earlier build's
-# server could not reach the Adreno at all -- see MULTI_ENGINE.md).
+# --reasoning -- upstream llama.cpp flags, not fork additions) and its
+# llama-server initialises OpenCL (an earlier build's server could not reach
+# the Adreno at all -- see MULTI_ENGINE.md).
 $binDir = if ($env:LLAMA_BIN_DIR) { $env:LLAMA_BIN_DIR } else { Join-Path $yaw "llama-qnn-fork\build-arm64-windows-llvm-release\bin" }
 $server = Join-Path $binDir "llama-server.exe"
+# Not found: say WHICH build, where it comes from and how it is made -- "the
+# fork build" named nothing a stranger could fetch, and the fork's URL was in
+# no tracked file. The build line is this box's own: the release preset plus
+# the three options its CMakeCache shows on (QNN is off -- neither leg uses
+# it). Stock llama.cpp is named honestly as untested. Every flag passed below
+# is in upstream master's common/arg.cpp (checked 2026-09-17; --agent and
+# --cache-idle-slots, the ones the old comment here called fork flags, came
+# from upstream PRs), so a recent upstream build with OpenCL may well serve both
+# legs, but no leg here has been measured on one, and the fork carries two
+# non-QNN fixes on the paths these legs use: KleidiAI assembly patched for the
+# Windows COFF assembler, and OpenCL staging-buffer allocation failures made
+# recoverable instead of aborting.
 if (-not (Test-Path $server)) {
     Write-Host "[run] llama-server.exe not found at: $server"
-    Write-Host "[run] Set LLAMA_BIN_DIR to a directory containing the fork build."
+    Write-Host "[run] Both legs are verified on the YawLabs llama.cpp fork (master branch):"
+    Write-Host "[run]   https://github.com/YawLabs/llama.cpp"
+    Write-Host "[run] Clone it beside this repo as llama-qnn-fork\, which is where this launcher"
+    Write-Host "[run] looks by default, and build it there (OpenCL prerequisites: docs/build.md in"
+    Write-Host "[run] that repo):"
+    Write-Host "[run]   cmake --preset arm64-windows-llvm-release -DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON -DGGML_CPU_KLEIDIAI=ON"
+    Write-Host "[run]   cmake --build build-arm64-windows-llvm-release"
+    Write-Host "[run] Stock llama.cpp is UNTESTED here: every flag this launcher passes exists"
+    Write-Host "[run] upstream and the fork's QNN backend is not used, so a recent upstream build"
+    Write-Host "[run] with the same options may serve, but the fork also patches KleidiAI for the"
+    Write-Host "[run] Windows assembler and makes OpenCL allocation failures recoverable."
+    Write-Host "[run] Or set LLAMA_BIN_DIR to the bin\ directory of the build you have."
     exit 1
 }
 
@@ -173,13 +272,39 @@ if (-not (Test-Path $slotDir)) { New-Item -ItemType Directory -Force $slotDir | 
 # listener bound to one non-loopback interface, or a wildcard bind coexisting
 # with such a listener. A conflict is: we bind wildcard and ANYTHING listens
 # on the port, or something listens on wildcard, or on our exact address.
+#
+# The refusal NAMES the holder and hands out no kill. It used to print a
+# ready-to-paste `Stop-Process <pid>` for a pid it had never looked at -- on a
+# box other sessions share, the likeliest holder of 8080 is another session's
+# llama-server serving as typed's endpoint, every process runs as the same
+# user, and Stop-Process kills those without asking. bench_servers.py already
+# says "stop it yourself" for the same reason. So: the process name and
+# command line from Win32_Process when they can be read (not for another
+# user's or an elevated process, or one that has just exited -- said so
+# rather than left blank), the non-destructive way round first, and a kill
+# only as the operator's own decision once they have confirmed it is theirs.
 $wildcards = @("0.0.0.0", "::")
 $conflict = Get-NetTCPConnection -LocalPort ([int]$port) -State Listen -ErrorAction SilentlyContinue |
     Where-Object { ($bindHost -in $wildcards) -or ($_.LocalAddress -in $wildcards) -or ($_.LocalAddress -eq $bindHost) } |
     Select-Object -First 1
 if ($conflict) {
-    Write-Host "[run] something is already listening on $($conflict.LocalAddress):${port} (pid $($conflict.OwningProcess)) -- refusing to double-bind."
-    Write-Host "[run] Stop it first (Stop-Process $($conflict.OwningProcess)) or set LLAMA_PORT."
+    $holder = $conflict.OwningProcess
+    Write-Host "[run] something is already listening on $($conflict.LocalAddress):${port} (pid $holder) -- refusing to double-bind."
+    $holderSays = $null
+    try {
+        $holderProc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $holder" -ErrorAction Stop |
+                      Select-Object -First 1
+        if ($holderProc -and $holderProc.Name) {
+            $holderSays = $holderProc.Name
+            $cmdLine = "$($holderProc.CommandLine)".Trim()
+            if ($cmdLine.Length -gt 300) { $cmdLine = $cmdLine.Substring(0, 300) + " ..." }
+            if ($cmdLine) { $holderSays += " -- $cmdLine" }
+        }
+    } catch { }
+    if ($holderSays) { Write-Host "[run] pid ${holder} is $holderSays" }
+    else { Write-Host "[run] pid ${holder}: its name could not be read (another user's or an elevated process, or it just exited)." }
+    Write-Host "[run] On a shared box that may be another session's server. Set LLAMA_PORT to run"
+    Write-Host "[run] beside it; stop the holder yourself only once you have confirmed it is yours."
     exit 1
 }
 
@@ -284,6 +409,57 @@ $hfNote = if ($hf -eq $cpuDefaultHf) { " (HF cache; ~5.4 GB on first fetch)" } e
 Write-Host "[run] model: $(if ($gguf) { $gguf } else { $hf + $hfNote })"
 Write-Host "[run] log:   $log(.err)"
 if ($keptPrev) { Write-Host "[run] previous run's logs kept as $prev(.err)" }
+
+# Unfinished Hugging Face downloads of the -hf repo. llama-server fetches an
+# -hf spec into the HF cache as blobs\<etag>.downloadInProgress and RESUMES a
+# partial it finds there with a Range request. A partial already at the full
+# file's size -- or past it: two downloads appending to one partial at once
+# (this build opens it for append and takes no lock) left one 277 MiB oversize
+# on this box -- can never resume. The server answers HTTP 416, this build
+# never compares the sizes first, and the leg died after three identical
+# retries on every run, the launcher adding only "see its stderr above". The
+# full size is not knowable offline (the blob is named for its content hash,
+# not its length), so every partial is named, with its size, before the start,
+# and the server's own 416 settles it after (see the startup failure below).
+# DETECTION ONLY: nothing here deletes or moves a file -- the cache is shared
+# with other sessions and tools, and one of them may be mid-download.
+#
+# The cache is resolved in llama.cpp's own order (common/hf-cache.cpp):
+# LLAMA_CACHE, HF_HUB_CACHE, HUGGINGFACE_HUB_CACHE, HF_HOME\hub,
+# XDG_CACHE_HOME\huggingface\hub, USERPROFILE\.cache\huggingface\hub.
+# [IO.Path]::Combine rather than Join-Path, which throws DriveNotFound on 5.1
+# for a drive letter that does not exist. The blobs dir searched is left in
+# $hfBlobs so a message can name it.
+function Get-HfPartials([string]$spec) {
+    $script:hfBlobs = $null
+    if (-not $spec) { return @() }
+    $cache = $null
+    foreach ($pair in @(@("LLAMA_CACHE", ""), @("HF_HUB_CACHE", ""),
+                        @("HUGGINGFACE_HUB_CACHE", ""), @("HF_HOME", "hub"),
+                        @("XDG_CACHE_HOME", "huggingface\hub"),
+                        @("USERPROFILE", ".cache\huggingface\hub"))) {
+        $base = [Environment]::GetEnvironmentVariable($pair[0], "Process")
+        if ($base) {
+            $cache = if ($pair[1]) { [IO.Path]::Combine($base, $pair[1]) } else { $base }
+            break
+        }
+    }
+    if (-not $cache) { return @() }
+    $repo = ($spec -split ":")[0]
+    $script:hfBlobs = [IO.Path]::Combine($cache, "models--" + ($repo -replace "/", "--"), "blobs")
+    try { return @(Get-ChildItem -LiteralPath $script:hfBlobs -Filter "*.downloadInProgress" -File -ErrorAction Stop) }
+    catch { return @() }
+}
+$hfPartials = @(Get-HfPartials $hf)
+if ($hfPartials.Count -gt 0) {
+    Write-Host "[run] note: the HF cache holds an unfinished download for $(($hf -split ':')[0]):"
+    foreach ($f in $hfPartials) {
+        Write-Host ("[run]   {0}  ({1} bytes, last written {2})" -f $f.FullName, $f.Length, $f.LastWriteTime.ToString("s"))
+    }
+    Write-Host "[run] llama-server will resume it. If that fails with 'did not respond with 206"
+    Write-Host "[run] Partial Content ... Status: 416', the file is already at or past its full"
+    Write-Host "[run] size and can never resume; the launcher says what to do if it does."
+}
 $proc = Start-Process -FilePath $server -ArgumentList $srvArgs `
     -RedirectStandardOutput $log -RedirectStandardError ($log + ".err") `
     -NoNewWindow -PassThru
@@ -371,6 +547,31 @@ if (-not $up) {
         $code = $proc.ExitCode
         if ($null -eq $code) { $code = 1 }
         Write-Host "[run] llama-server exited $code during startup -- see its stderr above; full logs: $log(.err)"
+        # A refused RESUME is the one startup death whose cause and cure can be
+        # named from here (see Get-HfPartials above): the 416 lines scroll past
+        # as warnings, llama.cpp's last word is a misleading "status code: -1",
+        # and it logs the partial's path only at debug verbosity. Read, not
+        # acted on -- the file is named and the operator moves it.
+        $resumeRefused = $false
+        try {
+            $resumeRefused = [bool](Select-String -LiteralPath ($log + ".err") -SimpleMatch -Quiet `
+                -Pattern "Partial Content for a resume request. Status: 416")
+        } catch { }
+        if ($resumeRefused) {
+            Write-Host "[run] cause: llama-server could not RESUME a partial download. HTTP 416 means the"
+            Write-Host "[run] partial file is already at or past the full file's size (past it = corrupt,"
+            Write-Host "[run] typically two downloads appending to it at once), and this build retries it"
+            Write-Host "[run] unchanged, so every run fails the same way until that file is gone:"
+            $stale = @(Get-HfPartials $hf)
+            foreach ($f in $stale) { Write-Host ("[run]   {0}  ({1} bytes)" -f $f.FullName, $f.Length) }
+            if ($stale.Count -eq 0) {
+                $where = if ($hfBlobs) { $hfBlobs } else { "the HF cache" }
+                Write-Host "[run]   (no *.downloadInProgress found in $where -- the server may use another cache)"
+            }
+            Write-Host "[run] The launcher deletes nothing. If no other llama-server is fetching this repo"
+            Write-Host "[run] right now, move that file aside (or delete it) and rerun. Do not just drop the"
+            Write-Host "[run] .downloadInProgress suffix: an oversize partial is not a valid GGUF."
+        }
         # The server's own code, as the post-health loop propagates it; both
         # startup failures used to leave as 1, so an outer script could not
         # tell a crash-on-load from an expired health timeout. The timeout

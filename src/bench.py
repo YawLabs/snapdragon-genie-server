@@ -33,6 +33,11 @@ Usage
     python bench.py --int8
     python bench.py --sweep
     python bench.py --all --no-verify      # do not hard-fail on CPU fallback
+
+Needs numpy, onnx and the onnxruntime-qnn wheel -- `pip install -r
+requirements.txt` in a clean venv (README, Install). --help works without
+them; any other run that is missing one names every package absent from the
+Python it ran under, and exits 1.
 """
 
 from __future__ import annotations
@@ -44,13 +49,51 @@ import sys
 import tempfile
 import time
 
-import numpy as np
-import onnx
-from onnx import TensorProto, helper, numpy_helper
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Stdlib only, so it needs no guard and sits with the unguarded imports.
 import bench_endpoint  # box_state: the one power/clock sampler all the bench tools share
-import qnn_ep
+
+# The third-party imports are guarded, each one, and reported by main() AFTER
+# argparse. Unguarded, a Python without the venv active died here with a bare
+# `ModuleNotFoundError: No module named 'onnx'` -- before argparse, so even
+# --help was a traceback -- while qnn_ep, three lines down, already said what
+# to do for a missing onnxruntime. (package, error) per failed import, so a
+# Python missing all three is told about all three at once.
+MISSING: list[tuple[str, ImportError]] = []
+try:
+    import numpy as np
+except ImportError as e:
+    np = None
+    MISSING.append(("numpy", e))
+try:
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+except ImportError as e:
+    onnx = TensorProto = helper = numpy_helper = None
+    MISSING.append(("onnx", e))
+try:
+    import qnn_ep
+except ImportError as e:
+    # qnn_ep's own ImportError already carries the right sentence (the wheel,
+    # requirements.txt, a clean venv); it is kept whole in the report below.
+    qnn_ep = None
+    MISSING.append(("onnxruntime-qnn", e))
+
+
+def missing_report(missing, python=None):
+    """The one message for a run whose dependencies are not all importable.
+
+    Names the Python it ran under, because the usual cause is not a missing
+    install but a venv that is not active in this shell: the packages are
+    there, in a different interpreter.
+    """
+    lines = ["bench.py needs packages this Python (%s) cannot import:"
+             % (python or sys.executable)]
+    for package, err in missing:
+        lines.append("  %s -- %s" % (package, err))
+    lines.append("Activate the venv they are installed in, or `pip install -r "
+                 "requirements.txt` in a clean venv -- see README, Install.")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -322,6 +365,10 @@ def main(argv=None):
     ap.add_argument("--no-verify", action="store_true",
                     help="do not hard-fail if HTP placement can't be verified")
     args = ap.parse_args(argv)
+    # After parse_args, so --help (and a usage error) never depends on the
+    # wheels; before anything that would reach for them.
+    if MISSING:
+        sys.exit(missing_report(MISSING))
 
     if not (args.fp16 or args.int8 or args.sweep):
         args.all = True

@@ -56,6 +56,11 @@ def _endpoint_stub():
         power_reading=lambda: (None, None, None),
         BOX_SAMPLES=[],
         MIN_DECODE_STEPS=16,
+        # Every URL is acceptable to the stub; the tests of the refusal
+        # patch the REAL check in (_real_bench_endpoint), since the words
+        # are that module's.
+        base_url_problem=lambda flag, base: None,
+        STILL_LOADING="<a genie_server there is still loading>",
     )
 
 
@@ -91,6 +96,7 @@ bc = _load()
 # autouse fixture below replaces the module's own names with stubs.
 _REAL_CPU_PERFORMANCE_PCT = bc.cpu_performance_pct
 _REAL_CPU_BUSY_PCT = bc.cpu_busy_pct
+_REAL_CONNECT_PROBLEM = bc._connect_problem
 
 
 @pytest.fixture(autouse=True)
@@ -120,6 +126,11 @@ def hardware(monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", refuse)
     monkeypatch.setattr(bc, "cpu_performance_pct", lambda: 99.0)
     monkeypatch.setattr(bc, "cpu_busy_pct", lambda: 50.0)
+    # Not hardware, but the same promise: a failed ping is followed by a
+    # real TCP connect, which here would reach whatever this box has on
+    # 8123/8124. "Something took it" by default; the tests of the refused
+    # reading say so themselves.
+    monkeypatch.setattr(bc, "_connect_problem", lambda base, timeout=None: None)
     # Read from the environment at import, so pinned: a developer shell that
     # exports GENIE_LOW_CHARGE_PCT would otherwise move the low-pack tests.
     monkeypatch.setattr(bc, "LOW_CHARGE_PCT", 25.0)
@@ -1750,6 +1761,9 @@ def test_an_unknown_box_may_run_only_under_the_loaded_stamp(monkeypatch,
     assert body["loaded"] is True and body["free_gb"] is None
 
 
+_REFUSED = "ConnectionRefusedError: [WinError 10061] No connection could be made"
+
+
 def test_an_engine_that_is_not_answering_refuses_to_measure(monkeypatch,
                                                             capsys):
     # The likeliest real failure: one server started, the other forgotten. It
@@ -1758,14 +1772,142 @@ def test_an_engine_that_is_not_answering_refuses_to_measure(monkeypatch,
     # rather than as "no experiment".
     swept = []
     monkeypatch.setattr(bc.be, "chat", lambda *a, **k: None)
+    monkeypatch.setattr(bc, "_connect_problem", lambda base, timeout=None: _REFUSED)
     rc = _run_main(monkeypatch, {}, [],
                    sweep=lambda *a: swept.append(1))
     assert rc == 2, "must exit non-zero; a script keys on this"
-    err = capsys.readouterr().err
-    assert "NPU at http://127.0.0.1:8123 is not answering" in err
-    # chat() also returns None for a server that answers with no usage block.
-    assert "reports no usage" in err
+    err = _flat(capsys.readouterr().err)
+    assert ("NPU at http://127.0.0.1:8123 is not answering: nothing "
+            "listening (%s)" % _REFUSED) in err
+    assert "run-genie-server.ps1 serves on 8123" in err
     assert swept == []
+
+
+def test_a_refused_ping_names_a_genie_server_still_loading(monkeypatch, capsys):
+    # genie_server binds before its 11-35 s load and listens only after it,
+    # so during the load the ping is refused exactly as if nothing were
+    # running. "Start it first" alone, taken then, queues a second bundle on
+    # a shared NPU -- the line gives the loading reading first, in
+    # bench_endpoint's words.
+    monkeypatch.setattr(bc.be, "chat", lambda *a, **k: None)
+    monkeypatch.setattr(bc, "_connect_problem", lambda base, timeout=None: _REFUSED)
+    assert _run_main(monkeypatch, {}, []) == 2
+    err = _flat(capsys.readouterr().err)
+    assert "either it is not running, or %s" % bc.be.STILL_LOADING in err
+    assert err.index(bc.be.STILL_LOADING) < err.index("start it first")
+    # Not the other reading: nothing took this connection.
+    assert "took the connection" not in err and "usage block" not in err
+
+
+def test_a_ping_something_took_is_named_as_up_not_as_absent(monkeypatch, capsys):
+    # chat() also returns None for a server that took the request and
+    # answered unusably -- an HTTP error, or no usage block (GenieAPIService
+    # reports all zeros). That one is up: "start it first" there is advice to
+    # start a second server behind it.
+    monkeypatch.setattr(bc.be, "chat", lambda *a, **k: None)
+    assert _run_main(monkeypatch, {}, []) == 2     # the fixture: connect OK
+    err = _flat(capsys.readouterr().err)
+    assert ("NPU at http://127.0.0.1:8123 took the connection but did not "
+            "answer the ping with a usable completion") in err
+    assert "do not start another" in err
+    assert "usage block is missing or all zeros" in err
+    assert "start it first" not in err and bc.be.STILL_LOADING not in err
+
+
+def test_the_refused_line_names_the_launcher_of_the_engine_that_refused(
+        monkeypatch, capsys):
+    # The NPU answers and the GPU leg does not: the advice is the llama
+    # launcher and its port, not genie_server's.
+    monkeypatch.setattr(bc.be, "chat",
+                        lambda base, *a, **k: None if base.endswith(":8124")
+                        else {"model": "m"})
+    asked = []
+    monkeypatch.setattr(bc, "_connect_problem",
+                        lambda base, timeout=None: asked.append(base) or _REFUSED)
+    assert _run_main(monkeypatch, {}, []) == 2
+    err = _flat(capsys.readouterr().err)
+    assert "GPU at http://127.0.0.1:8124 is not answering" in err
+    assert "`run-llama-server.ps1 -Leg gpu` serves on 8124, so pass --gpu" in err
+    assert asked == ["http://127.0.0.1:8124"], (
+        "the connect is asked only of the engine whose ping failed")
+
+
+def test_the_connect_is_asked_only_after_a_failed_ping(monkeypatch):
+    # Never as a gate: a bare socket ignores the proxy settings urllib
+    # honours, so a connect in front of the ping could refuse a base the ping
+    # itself reaches.
+    asked = []
+    monkeypatch.setattr(bc.be, "chat", lambda *a, **k: {"model": "m"})
+    monkeypatch.setattr(bc, "_connect_problem",
+                        lambda base, timeout=None: asked.append(base))
+    assert _run_main(monkeypatch, _both_ran(18.0, 13.4, 18.0, 13.5), QUICK) == 0
+    assert asked == []
+
+
+class _Conn:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("base,addr", [
+    ("http://127.0.0.1:8123", ("127.0.0.1", 8123)),
+    ("http://127.0.0.1:8123/", ("127.0.0.1", 8123)),
+    ("http://localhost", ("localhost", 80)),
+    ("https://example.org", ("example.org", 443)),
+    ("http://[::1]:8124", ("::1", 8124)),
+])
+def test_connect_problem_is_none_when_something_takes_the_connection(
+        monkeypatch, base, addr):
+    seen = []
+    conn = _Conn()
+
+    def connect(address, timeout=None):
+        seen.append((address, timeout))
+        return conn
+
+    monkeypatch.setattr(bc.socket, "create_connection", connect)
+    assert _REAL_CONNECT_PROBLEM(base) is None
+    assert seen == [(addr, bc.CONNECT_TIMEOUT_S)]
+    assert conn.closed, "the probe's socket is not left open on the server"
+
+
+@pytest.mark.parametrize("exc", [
+    ConnectionRefusedError(10061, "No connection could be made"),
+    TimeoutError("timed out"),
+    OSError(11001, "getaddrinfo failed"),
+], ids=lambda e: type(e).__name__)
+def test_connect_problem_names_what_stopped_the_connection(monkeypatch, exc):
+    def connect(address, timeout=None):
+        raise exc
+
+    monkeypatch.setattr(bc.socket, "create_connection", connect)
+    said = _REAL_CONNECT_PROBLEM("http://127.0.0.1:8123", timeout=3)
+    assert said == "%s: %s" % (type(exc).__name__, exc)
+
+
+@pytest.mark.parametrize("flag", ["--npu", "--gpu"])
+def test_a_base_without_its_scheme_is_refused_before_the_box_is_touched(
+        monkeypatch, capsys, flag):
+    # urllib fails `127.0.0.1:8123` as "unknown url type" before any socket,
+    # and the ping's refusal then said to start a server that was already
+    # answering there. Refused by the flag's name and value, in
+    # bench_endpoint's words (the real check, not the stub's).
+    touched = []
+    monkeypatch.setattr(bc.be, "base_url_problem",
+                        _real_bench_endpoint().base_url_problem)
+    monkeypatch.setattr(bc, "free_physical_gb",
+                        lambda: touched.append("memory") or 32.0)
+    monkeypatch.setattr(bc.be, "chat", lambda *a, **k: touched.append("ping"))
+    monkeypatch.setattr(sys, "argv", ["bench_contention.py", flag, "127.0.0.1:8123"])
+    with pytest.raises(SystemExit) as e:
+        bc.main()
+    assert e.value.code == 2 and touched == []
+    err = _flat(capsys.readouterr().err)
+    assert ("%s must start with http:// or https:// (got '127.0.0.1:8123' -- "
+            "try http://127.0.0.1:8123)" % flag) in err
 
 
 def test_the_preflight_is_bounded_separately_from_the_measurement(monkeypatch,

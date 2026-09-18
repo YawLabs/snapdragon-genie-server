@@ -1026,6 +1026,29 @@ def test_props_marks_a_single_length_bundle_as_such(gs, handler):
     assert body["genie"]["multi_length"] is False
 
 
+@pytest.mark.parametrize("lengths", [[], None])
+def test_props_does_not_call_an_unreadable_build_single_length(gs, handler, lengths):
+    # No metadata.json, a genie block without context_lengths, or a value
+    # that is not a list all read as [] -- "claims nothing". /props used to
+    # turn that into multi_length: false, which the docs define as a
+    # SINGLE-length bundle running 2-3x slower, so a router down-ranked an
+    # endpoint whose build was only unknown. The banner and the startup
+    # warnings already call this state unknown; /props now says null.
+    gs._CONTEXT_LENGTHS = lengths
+    gs.BUNDLE_DIR = ""                      # None -> re-read -> nothing there
+    _code, body, _h = request(gs, handler, "GET", "/props")
+    assert body["genie"]["context_lengths"] == []
+    assert body["genie"]["multi_length"] is None
+
+
+def test_props_reports_an_absent_poll_key_as_null_not_as_a_value(gs, handler):
+    # null is "no `poll` key was read" -- absent, or the config unreadable --
+    # and not the shipped true: what QnnHtp does with no key is unmeasured.
+    gs._POLL_MATCHES = []
+    _code, body, _h = request(gs, handler, "GET", "/props")
+    assert body["genie"]["poll"] is None
+
+
 def test_props_reports_poll_because_it_decides_concurrency(gs, handler):
     # poll:true turns NPU+GPU from a 1.45x gain into a 0.78x loss, so a client
     # deciding whether to run a second engine needs to see it.

@@ -292,7 +292,19 @@ def main(argv=None):
             # default moved from 8080 to 8123 with the launcher, so a bare
             # `python src/genie_server.py` is now somewhere this tool does not
             # look by default. bench_endpoint's equivalent names both ports.
-            print("Nothing is listening at %s. run-genie-server.ps1 serves on 8123; "
+            # The loading reading comes first, in bench_endpoint.STILL_LOADING's
+            # words (copied, not imported: this tool is stdlib-only and
+            # standalone): a genie_server binds its port before its model load
+            # and refuses connects until the model is resident, so "nothing
+            # listening" is also what a server that is starting looks like --
+            # and "start one" is then advice to queue a second bundle onto a
+            # shared NPU.
+            print("Nothing is listening at %s. Either nothing is running "
+                  "there, or a genie_server there is still loading its bundle "
+                  "(11-35 s: it holds the port but refuses connections until "
+                  "the model is resident) -- if you just started one, wait for "
+                  "its `endpoint on` line and re-run rather than starting "
+                  "another. Otherwise: run-genie-server.ps1 serves on 8123; "
                   "`python src/genie_server.py` directly serves on GENIE_PORT "
                   "(default 8080). Pass that base as the argument, or set "
                   "GENIE_PORT, to match." % base)
