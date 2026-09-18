@@ -65,7 +65,9 @@ only:
 | 0.8B | 28.3 t/s | **56.8** | -- |
 | 9B | 6.7 t/s | **16.0** | 9.6 |
 
-CPU beats the ggml-hex NPU path ~2.4x at both sizes, so GenieX buys no
+CPU beats the ggml-hex NPU path ~2x at 0.8B (56.8 against 28.3) and ~2.4x at
+9B (16.0 against 6.7) -- this line said "~2.4x at both sizes" until
+2026-09-16, which its own table above contradicts -- so GenieX buys no
 throughput today -- the fork llama-server legs above remain the way to serve
 this model. What the probe DID establish: Qwen3.5 executes on the Hexagon
 without crashing (fix confirmed), `hybrid` does not crash on X Elite (the
@@ -86,7 +88,29 @@ the agent-mode flags and its llama-server initialises OpenCL; an earlier
 build's server could not reach the Adreno at all). Env overrides: `LLAMA_HF`
 / `LLAMA_GGUF`, `LLAMA_HOST`, `LLAMA_PORT`, `LLAMA_CTX`, `LLAMA_THREADS`,
 `LLAMA_ALIAS`, `LLAMA_SLOT_DIR`, `LLAMA_BIN_DIR`, `LLAMA_EXTRA_ARGS`,
-`LLAMA_HEALTH_TIMEOUT`.
+`LLAMA_HEALTH_TIMEOUT`, `LLAMA_CACHE_RAM`. Three of them have behaviour worth
+knowing:
+
+- `LLAMA_CACHE_RAM` drives `--cache-ram`, the prompt-cache budget in MiB.
+  Default **16384**, which is sized for THIS box -- a 32 GB pool shared with
+  the Genie server and a 64000-token q8_0 KV. A 16 GB machine wants it lower.
+- `LLAMA_PORT` is validated as 1-65535 before anything starts; junk prints a
+  `[run] WARNING` naming the variable and falls back to the leg default (8080
+  cpu, 8124 gpu) instead of dying on a bare cast error. `LLAMA_HOST` may be an
+  IPv6 literal (`::1`); the probe and the printed URL bracket it.
+- Setting BOTH `LLAMA_HF` and `LLAMA_GGUF` prints a note and uses the GGUF
+  (`-m` and `-hf` cannot both reach the server, and a local file is the more
+  deliberate of the two). The quant warnings run against the selected source
+  only.
+
+Like the Genie launcher, it writes nothing into the calling shell: every
+`LLAMA_*` value is computed into a local. Unlike it, it keeps logs:
+`<root>\logs\llama-server-<model-leaf>-<leg>-<port>.log` and `.log.err` (the
+default cpu leg is `llama-server-Qwen3.5-9B-GGUF-Q4_0-cpu-8080.log`), with the
+previous run's pair renamed to `.prev.log` / `.prev.log.err` before each
+launch -- the relaunch after a crash used to truncate the very log that held
+the crash reason. A server that dies during startup makes the launcher exit
+with the server's own exit code (a health timeout still exits 1).
 
 **The quant is per-leg, and the ranking inverts between legs.**
 
@@ -107,11 +131,21 @@ build's server could not reach the Adreno at all). Env overrides: `LLAMA_HF`
 Do not swap either quant onto the other leg for "quality"; each pays roughly
 2x throughput on the wrong engine.
 
-**Placement is verified, not assumed.** The launcher greps the startup log
+**Placement is verified, not assumed -- on the gpu leg, and only there.** The
+launcher greps the startup log
 for the `using device GPUOpenCL` line (passing `-lv 5` on the gpu leg,
 because at default verbosity this build prints no device line at all) and
 warns loudly when it is absent -- a llama-server has been observed on this
-box silently serving from the CPU while asked for the GPU. Smoke-verified
+box silently serving from the CPU while asked for the GPU. The CPU leg passes
+no `-lv 5`, so it reports `placement: not checked -- the device line needs -lv
+5` rather than the unconditional "CPU-only load (KleidiAI)" it used to print,
+and adds a note when the log mentions the OpenCL backend: this fork's `-ngl`
+default is auto, so the cpu leg does not by itself pin the CPU.
+`LLAMA_EXTRA_ARGS='--device none'` pins it; `LLAMA_EXTRA_ARGS='-lv 5'` shows
+the device line (and the console filter that keeps the gpu leg's debug-severity
+flood off the screen engages on the cpu leg too once `LLAMA_EXTRA_ARGS` sets
+`-lv 4` or higher; the log file keeps everything). A log that cannot be read is
+reported as that, not as a placement. Smoke-verified
 2026-09-03: `offloaded 33/33 layers to GPU`, GPU engine counter 59% during
 decode, server-reported **prefill 36.2 t/s, decode 5.6 t/s** -- taken on a
 warm, loaded box (the CPU 9B resident, ~4-6 GB free RAM), so treat as a
@@ -186,8 +220,18 @@ bandwidth-bound and the 8B moves ~2x the weight bytes per token.
 multi-length build (`qwen3_8b-genie-w4a16-x-elite-ctx8192-multi`, id
 `qwen3-8b-8192-npu`) -- twice the prebuilt's window, `context_lengths
 [512, 1024, 2048, 4096, 8192]` so a short prompt still runs against the
-smallest graph that fits. The 4096 prebuilt stays the default 8B: on this
-engine a bigger compiled window is a per-token tax, not a free upgrade.
+smallest graph that fits. The 4096 prebuilt stays the default 8B -- but not
+for the reason this paragraph gave until 2026-09-16 ("on this engine a bigger
+compiled window is a per-token tax, not a free upgrade"). That tax is a
+property of SINGLE-length exports (`docs/IMPLEMENTATION_PLAN.md`, "The window
+tax", ANSWERED 2026-08-24), both 8B bundles are multi-length, and it is
+exactly the finding on which the 4B default moved to its 8192-multi. The
+prebuilt keeps the 8B default because the two have not been compared on equal
+terms: the 8192-multi's decode below was taken on battery and its prefill has
+never been measured on AC, while the prebuilt is the smoke-verified,
+AC-measured bundle, and it carries a `cl3072` graph the export lacks. Once a
+same-harness AC comparison exists, the 8B default should follow the 4B's
+logic rather than this paragraph's.
 
 Measured decode, boundary-safe depths (prompt + generated tokens inside one
 compiled length):
@@ -267,9 +311,11 @@ also exhibited (that one does need a reboot).
 Both bundles are LEFT at `poll: false` -- the steady-state setting this repo
 measured concurrency arguments for -- because its failure mode here is
 loud (a crawl you cannot miss), while `poll: true` left in place after the
-driver heals fails silently (2.7 idle cores, up to -36% decode, NPU+GPU
-concurrency inverted). If a Genie server crawls at ~0.3 t/s: restart the
-device as above and re-test.
+driver heals fails silently (2.7 idle cores, up to -36% decode, and about a
+quarter of the NPU+GPU concurrency win given away -- 1.70x to 1.26x in the
+controlled A/B, `docs/MULTI_ENGINE.md`; this line said "concurrency inverted"
+until 2026-09-16, the 0.78x reading that same-day A/B retracted). If a Genie
+server crawls at ~0.3 t/s: restart the device as above and re-test.
 
 One more consequence worth writing down: the 4B numbers throughout these
 docs were measured with interrupts healthy. A number taken in the degraded

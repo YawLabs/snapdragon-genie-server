@@ -1,21 +1,41 @@
 # Snapdragon NPU (Hexagon HTP) via ONNX Runtime QNN Execution Provider.
 #
-# IMPORTANT: install into a venv that has NO plain `onnxruntime` package.
-# onnxruntime-qnn ships the same `onnxruntime` module and the two collide.
-# If both ever land, the clean fix is a fresh venv (uninstall + --no-deps
-# reinstall is NOT reliable). See README "Install".
+# IMPORTANT: install into a CLEAN venv -- one that has never held another
+# onnxruntime or onnxruntime-qnn. See README "Install".
+#
+# What this note used to say -- "NO plain `onnxruntime`; onnxruntime-qnn ships
+# the same `onnxruntime` module and the two collide" -- is true of the old
+# onnxruntime-qnn 1.x line (the 1.24.4 wheel carries a whole `onnxruntime/`
+# package) and FALSE of the 2.5.0 pinned below, checked 2026-09-17 by opening
+# the wheels: 2.5.0 ships only `onnxruntime_qnn/` and declares
+# `Requires-Dist: onnxruntime>=1.24.2`. Plain onnxruntime is its dependency,
+# not its rival. The venv to avoid is one with a 1.x onnxruntime-qnn left in
+# it; the clean fix for that is still a fresh venv (uninstall + --no-deps
+# reinstall is NOT reliable -- with 2.5.0 it removes the only `onnxruntime`
+# module there is).
 #
 # Target: Windows on ARM64 (Snapdragon X Elite / X1E80100), Python 3.11-3.14.
 # win_arm64 wheels exist for cp311 / cp312 / cp313 / cp314.
 
-onnxruntime-qnn==2.5.0   # plugin EP for onnxruntime 1.29 (pulls onnxruntime 1.29 as a dep)
+onnxruntime-qnn==2.5.0   # plugin EP; pulls `onnxruntime` in as a dependency
+# WHICH onnxruntime is not pinned by that wheel (`>=1.24.2`). Everything in the
+# README was proven on 1.29.0, which is what this resolved to then; a fresh
+# install on 2026-09-17 resolves 1.30.0 (pip --dry-run), which has NOT been run
+# here. If the attach misbehaves in a new venv, rebuild it with the proven pair
+# pinned in the SAME resolve, before suspecting anything else:
+#   pip install onnxruntime==1.29.0 -r requirements.txt
 onnx>=1.16               # model construction for the benchmark
 numpy>=1.26
 
 # --- NOT installed here (full-LLM path, optional) ---------------------------
 # onnxruntime-genai is the LLM wrapper (tokenizer + KV-cache + generation loop).
-# Its latest release (0.15.2) has NO cp314 win_arm64 wheel (max cp313), so a
-# genai-based decode harness needs a cp311/cp312/cp313 venv. See
-# docs/MODEL_CONVERSION.md. Do NOT add it to this file; it would force a
-# Python downgrade for the GEMM benchmark, which does not need it.
-#   pip install onnxruntime-genai   # in a cp311/312/313 venv only
+# It DOES ship a cp314 win_arm64 wheel: `pip download --platform win_arm64
+# --python-version 314` fetched onnxruntime_genai-0.15.2-cp314-cp314-win_arm64
+# and the 0.16.0 one (checked 2026-09-17). This file used to say 0.15.2 had no
+# cp314 wheel (max cp313) and that adding it would force a Python downgrade;
+# that was wrong. Keep it in a SEPARATE venv anyway, and out of this file: it
+# declares `Requires-Dist: onnxruntime>=1.20.1` -- the same plain onnxruntime
+# that onnxruntime-qnn 2.5.0 depends on -- so sharing a venv is plausible on
+# paper and untested here, the GEMM benchmark does not need it, and the proven
+# venv should stay the proven one. See docs/MODEL_CONVERSION.md.
+#   pip install onnxruntime-genai   # in a separate venv

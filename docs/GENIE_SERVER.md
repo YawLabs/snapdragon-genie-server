@@ -1,14 +1,21 @@
-# Genie NPU Server (OpenAI-compatible)
+# Genie NPU Server (OpenAI- and Anthropic-compatible)
 
-A local OpenAI-compatible HTTP endpoint backed by a Qualcomm Genie context-binary
+A local HTTP endpoint speaking the OpenAI Chat Completions API and the
+Anthropic Messages API, backed by a Qualcomm Genie context-binary
 bundle running on the Snapdragon X Elite NPU (Hexagon v73). The model is loaded
 **once** (resident on the HTP via the Genie C API) so requests don't pay the
-~35-50s reload that `genie-t2t-run.exe` would incur per invocation.
+bundle load that `genie-t2t-run.exe` repeats on every invocation: **11-35s**,
+measured on the 8192 multi-length bundle (10.8-15.0s warm, 34.4s after heavy
+disk traffic -- the table under [Run](#run)). This line said "~35-50s" and the
+server's own header "~8.5s" for the same operation; neither was a measurement
+of this bundle, and the table is the one figure to quote.
 
 ## Requirements
 
 - **Native ARM64 Python** (aarch64). Genie.dll and its Qnn* deps are
-  `aarch64-windows-msvc`; an x64/emulated Python cannot load them.
+  `aarch64-windows-msvc`; an x64/emulated Python cannot load them. The
+  launcher checks this before anything else and exits 1 naming the interpreter
+  it tried; `GENIE_PYTHON` points it at another one.
 - The QAIRT 2.45 runtime (extracted) and a Genie bundle matching this box's
   Hexagon. The server DERIVES the supported set at startup by intersecting
   `lib/hexagon-v*/unsigned` (DSP skel) with
@@ -32,7 +39,9 @@ bundle running on the Snapdragon X Elite NPU (Hexagon v73). The model is loaded
 The Genie bundle and the QAIRT 2.45 runtime are large external artifacts and are
 **not** in this repo. The normal way to run is the launcher, which finds them
 itself -- it looks for a `genie-npu` directory beside this repo holding
-`bundles/` and `qairt/`, and picks the newest QAIRT under it:
+`bundles/` and `qairt/`, and picks the newest QAIRT under it by VERSION NUMBER
+(a directory not named like `2.45.0.260326` is ignored, so a stray `latest` or
+`backup` beside the SDKs is never handed to the server as one):
 
 ```powershell
 cd <your clone of this repo>   # the path below is relative to the repo root
@@ -44,7 +53,9 @@ That serves on `127.0.0.1:8123`, and supervises: see Supervision below.
 If the artifacts live elsewhere, point `GENIE_NPU_ROOT` at the directory
 holding them, or set the two paths directly. The launcher checks both exist
 before the 11-35s model load and exits naming what it tried, rather than failing
-deep inside the server:
+deep inside the server -- and when `qairt\` exists but holds no version
+directory (an SDK zip dropped there and never unpacked is the usual shape) it
+names the directory it searched:
 
 ```powershell
 $env:GENIE_NPU_ROOT = "D:\genie-npu"
@@ -54,10 +65,53 @@ $env:GENIE_SDK_DIR    = "...\qairt\2.45.0.260326"
 ```
 
 Running `python src\genie_server.py` directly works too, but then nothing
-supervises it and the port defaults to 8080 rather than 8123.
+supervises it, the port defaults to 8080 rather than 8123, and
+`GENIE_BUNDLE_DIR` and `GENIE_SDK_DIR` have NO default -- the server exits at
+startup naming both when either is unset. (A relative path in either is made
+absolute first, so one works from wherever you launched.)
 
-Startup prints `model resident on HTP in <N>s` then the endpoint URL, and
-after that every request reuses the resident model.
+The launcher leaves your shell as it found it: every `GENIE_*` variable it
+writes for the server (`GENIE_NPU_ROOT`, `GENIE_BUNDLE_DIR`, `GENIE_MODEL_ID`,
+`GENIE_SDK_DIR`, `GENIE_HOST`, `GENIE_PORT`) is put back, or removed again, when
+it exits. It used to fill the last four if unset and leave them behind, which
+pinned an interactive shell to the first QAIRT it discovered. It also persists
+no log: the server's output is the console's, and only the llama launcher
+rotates log files.
+
+Startup order is cheap-things-first, so a mistake costs a second rather than a
+model load. Before the 11-35s load: the port-collision check (see the note
+below), the bundle-config warnings (`poll`, single-length, sampler penalty),
+and then the **bind itself** -- an address this machine does not have, or a
+`GENIE_PORT` outside 0-65535, exits with `cannot bind HOST:PORT: ...`.
+
+The socket is BOUND before the load and only LISTENS after it, once the model
+is resident. A connect made during the load is therefore refused exactly as
+one to a closed port is -- on Windows after the stack's ~2s of SYN retries, or
+as a timeout for a client that waits less than that -- so "the port answers"
+means "the model is resident", and `/health` is reachable only from then on.
+That is what anything waiting on the port relies on (`bench_servers` takes the
+first successful connect as a server that started): a load that fails -- a bad
+bundle, `GenieDialog_create` refusing, the HTP held by another session -- exits
+BEFORE the port has ever answered, not after. A second instance started during
+the load passes the port-collision check (nothing is accepting yet) and exits
+at its OWN bind, with `cannot bind ...` (WinError 10048, or 10013 when the
+instance binding second is the wildcard one), ahead of its load, plus a line
+naming the collision: `Something already holds that port -- most likely
+another instance of this server still loading its bundle, on ANY GENIE_HOST:
+the bind is exclusive, so 0.0.0.0 and 127.0.0.1 cannot share a port.` That
+guard holds whatever `GENIE_HOST` each instance uses, because
+`Server.server_bind` asks for the port with `SO_EXCLUSIVEADDRUSE`. Leaving
+`SO_REUSEADDR` off was not enough: two sockets with DIFFERENT addresses on one
+port -- `0.0.0.0` and `127.0.0.1` -- bound happily in either order, so an
+instance started on the default host during a wildcard instance's load passed
+the port check AND the bind, and loaded a second bundle onto the HTP beside
+the first. The listen step has an exit of its own, `cannot listen on
+HOST:PORT: ...`; in practice that one is POSIX-only, where `SO_REUSEADDR` lets
+two sockets bind a port while neither is listening.
+
+Startup then prints `model resident on HTP in <N>s`, the endpoint URL and the
+bundle's `n_ctx`, compiled lengths and `poll`, and after that every request
+reuses the resident model.
 
 Re-measured 2026-08-26 on the 8192 multi-length bundle (the launcher default),
 because the figures here were an older bundle's and the startup string still
@@ -89,11 +143,55 @@ regardless.
 
 ## Endpoints
 
+Routing looks at the path alone: a query string and a trailing slash are
+ignored on GET and POST alike, so `/health?probe=1` (a cache-buster, which is
+an ordinary thing for a health checker to send) and `/v1/messages?beta=true`
+route like their bare forms, and an error comes back in the envelope of the
+API the path names.
+
 - `POST /v1/chat/completions` -- OpenAI chat API. Supports `messages`, `stream`
-  (SSE), `max_tokens`, `stop` (also Anthropic `stop_sequences`), and `tools`.
-  ChatML template is taken from the bundle's own
-  `metadata.json` chat_template.
-- `GET /v1/models` -- lists the served model id (`GENIE_MODEL_ID`).
+  (SSE), `max_tokens` / `max_completion_tokens`, `stop` (also Anthropic
+  `stop_sequences`), and `tools`. ChatML template is taken from the bundle's own
+  `metadata.json` chat_template. An UNUSABLE one does not abort startup any more
+  -- corrupt or truncated JSON, `"genie": null` or a non-object `genie`, a
+  chat_template missing a delimiter key, or the Jinja STRING where the delimiter
+  block belongs each used to leave a raw traceback out of `main()` with nothing
+  listening. The server now falls back to standard Qwen ChatML and prints
+  `[genie] WARNING: <path> is unusable as a chat template (...)`, because that
+  substitution is otherwise invisible: generic ChatML renders every bundle's
+  turns plausibly, so a bundle whose real delimiters were dropped would serve
+  slightly-wrong prompts forever with nothing in the log to explain the quality.
+  A MISSING file, or a bundle carrying no chat_template at all, is the
+  documented fallback rather than a degradation and stays quiet.
+  Each message's `content`, here and on `/v1/messages`, may be a string, a LIST
+  of content blocks, or a single content block on its own
+  (`{"type":"text","text":"hi"}` -- clients
+  write it by hand, and a `tool_result`'s own `content` arrives that way); text
+  and `tool_result` blocks contribute text, images and `tool_use` contribute
+  none. A content value that is none of those -- a number, a bool -- is a
+  **400** naming the type it got, where it used to flatten to `""` and be
+  answered 200 over a turn with no words in it.
+  Responses report `GENIE_MODEL_ID` as `model`.
+- `POST /v1/messages` -- the Anthropic Messages API, which is what typed
+  speaks: real Anthropic SSE (`message_start` .. `message_stop`, `ping`),
+  `input_schema` tools converted to the function shape Qwen3 was trained on,
+  `tool_use` / `tool_result` content blocks, `stop_sequences`, the
+  `stop_reason` mapping under [finish_reason](#notes--limitations) below, and
+  **529** `overloaded_error` for backpressure where the OpenAI leg sends 429.
+  One deliberate asymmetry: the response ECHOES the request's `model` string
+  (falling back to `GENIE_MODEL_ID` when the request names none), as the real
+  Messages API does and as a router fanning one request out to several engines
+  needs for matching replies -- so a request for `claude-x` is answered with
+  `"model": "claude-x"` by an NPU Qwen. That is a routing label, not a claim
+  about what ran; `/health`, `/props`, `/v1/models` and the OpenAI leg all
+  report `GENIE_MODEL_ID`.
+- `GET /v1/models` -- lists the served model id (`GENIE_MODEL_ID`), as one
+  superset object satisfying both the OpenAI (`id` / `object`) and Anthropic
+  (`type` / `id` / `display_name`) model shapes.
+- `GET /v1/models/<id>` -- the retrieve-model route some SDKs call to validate
+  a name before the first request. `GENIE_MODEL_ID` returns that same object;
+  any other id is a 404 with `code: "model_not_found"` and a message naming the
+  model that IS served.
 - `GET /props` -- llama.cpp-shaped metadata: `default_generation_settings.n_ctx`
   and `model_alias` / `model_id`, which is what typed reads. Plus a namespaced
   `genie` block carrying what a router cannot otherwise learn over HTTP:
@@ -112,10 +210,21 @@ regardless.
   how many graphs the bundle carries. Two bundles reporting the same `n_ctx`
   differ 2-3x on a short prompt. The block is additive and namespaced, so a
   client that ignores it sees exactly the response it saw before.
-- `GET /health` -- **engine** state, not process liveness. `200` when the
-  server can actually generate; `503` with a `state` of `failing`, `stalled` or
-  `wedged` when it cannot. The body carries `detail` (why), `generating`,
-  `tokens_in_flight`, `generations` and `consecutive_failures`.
+- `GET /health` (alias `GET /healthz`) -- **engine** state, not process
+  liveness. `200` when the server can actually generate; `503` with a `state`
+  of `failing`, `stalled` or `wedged` when it cannot. The body carries `state`
+  (and the same value as `status`), `detail` (why), `model`, `generating`,
+  `tokens_in_flight`, `generations`, `consecutive_failures` and
+  `token_counts`.
+
+  What those fields count, because each was wrong once:
+
+  | field | meaning |
+  |---|---|
+  | `generating` | true from the moment a request takes the engine lock -- covering the dialog reset, stop-sequence, sampler and token-cap calls that precede the query, each of which is a call into the same driver and can wedge like one. It used to turn true only at `GenieDialog_query`, so a hang in any of the others read `ok` for as long as it lasted. |
+  | `generations` | client generations only. The server's own summarisation calls are supervised identically but not counted, on the success path or the failure path. |
+  | `consecutive_failures` | generations that ended in an ERROR status or a throw. A client abort (`ABORTED`) and a full window (`CONTEXT_EXCEEDED`) are endings, not failures, so a user leaning on the stop button cannot flip `/health` to `failing`. The one abort that IS a failure is the WATCHDOG's, sent for a stall: that generation is booked as failed rather than resetting the streak, so a device that stalls on every turn but honours each abort still reaches `failing` (the client of such a turn receives an ordinary `stop`). A throw inside a generation DOES count -- it used to be booked as a success and reset the streak. |
+  | `token_counts` | `exact` when the Genie tokenizer is attached; `estimated` (chars/4) when `GenieDialog_getTokenizer` failed. It says whether every usage figure, window budget and `length` finish this server reports is a count or a guess -- the startup log carries the matching `WARNING: GenieDialog_getTokenizer failed` line. |
 
   The distinction is the entire point: a wedged HTP leaves this process
   perfectly able to accept a connection and answer this endpoint while unable
@@ -129,32 +238,96 @@ curl http://127.0.0.1:8123/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model":"qwen3-4b-npu","messages":[{"role":"user","content":"Hi"}],"max_tokens":128}'
 ```
 
+`python src\genie_smoke.py [BASE]` does that for you, against a server that is
+ALREADY running -- it loads nothing itself (`-h` / `--help` / `/?` prints its
+usage and exits 0; `--help` used to be taken as the BASE and reported as
+`unknown url type: '--help/v1/models'`). It GETs `/v1/models`, then asks for
+one non-streamed and one streamed completion, printing `served: <ids>` and the
+`model:` that answered each (so you can see which engine you smoked, not infer
+it), the content, the finish reason, chunk count and TTFT. BASE defaults to
+`http://127.0.0.1:8123`, with `GENIE_PORT` overriding the port (a value that is
+not a port number is a `note:` line and 8123, where it used to go unparsed into
+the URL and come back as an `http.client.InvalidURL: nonnumeric port`
+traceback) -- it used to
+default to 8080, which with the documented two-engine stack up is the
+llama-server CPU leg: the non-streaming half passed against the wrong engine,
+and the streaming half then died in a TypeError, because llama-server opens
+every stream with a delta of `{"role": "assistant", "content": null}` and the
+null went into the join. (Only a non-empty string is a content delta now, so a
+run against llama-server completes and is judged like any other.) **The exit
+status is the verdict:** 0 only when both completions carried content and
+finished `stop` or `length`; a `FAIL: ...` line and 1 otherwise, including for
+a streamed error frame. The streamed half also judges the FRAMING, not just
+the payloads: an SSE event is dispatched by a blank line, and a reader that
+keeps `data:` lines regardless cannot tell a stream of frames from one frame
+that never ends -- so a server writing one newline where the separator's two
+belong, unreadable to every SDK, used to be smoked clean. Two `data:` lines
+with nothing between them are now counted and reported as `N SSE frame(s) were
+not terminated by a blank line`, independently of the content verdict; a
+`: keep-alive` comment or an `event:` line between frames is not one. A 4xx/5xx prints `HTTP <code> during <stage>: <body>`
+and exits 1 rather than leaving a urllib traceback with the body unread; a
+server that is not there (connection refused, a timeout, a reset mid-stream),
+one that does not speak HTTP at all, a response that stops mid-body, a 200
+whose body is not JSON and a 200 of an unexpected SHAPE print `FAIL:
+<ExceptionName> during <stage>: ...` naming the request and exit 1 the same
+way, where each used to be a traceback. A REFUSED connection adds the two
+ports a server here is normally on, since the default moved.
+
 ## Environment
+
+Every `GENIE_*` variable the server, its launcher and the bench tools read.
+The "default" column is what the CODE does with the variable unset -- where the
+launcher supplies a different value, the row says so.
+
+**A malformed value never stops the server from booting.** Every numeric
+variable here (`GENIE_PORT`, `GENIE_MAX_TOKENS`, `GENIE_MAX_BODY_BYTES`,
+`GENIE_SOCKET_TIMEOUT`, `GENIE_WINDOW_MARGIN`, `GENIE_SUMMARY_MAX_TOKENS`,
+`GENIE_FIRST_TOKEN_TIMEOUT`, `GENIE_STALL_TIMEOUT`, `GENIE_WEDGE_GRACE`,
+`GENIE_FAIL_THRESHOLD`, `GENIE_MAX_INFLIGHT`, `GENIE_SEED`,
+`GENIE_ORPHAN_HOLD_CHARS`) degrades to its default with one line naming the
+variable and the value it rejected -- `[genie] WARNING: GENIE_PORT='808O' is
+not an integer; using 8080 instead.` -- where a typo used to kill the process
+at import with a bare `invalid literal for int()`, before any startup line had
+printed. The launcher's three integers and the two bench-tool knobs behave the
+same way, each with its own prefix (`[run]`, `[bench]`).
+
+**And neither does a value that parses but is out of range.** Where a variable
+has a floor, a value below it degrades the same way rather than being clamped
+in silence -- `[genie] WARNING: GENIE_MAX_TOKENS='-1' must be >= 1; using 512
+instead.` The value it falls back to is the DEFAULT, not the bound: 512 is a
+cap somebody might have wanted, 1 is not. A silent clamp reads as acceptance,
+which is how `-1` (llama.cpp's spelling of "no limit", and this repo runs a
+llama-server leg beside this one) turned every uncapped completion into a
+one-token answer with no line anywhere saying why.
 
 | var | default | meaning |
 |---|---|---|
-| `GENIE_BUNDLE_DIR` | the 8192 multi-length bundle | dir with genie_config.json + part*_of_*.bin + tokenizer.json. **Prefer a MULTI-length bundle** -- check `genie.context_lengths` in its metadata.json; a single-length one is 2-3x slower on short prompts. |
-| `GENIE_SDK_DIR` | scratchpad 2.45 SDK | QAIRT 2.45 root (lib/aarch64-windows-msvc, lib/hexagon-v*) |
+| `GENIE_BUNDLE_DIR` | **none -- required.** The launcher sets it to `<GENIE_NPU_ROOT>\bundles\<the -Model bundle>`: the 8192 multi-length 4B unless `-Model` says otherwise | dir with genie_config.json + part*_of_*.bin + tokenizer.json. **Prefer a MULTI-length bundle** -- check `genie.context_lengths` in its metadata.json; a single-length one is 2-3x slower on short prompts. A relative path is made absolute at startup (the server chdirs into the bundle, which used to turn a relative one into a bare FileNotFoundError after it had passed the existence check). Run directly with it unset and the server exits naming it. |
+| `GENIE_SDK_DIR` | **none -- required.** The launcher sets it to the newest version directory under `<GENIE_NPU_ROOT>\qairt` | QAIRT 2.45 root (lib/aarch64-windows-msvc, lib/hexagon-v*). Made absolute like the bundle dir. |
 | `GENIE_HEXAGON_ARCH` | unset | pin one skel arch (`v81`); default offers all |
 | `GENIE_SUMMARIZE_EVICTED` | 1 | 0 disables summarising evicted turns (plain drop) |
 | (not an env var) | -- | **`poll: false` in the bundle's `genie_config.json`** -- see the poll note below. Worth up to +55% decode and frees 2.7 idle cores. The server now CHECKS this at startup (before the 11-35s load) and warns loudly if the bundle ships `true`; it also warns on a single-length bundle. Both are warnings, never refusals -- a slow server is still a working one. |
 | `GENIE_SUMMARY_MAX_TOKENS` | 192 | cap on the retained note. Clamped at runtime to `n_ctx / 8` (floor 32) so the note cannot crowd out the window on a small-context bundle; the server logs the clamp when it bites. |
-| `GENIE_WINDOW_MARGIN` | 64 | headroom left between prompt and n_ctx |
+| `GENIE_WINDOW_MARGIN` | 64 | headroom left between prompt and n_ctx. Must be >= 0: a negative margin is not more headroom, it is a budget past the window. A negative value is rejected with a WARNING line and the default 64 is used -- it is not clamped to 0. |
 | `GENIE_MAX_INFLIGHT` | 2 | requests admitted at once (1 running + queue). Floored at 1 -- it cannot be disabled, since the NPU is single-flight and an unbounded setting only parks threads on the engine lock. Set 1 to protect KV reuse: two interleaved conversations share one resident KV and reset each other's prefix. |
-| `GENIE_HOST` / `GENIE_PORT` | 127.0.0.1 / **8080** | bind address. Note the launcher overrides the port: `run-genie-server.ps1` sets **8123** because 8080 usually collides with a llama-server. So the endpoint is `127.0.0.1:8123` when started the normal way, and `127.0.0.1:8080` only if you run `genie_server.py` directly. **There is no authentication.** The loopback default is the security model: anyone who can reach the port can use the NPU, read what it generates, and wedge the device for everyone else. Binding `0.0.0.0` is supported and the server warns at startup when you do, but put something in front of it. |
-| `GENIE_MODEL_ID` | qwen3-4b-npu | id reported to clients |
-| `GENIE_NPU_ROOT` | `../genie-npu` beside this repo | where `bundles/` and `qairt/` live. Set this instead of the two paths above; the newest `qairt/*` is picked automatically. |
-| `GENIE_FIRST_TOKEN_TIMEOUT` | 300 | seconds a generation may run before its first token before being called stalled. Generous because prefill at depth legitimately takes tens of seconds. |
+| `GENIE_HOST` / `GENIE_PORT` | 127.0.0.1 / **8080** | bind address. Note the launcher overrides the port: `run-genie-server.ps1` sets **8123** unless `GENIE_PORT` is already set, because 8080 is where `run-llama-server.ps1` puts its CPU leg. It also PARSES and range-checks the value (1-65535) before exporting it, so a typo falls back to the launcher's 8123 with `[run] WARNING: GENIE_PORT='808O' is not a port number (1-65535); using 8123.` rather than reaching the server and degrading to ITS default 8080 -- which is the CPU leg. So the endpoint is `127.0.0.1:8123` when started the normal way, and `127.0.0.1:8080` only if you run `genie_server.py` directly. The tools follow the launcher: `bench_endpoint`, `bench_contention --npu` and `bench_servers --ours-port` default to 8123, and `genie_smoke.py` to 8123 with `GENIE_PORT` overriding the port -- it validates it too, printing `note: GENIE_PORT='abc' is not a port number (1-65535); using 8123.` and using 8123, where it used to die in an `http.client.InvalidURL: nonnumeric port` traceback. `::1` and `::` bind too (the address family is chosen from the host). A bind that cannot succeed -- an address this machine does not have, a `GENIE_PORT` outside 0-65535 (which now only a direct `python src/genie_server.py` run can reach) -- exits with `cannot bind HOST:PORT: ...` BEFORE the model load. **There is no authentication.** The loopback default is the security model: anyone who can reach the port can use the NPU, read what it generates, and wedge the device for everyone else. Binding `0.0.0.0` is supported and the server warns at startup when you do, but put something in front of it. |
+| `GENIE_MODEL_ID` | qwen3-4b-npu | id reported to clients. The launcher sets it from `-Model` (`qwen3-8b-npu`, `qwen3-8b-8192-npu`), or from the bundle directory name when that is one it knows. |
+| `GENIE_NPU_ROOT` | `../genie-npu` beside this repo | launcher only: where `bundles/` and `qairt/` live. Set this instead of the two paths above; the newest `qairt/*` BY VERSION NUMBER is picked automatically, and directories not named like a dotted version are ignored. "A dotted version" means what `[version]` can hold: two to four dot-separated components of at most nine ASCII digits each. So an all-digits stray -- a directory named for a full build stamp (`2.45.0.260326153000`), a timestamped backup -- is ignored like `latest` is, instead of killing the launcher with a cast error out of the sort while a valid SDK sits right beside it. |
+| `GENIE_PYTHON` | `python` (first on PATH) | launcher only: the interpreter to run the server with. It must be native ARM64 -- Genie.dll is aarch64-only -- and the launcher exits 1 naming the interpreter when it is missing or is not. (That used to be a warning followed by a DLL-load failure that named neither.) The question asked is the interpreter's own BUILD -- `python -c "import sysconfig;print('GENIE_ARCH=' + sysconfig.get_platform())"` -- and the answer is the last line matching `^GENIE_ARCH=`, which must contain arm64 (`win-arm64` accepted, `win-amd64` refused). `platform.machine()` was the old question and is wrong on this box: from CPython 3.12 on Windows it reports the HOST cpu, so an emulated x64 python answered `ARM64` and was accepted, differently from launch to launch (measured here: 10 of 10 accepted-then-refused flaps gone, 10 of 10 now refused). Because only a TAGGED line is read, a `.cmd` shim may print before python AND after it (`exit /b %ERRORLEVEL%`, for want of `@echo off`) and is still accepted -- the old wording promised that and the last-non-blank read broke it. The refusal quotes the build tag (`[run] python arch is 'win-amd64' (...)`), and an interpreter that prints no tagged line is refused with either `[run] (It printed no text on stdout; if it failed, its own error is above.)` or `[run] (It printed N line(s) but no GENIE_ARCH= line; its own error, if any, is above.)`; a silent one used to be accepted, and the server launched under an interpreter that had just failed to run one line. The start line reads `[run] starting Genie server (python win-arm64) on ...`, since the build tag is what was checked. |
+| `GENIE_MAX_BODY_BYTES` | 8388608 | largest request body accepted, in bytes (8 MiB), checked against `Content-Length` BEFORE the read and before the single-flight queue. Larger is a 413; orders of magnitude above any legitimate prompt at n_ctx 16384. |
+| `GENIE_SOCKET_TIMEOUT` | 120 | seconds any ONE socket read or write may block before the connection is dropped; `0` or less waits forever (the old behaviour). It is **not** a cap on generation time -- a handler never blocks on the socket while it waits for the engine. What it bounds: an idle keep-alive connection is closed after it; a request body that stops arriving is dropped with no response and one log line; a client that stops READING a stream is treated as gone and its generation aborted. Before it existed each of those parked a handler thread for the life of the process, ahead of the `GENIE_MAX_INFLIGHT` queue. |
+| `GENIE_FIRST_TOKEN_TIMEOUT` | 300 | seconds a generation may run before its first token before being called stalled. Generous because prefill at depth legitimately takes tens of seconds. Also the limit for a host-side native call that is not a generation (the tokenizer encode that sizes a request) -- see Supervision. Seconds, may be fractional, as may the next two. |
 | `GENIE_STALL_TIMEOUT` | 120 | seconds between tokens before being called stalled. This is the real wedge signal -- see Supervision. |
 | `GENIE_WEDGE_GRACE` | 60 | seconds an abort gets to take effect before the stall is escalated to a wedge |
-| `GENIE_FAIL_THRESHOLD` | 3 | consecutive failed generations before `/health` reports `failing` |
-| `GENIE_WEDGE_EXIT` | 1 | `0` keeps the process up on a wedge (it stays 503) instead of exiting for a supervisor |
-| `GENIE_MAX_RESTARTS` | 5 | launcher only: rapid restarts before it gives up |
-| `GENIE_RESTART_COOLDOWN` | 25 | launcher only: seconds between restarts. Not arbitrary -- a force-killed server needs roughly 20s of settling, and restarting sooner was measured costing about half of decode throughput. |
-| `GENIE_MAX_TOKENS` | 512 | default cap when a request omits max_tokens |
-| `GENIE_STRIP_THINK` | 0 | 1 strips a well-formed `<think>...</think>` pair from non-streamed content. Unrelated to the orphan-close strip below, which is always on because it removes a DUPLICATED answer rather than the model's reasoning. |
-| `GENIE_MIN_DECODE_STEPS` | 16 | `bench_endpoint` only: fewest decode steps a rate may rest on. Below it the delta is measuring per-request overhead rather than decode -- a 4-step window once reported **0.60 tok/s against a true 17.6**. Such a sample is refused with a line naming the count, not averaged in. |
-| `GENIE_LOW_CHARGE_PCT` | 25 | `bench_contention` only: pack percentage below which a timing run is flagged as not-a-settled-baseline **even on AC**. Measured on this box: at 13-20% charge, CPU pp512 comes back ~58 against a settled 130, while decode barely moves. Advisory, never fatal -- bandwidth-bound work is largely immune. |
+| `GENIE_FAIL_THRESHOLD` | 3 | consecutive failed generations before `/health` reports `failing`. Floored at 1. A client's abort and a full-window finish are not failures; an abort the watchdog sent for a stall is -- see `/health` above. |
+| `GENIE_WEDGE_EXIT` | 1 | `0` (or `false` / `no`) keeps the process up on a wedge instead of exiting for a supervisor. The watchdog then keeps watching and `/health` keeps answering 503 `wedged`; the WEDGED stanza is printed once, not every five seconds. |
+| `GENIE_MAX_RESTARTS` | 5 | launcher only: engine failures (wedges and native crashes) tolerated within `GENIE_RESTART_WINDOW` before it gives up. `0` is valid (give up on the first). A non-integer or negative value warns and uses the default. |
+| `GENIE_RESTART_WINDOW` | 3600 | launcher only: seconds of history the restart cap counts over. Failures older than this age out, and the launcher says so when they do. Minimum 1; junk warns and uses the default. |
+| `GENIE_RESTART_COOLDOWN` | 25 | launcher only: seconds between restarts. Not arbitrary -- a force-killed server needs roughly 20s of settling, and restarting sooner was measured costing about half of decode throughput. `0` is valid; a non-integer or negative value warns and uses the default (a negative one used to throw from `Start-Sleep` inside the restart path). |
+| `GENIE_MAX_TOKENS` | 512 | default cap when a request sets neither `max_tokens` nor `max_completion_tokens`. Must be >= 1: `0` or `-1` is rejected with a WARNING line and 512 is used (`-1` is llama.cpp's no-limit spelling; here it used to reach the engine as 4294967295, `0` skipped the cap call altogether, and a silent clamp to 1 made every uncapped answer one token long). |
+| `GENIE_STRIP_THINK` | 0 | 1 strips a well-formed `<think>...</think>` pair from every BUFFERED response -- non-streaming, and a tool stream on either API, which is generated in full before it is framed. Only an incremental (non-tool) stream is always faithful to the model, because a frame already sent cannot be retracted. Unrelated to the orphan-close strip below, which is always on because it removes a DUPLICATED answer rather than the model's reasoning. |
+| `GENIE_MIN_DECODE_STEPS` | 16 | `bench_endpoint`, and through it `bench_servers` and `bench_contention`: fewest decode steps a rate may rest on. Below it the delta is measuring per-request overhead rather than decode -- a 4-step window once reported **0.60 tok/s against a true 17.6**. Such a sample is refused with a line naming the count, not averaged in. `bench_contention` goes one further and refuses a `--tokens` below this floor at startup (exit 2), rather than running a sweep in which every leg is REFUSED; `bench_servers` now does the same, with the same wording, exiting 1 (a `sys.exit`, not argparse's `ap.error`). It also floors the probe that corrects prefill, which asks for exactly this many steps (16; it was 8). A non-integer value is reported at startup and the default used; the knob is described in `python src/bench_endpoint.py --help`. |
+| `GENIE_LOW_CHARGE_PCT` | 25 | `bench_contention` only: pack percentage below which a timing run is flagged as not-a-settled-baseline **even on AC**. Measured on this box: at 13-20% charge, CPU pp512 comes back ~58 against a settled 130, while decode barely moves. Advisory, never fatal -- bandwidth-bound work is largely immune. A non-numeric value warns and falls back to 25; described in `python src/bench_contention.py --help`. |
 | `GENIE_SEED` | unset | pins the sampler seed. Unset means a fresh seed per PROCESS, which is what stops every fresh prompt replaying the same answer -- the bundles ship a fixed `42` and Genie re-seeds from it on every dialog reset. Pin it for reproducibility (comparing bundles, bisecting a bad generation); throughput does not depend on it. Per-REQUEST variation is not available -- see the note below. |
 | `GENIE_ORPHAN_HOLD_CHARS` | -1 | how much of a STREAM to withhold while deciding whether the model is about to close a `<think>` block the prefill opened. `-1` holds until that is settled (so a streamed reply arrives as one frame at the end -- correct, not incremental). `0` streams every chunk as it arrives and ships the occasional doubled answer. A positive value is a bounded hold, which was measured LEAKING. Non-streaming and tool paths are unaffected; they buffer anyway and always strip. |
 | `GENIE_THINKING` | **0** | Qwen3's reasoning block is **suppressed by default** -- it costs 10-17x on an agent turn (see the tool-calling note below). `1` re-enables it server-wide. Per request either way: `chat_template_kwargs.enable_thinking`, `reasoning_effort` (`"none"` / `"high"`), or `thinking:{"type":"disabled"|"enabled"}` -- an explicit request always beats the server default. |
@@ -177,21 +350,86 @@ a request may legitimately run.
 Escalation, in order:
 
 1. **Stalled** -- no first token in `GENIE_FIRST_TOKEN_TIMEOUT`, or no further
-   token in `GENIE_STALL_TIMEOUT`. `/health` goes 503; the server signals
-   Genie's abort, which is free and is the mechanism provided for exactly this.
-   On a healthy device this is usually where it ends: forced against a live
-   generation, the abort landed and the engine returned to `ok` on its own.
-2. **Wedged** -- the abort did not take within `GENIE_WEDGE_GRACE`. Nothing
-   in-process can help, so the server exits **75** (`EX_TEMPFAIL`) and asks to
-   be replaced. `GENIE_WEDGE_EXIT=0` keeps it up and reporting 503 instead.
+   token in `GENIE_STALL_TIMEOUT`. `/health` goes 503; for a stall INSIDE
+   `GenieDialog_query` the server signals Genie's abort, which is free and is
+   the mechanism provided for exactly this. On a healthy device this is usually
+   where it ends: forced against a live generation, the abort landed and the
+   engine returned to `ok` on its own. The turn is still booked as a FAILED
+   generation -- a stall that an abort happened to clear is still the engine
+   not serving -- so a device that stalls on every turn and honours every abort
+   reaches `failing` instead of reading healthy between stalls. Its client
+   receives an ordinary `stop` with whatever had been generated.
+
+   The first-token clock starts when the request takes the engine lock, not at
+   `GenieDialog_query`, so a hang in the reset, stop-sequence, sampler or
+   token-cap call that precedes the query is a stall too. And the host-side
+   native calls that are NOT generations -- `GenieTokenizer_encode`, both when
+   it sizes a request and when it re-counts a finished generation against its
+   cap -- run on a clock of their own with the same limit: a hang there reports
+   `stalled` and then `wedged` with a detail of `no return from
+   GenieTokenizer_encode for Ns ...`, where it used to report `ok`.
+
+   So the watchdog tells three stalls apart, and its log lines say which,
+   rather than claiming a signal it never sent. All three open on the same bare
+   `STALL: <detail>`: the stall is announced BEFORE the attempt, because
+   signalling an abort can itself block inside a wedged driver, and a single
+   line composed afterwards would say nothing at all in exactly the case that
+   matters. What was tried is the line after it:
+
+   | where the stall is | what the watchdog does and prints |
+   |---|---|
+   | inside `GenieDialog_query` | sends the native ABORT and says so on a second line, `signalling abort to the generation in flight`, again every interval until it takes or the grace runs out |
+   | a host-side call with no turn (the tokenizer sizing a request) | nothing to signal: `nothing in flight to abort: the stall is in a host-side call, so only the exit below can clear it` |
+   | a turn stuck in a call BEFORE its query (the reset, the stop sequences, the sampler, the token cap) | no native signal either -- ABORT is aimed at a query and this turn is not in one: `no native ABORT was sent: the turn is stalled in a call BEFORE its query, which ABORT cannot reach. It is flagged, so it will not start its query if that call returns; otherwise only the exit below can clear it` |
+
+   The closing clause in the last two rows is the `GENIE_WEDGE_EXIT=1` wording.
+   Under `GENIE_WEDGE_EXIT=0` there is no exit to wait for, so it reads
+   `nothing in this process can clear it -- with GENIE_WEDGE_EXIT=0 the server
+   stays up wedged, answering 503, until you restart it by hand` instead.
+   Whoever sets that variable sets it BECAUSE nothing supervises the process,
+   which is the one operator the old wording sent off to wait for a restart
+   that was never coming.
+
+2. **Wedged** -- the stall outlasted `GENIE_WEDGE_GRACE`, counted from the
+   first time the watchdog acted on it. Nothing in-process can help, so the
+   server exits **75** (`EX_TEMPFAIL`) and asks to be replaced.
+   `GENIE_WEDGE_EXIT=0` keeps it up instead: the watchdog goes on watching and
+   `/health` goes on answering 503. The WEDGED line and the `/health` detail end
+   on what was actually tried: `; an abort was signalled Ns ago and did not
+   take` when a native ABORT went out, and `; first seen Ns ago and still stuck.
+   No ABORT was sent: the stall is outside GenieDialog_query, where none can be
+   delivered` for the other two -- so nobody files "Genie ignores ABORT"
+   against a driver that was never asked.
+
+   The stanza is printed ONCE, not every five seconds, so it is the whole
+   record of the event -- which is why its second line branches on
+   `GENIE_WEDGE_EXIT` rather than describing the other configuration's ending.
+   It always opens `The engine cannot be recovered in this process: the stuck
+   call is inside the Genie driver, holding the engine lock, and Python cannot
+   reclaim a thread blocked in native code.` and then ends either `Exiting 75
+   so a supervisor restarts a clean process. (GENIE_WEDGE_EXIT=0 to stay up
+   and keep reporting 503.)` or, under `GENIE_WEDGE_EXIT=0`, `NOT exiting:
+   GENIE_WEDGE_EXIT=0. This process stays up wedged -- /health answers 503 and
+   generation requests queue behind the stuck call or are shed -- until you
+   restart it by hand. (Unset GENIE_WEDGE_EXIT to exit 75 instead, for a
+   supervisor to restart a clean process.)`
 3. **Restarted** -- `run-genie-server.ps1` restarts on exit 75 **and on a native
    crash**; any other code is a deliberate exit (Ctrl-C, a config error it
    already explained) and repeating it would be pointless. Restarts are capped
    and rate-limited, because looping on a device that wedges every time keeps
    the HTP busy and buries the original failure under identical log stanzas.
-   Only restarts following a short life count toward the cap, so a server that
-   ran for hours and wedged once does not share a budget with one wedging at
-   startup.
+   The cap is a SLIDING WINDOW: more than `GENIE_MAX_RESTARTS` failures within
+   `GENIE_RESTART_WINDOW` seconds (default 3600) gives up, exiting 75 so an
+   outer supervisor sees the same signal; older failures age out, and the
+   launcher prints when they do. Each restart line reads `restart N/M within
+   Ws; next in Cs`. (The rule this replaced counted only restarts that followed
+   a life shorter than 120s. It could never count a wedge -- the detector itself
+   needs at least 180s, stall 120 + grace 60, before the server exits 75 -- so a
+   device wedging on every load restarted forever at "restart 1/5" and the
+   give-up branch was dead for the case it exists for.) The give-up message
+   carries a `pnputil /restart-device` hint; the instance id in it is the dev
+   box's, and the line beside it says how to find yours (`Get-PnpDevice
+   -FriendlyName '*Hexagon*'`).
 
    The crash case is not hypothetical and is why "75 and only 75" was wrong:
    the driver can fault instead of hang, and WER on the dev box records
@@ -215,7 +453,65 @@ Escalation, in order:
 
 Separately, `consecutive_failures` reaching `GENIE_FAIL_THRESHOLD` reports
 `failing` on `/health` **without** restarting: the engine is answering, just
-badly, and restarting on that would turn a bad bundle into a crash loop.
+badly, and restarting on that would turn a bad bundle into a crash loop. What
+counts is a generation that ended in an error status or a throw -- including a
+`GenieDialog_setStopSequence` that Genie rejects, which now fails the request
+(500, or an error frame on a stream) instead of generating under the previous
+caller's stop list. Two more statuses on that same path are read rather than
+discarded, and each fails the request with a named `RuntimeError` in the same
+way. A rejected `GenieDialog_reset` no longer lets the turn prefill on top of a
+KV that may still hold the PREVIOUS conversation -- the commit that followed
+recorded prompt-plus-generated as the resident text, the next turn's byte-prefix
+check passed, and the model answered from a history that never happened, with no
+error and no log line. And a rejected `GenieDialog_setMaxNumTokens` no longer
+generates under whatever cap the previous request left on the dialog:
+`GenieDialog.h` documents `ERROR_GENERAL` for a cap that "could not be applied",
+which is value-dependent and so reachable from an ordinary client `max_tokens`,
+and a turn silently held at the earlier request's 8 tokens came back short
+reporting `finish_reason: "stop"` -- which an agentic client reads as a complete
+answer. A client abort and a full window are not failures, so the
+stop button cannot produce this state. The watchdog's own abort of a stalled
+turn is the exception: that generation counts as failed, so repeated stalls
+that each clear on abort add up to `failing` here rather than resetting the
+streak every time.
+
+**Shutdown (Ctrl-C)** aborts whatever holds the dialog and then CLOSES the
+engine under the engine lock, so the handle is never freed beneath a generation
+still inside `GenieDialog_query` -- which at best left a spurious `0xC0000005`
+in the WER log beside the real driver faults this section relies on. Closing
+is more than the free: under the lock, and ahead of `GenieDialog_free`, a
+closed flag is set and the dialog and tokenizer handles are nulled. Handler and
+worker threads are daemons and outlive `main()` for as long as the interpreter
+takes to leave, and with the free alone each of them was one lock acquisition
+away from a native call on the freed handle. After the close none is made: a
+request that was queued behind the lock fails with `the engine is closed: the
+server is shutting down and the Genie dialog has been freed`, token counts fall
+back to the chars/4 estimate, and an abort sends nothing. If the lock is not
+released within 5s the driver is stuck, nothing is touched -- a free on a stuck
+driver can hang too -- and the server says so: `a generation is still inside
+the driver; leaving the dialog for the OS to reclaim`.
+
+The turn that was ALREADY waiting for the engine lock when shutdown began is
+refused too, and that took a second step. An abort frees the lock, and the
+lock goes to whoever has waited longest -- which under load is a queued
+request, not `close()`. `GENIE_MAX_INFLIGHT` is 2, so one running plus one
+queued is an ordinary loaded moment, and on Ctrl-C that queued turn used to
+win the race: it went on to `GenieDialog_reset` and a fresh
+`GenieDialog_query`, `close()` timed out on it and blamed a driver that was
+working perfectly, and the process left with a generation running inside
+Genie. So `main()`'s finally calls `ENGINE.begin_shutdown()` -- mark closing
+under the abort lock, THEN abort the turn in flight -- before `close()`, and
+the parked turn raises `the engine is shutting down: no new generation will
+start, the Genie dialog is about to be freed` when it gets the lock. The flag
+has to precede the abort, because the gap between the two calls is itself the
+race.
+
+Both shutdown refusals -- the one above and the closed one -- are answered
+**503** (`server_error` / `api_error`) on the non-streaming paths, not 500:
+nothing was attempted and nothing about the request was wrong, which is this
+server's "503 = shed" contract, so a router can send it to another leg instead
+of booking a failure. On a stream whose 200 is already out it arrives as the
+usual error frame or event.
 
 ## Notes / limitations
 
@@ -227,17 +523,93 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   a hard `GenieDialog_query` failure, not a truncation. So the server evicts:
   oldest turns are dropped until the prompt fits, with the system turn and tool
   schemas anchored and tool results never separated from the call that produced
-  them. Eviction is logged (never silent). A single message too big to fit even
-  alone gets a 400 naming the token counts, not a doomed query.
+  them. That holds at the TAIL too, which is where it used to break: a
+  conversation that ends on tool results -- every agent step does -- ends on a
+  UNIT, the assistant turn that made the calls plus every result after it, and
+  eviction may cut in front of that unit and no later. When the unit itself
+  does not fit the request is a **400 naming the token counts**, never a 200
+  over a prompt that opens on a bare `<tool_response>` with its call gone.
+  Eviction is logged (never silent). A single message too big to fit even
+  alone gets the same 400, not a doomed query.
   `GENIE_WINDOW_MARGIN` (default 64) is the headroom left for generation.
+
+  **Every system message reaches the model, and only the LEADING ones are
+  anchored.** A client that sends several -- a trailing per-turn reminder, a
+  framework's injection -- used to have every one after the first dropped
+  without a word. Now the leading system messages (those before the first turn
+  of any other role) are folded, in order and blank-line separated, into the
+  one anchored system turn. A `role: "system"` message LATER in the conversation
+  is rendered inline where it was sent, as its own `<|im_start|>system` block
+  -- which is what the bundle's Jinja does with it -- and is an ordinary turn
+  from there on: evicted in order with the turns around it, never left at the
+  head of what survives an eviction (there it would read as part of the system
+  turn, behind the retained note), and handed to the summariser as `system:
+  ...` when it goes. An empty one renders nothing.
+
+  `role: "developer"` is the SAME role as `system`, everywhere the paragraph
+  above says system: OpenAI renamed it, its SDKs emit the new spelling, and one
+  that LEADS is folded into the anchored system turn while one that comes later
+  is its own inline block, evicted in order and summarised as `system: ...` like
+  any other turn. It used to fall through the renderer's unknown-role path and
+  become a USER turn, which is wrong twice and silently: the agent's
+  instructions were evictable, so the model got dumber as the conversation grew,
+  and with no message of role `system` left the template's `default_system`
+  ("You are a helpful AI assistant.") went in FRONT of them, contradicting the
+  instructions with a prompt nobody sent. Any OTHER unrecognised role is still
+  rendered as a user turn -- dropping it would lose words someone typed, which
+  is the failure above.
+
+  Folding ALL of them into the system turn, wherever they sat, is the obvious
+  fix for the dropped messages and the wrong one, because that turn is the one
+  thing eviction cannot shrink: a client that keeps a per-turn reminder in its
+  history then grows it by a message per exchange until nothing else fits.
+  Measured at `n_ctx=2048` with 400-character reminders: by 18 exchanges the
+  stale reminders had pushed 34 of the 37 real turns out of the window, and
+  from 20 on nothing fitted at all -- a 400 on every later request, since the
+  client resends the same history. Inline, a per-turn reminder does not cost
+  KV reuse either: it never touches the system turn, so a growing conversation
+  that carries one still extends the resident prompt byte-for-byte (see the
+  KV-reuse note below).
 
 - **Eviction summarises instead of discarding.** Dropping the oldest turns
   outright makes the agent forget it already read a file and read it again --
   burning the window a second time on information it had. So when eviction
   fires, the outgoing turns are condensed by one NPU call into a short note
-  folded into the SYSTEM turn (the one thing eviction never touches). A later
-  eviction re-summarises the previous note together with the newly evicted
-  turns, so notes never stack.
+  folded into the SYSTEM turn (the one thing eviction never touches), under the
+  heading `[genie_server note v1: summary of earlier turns]`.
+
+  **The note carries forward, and for a stateless client that is the server's
+  job.** No response returns the note and clients resend their history
+  verbatim, so the next request arrives with no trace of it. The last note is
+  therefore kept server-side -- ONE slot, like the resident KV, keyed by a
+  digest of exactly the evicted turns it stands for, so one conversation can
+  never be handed another's. On the next over-window request:
+
+  | what was evicted this time | what happens |
+  |---|---|
+  | the same turns as last time | the stored note is reused as it is: **no NPU call, no overhead tokens, no dialog reset** -- so KV reuse survives eviction |
+  | those turns plus newer ones | ONLY the newly evicted turns are summarised, with the stored note as the prior, and the result replaces it -- notes never stack and never restart from scratch |
+  | anything else (another conversation, edited history) | summarised fresh |
+
+  If a re-summary fails, the previous note is kept rather than lost. A
+  summarisation CUT SHORT BY AN ABORT -- the watchdog's, for a stall, or
+  shutdown's -- is a failed one too: Genie reports it as an ordinary `stop` with
+  whatever had been produced, and a fragment is not a summary. The partial text
+  is discarded and nothing is remembered as standing for those turns (the log
+  says `the summary was cut short by an abort -- discarded, ...`), so the next
+  over-window request offers the same turns to the summariser again; with a
+  note already in hand, that good note is kept and the record of what it covers
+  is not advanced. Two over-window conversations interleaving evict each
+  other's note exactly as they evict each other's KV -- the same trade as
+  `GENIE_MAX_INFLIGHT`. (Until
+  2026-09-16 this paragraph claimed the carry-forward and the code did not do
+  it: every over-window request re-summarised from the last few thousand
+  characters of what it evicted, so a fact stated before that tail was gone
+  after a few file reads.) A note a CLIENT sends back is honoured only as the
+  last block of its system turn with the heading on a line of its own; a system
+  prompt that merely quotes the heading is left alone. A client that sends no
+  system prompt keeps the template's default one after its first eviction, with
+  the note appended to it.
 
   Measured, same 30-turn conversation with a fact stated at the start:
 
@@ -246,26 +618,77 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   | `GENIE_SUMMARIZE_EVICTED=1` (default) | 12.6s | recalled the key |
   | `=0` | 8.5s | lost it |
 
+  That table was measured under the note's OLD heading (`[earlier context]`)
+  and before the carry-forward above; it has not been re-measured, because the
+  pass that changed them ran no NPU work. Treat it as the cost and the benefit
+  of one summarisation, which is what it measured.
+
   The extra ~4s is paid only when eviction was going to happen anyway. If the
   summarisation call fails, or the note itself will not fit, the server falls
   back to plain eviction -- a summary is never allowed to break a request.
-  `GENIE_SUMMARY_MAX_TOKENS` (default 192) bounds the note.
+  `GENIE_SUMMARY_MAX_TOKENS` (default 192) bounds the note. The summariser's
+  INPUT is bounded too: the transcript offered to it is capped at
+  `min(6000, (n_ctx // 2) * 3)` characters (so unchanged at 4096 and above),
+  and the prompt actually built is token-counted against `n_ctx` less the
+  note's cap and `GENIE_WINDOW_MARGIN`, halving the transcript until it fits.
+  If it cannot fit -- a tiny window, a long prior note -- no NPU call is made
+  and plain eviction follows.
 
-- **A buffered tool stream is still abortable.** Tool responses are buffered
-  (a half-emitted `<tool_call>` is worse than a slower one), which means
-  nothing is written while the model generates -- so the usual
-  disconnect-detection-by-failed-write never fires. Both stream paths emit a
-  lightweight probe every 8 chunks (an SSE comment on the OpenAI side, a real
-  `ping` event on the Anthropic side) purely so a departed client is noticed.
-  Without it an abandoned tool turn runs to `max_tokens` holding the
-  single-flight NPU against every other caller.
+  The log says which of these happened, one line per eviction beside the
+  `dropped N oldest message(s)` line:
+
+  ```
+  [genie] context window: summarised N evicted message(s) into a C-char note (T tokens of NPU time)
+  [genie] context window: reused the retained C-char note for M evicted message(s) (no NPU call)
+  [genie] context window: kept the previous C-char note; M newly evicted message(s) could NOT be summarised into it
+  [genie] context window: evicted turns NOT summarised -- the summarisation prompt does not fit n_ctx=N either
+  ```
+
+  N in the first line counts only the NEWLY summarised turns.
+
+- **A response that writes nothing while it generates is still abortable --
+  all three kinds.** A failed write is the only way a stream learns its reader
+  has gone, and three situations write nothing for a whole generation: a tool
+  turn (buffered, because a half-emitted `<tool_call>` is worse than a slower
+  one), a stream whose orphan gate is still holding -- which under the defaults
+  (`GENIE_ORPHAN_HOLD_CHARS=-1`, thinking off) is every plain stream, normally
+  for its whole length -- and every non-streaming response. Each is probed
+  every 8th chunk: a stream
+  writes its API's keep-alive (an SSE comment on the OpenAI side, a real `ping`
+  event on the Anthropic side) purely so the write can fail; a non-streaming
+  response has no frame to write, so it asks the socket instead (`select` plus
+  `MSG_PEEK`, which never blocks and leaves a pipelined next request unread).
+  Without it an abandoned turn runs to `max_tokens` holding the single-flight
+  NPU against every other caller.
+
+  What "gone" covers: a closed or reset connection; a client that half-closes
+  its sending side and waits (no HTTP/1.1 library does that on keep-alive, and
+  it is indistinguishable from here); and a client that has not READ a stream
+  for `GENIE_SOCKET_TIMEOUT` seconds. A departed client gets no response, its
+  generation is aborted, and only ITS generation: the abort is aimed at the
+  turn the leaving request is running, so a finished stream's late write
+  failure can no longer truncate the next client's answer. One departure is ONE
+  native ABORT for that turn: the emitter that noticed and the generator it
+  then walks away from both abort, and the second is not sent to Genie again,
+  because it would land just as the first was making the query return -- a
+  signal at an idle dialog, which might stick and cut the NEXT request short.
+  (The watchdog is different on purpose: it re-signals a stall every interval.)
+  One that left before its query started costs nothing at all -- no lock wait,
+  no prefill -- where it used to cost a full prefill plus a token. That holds
+  for every response kind: a stream finds out when its first frame fails to
+  write, and a non-streaming response, which has no first frame, asks the
+  socket before the generation is created.
 
 - **Streaming reports usage too.** OpenAI streams emit a final chunk with an
   empty `choices` list carrying `usage`, but only when the caller sets
   `stream_options.include_usage` -- clients that do not ask see a
   byte-identical stream to before. Anthropic streams carry `output_tokens` in
   `message_delta` as usual. Both include the summarisation overhead below when
-  there was any.
+  there was any. Every path counts the RAW generation -- what the model
+  produced, not what survived the think/orphan strip -- because the stripped
+  tokens cost the same NPU time; the OpenAI tool stream was the last path still
+  counting post-strip and no longer does. A stream that FAILED carries no usage
+  frame at all (see the error-frame note below).
 
 - **Summarisation cost is reported, not hidden.** A request that evicts spends
   extra NPU time condensing the outgoing turns. That shows up as
@@ -283,6 +706,30 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   unrelated one. The match must be exact -- edited history, an evicted turn, or
   an aborted generation all fall back to a full re-prefill, because resuming on
   mismatched KV would answer from a history that never happened.
+
+  What drops the record, so the next turn re-prefills: any dialog reset; an
+  aborted turn, whatever status Genie returned for it; a throw anywhere after
+  the reset; the server's own summarisation call; and **a request that supplied
+  stop sequences, unless its generation certainly ran to its token cap.** Genie
+  strips the matched text from what it hands back, but the tokens that began
+  the match were fed and sit in the KV -- so after a hit the KV holds tokens
+  the recorded text does not, and a continuation would resume one step out of
+  line. Whether a sequence fired is not observable, so the record goes whenever
+  one could have. A prompt that cannot be encoded (a lone surrogate) is refused
+  before any engine call and leaves the record intact.
+
+  Two things that silently defeated the byte-exact match after a tool call,
+  both fixed 2026-09-16: tool arguments and schemas are now rendered as raw
+  UTF-8 (`ensure_ascii=False`, as the template's `tojson` does) and come back
+  in responses the same way, so a client echoing non-ASCII arguments echoes
+  what the dialog holds; and a call-only assistant turn no longer gets a
+  newline before `<tool_call>` when thinking is off -- which, thinking being
+  off by default, had broken reuse after EVERY tool call. And one thing that
+  defeats it by design: a LEADING system message that changes each turn changes
+  the system turn, so nothing after it can match. A per-turn reminder sent
+  LATER in the conversation does not -- it renders inline where it sits (see
+  the system-message note above), so as long as the client keeps the earlier
+  ones in its history the next prompt is still a byte-exact extension.
   (`GenieDialog_save`/`restore` also exist and work -- measured ~75 KB/token on
   disk, ~128 MB at 1711 tokens -- but they are not used: in-memory continuation
   is free and this server serves one conversation at a time.)
@@ -406,7 +853,15 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   `penalize-last-n` is 0 (the penalties beside it are then applied to an empty
   window and do nothing), or when every penalty in it is 0. It says nothing
   when there is no bundle config at all -- a note about a file you do not have
-  is noise in front of the error naming the env vars to set.
+  is noise in front of the error naming the env vars to set. A
+  `genie_config.json` that is PRESENT but does not parse gets its own line --
+  `WARNING: could not parse genie_config.json (<the parser's message, with line
+  and column>). Nothing can be read from it, so the poll and sampler checks
+  were SKIPPED, not passed` -- where it used to print the false `note: no poll
+  key found`. The single-length finding comes from `metadata.json` and is still
+  reported. With `GENIE_BUNDLE_DIR` unset, none of these readers falls back to
+  a `genie_config.json` or `metadata.json` that happens to sit in the current
+  directory.
 
   **This is a PER-MACHINE fix, and nothing in this repo can apply it for you.**
   Bundles are large external artifacts deliberately kept out of version
@@ -438,7 +893,11 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   the config TEXT passed to `GenieDialogConfig_createFromJson`, never on disk.
   That is the only window in which sampling is settable at all, which is exactly
   why it happens there. See the seed note above for what it fixes and what it
-  cannot.
+  cannot. The per-request apply is still made (it costs one no-op and starts
+  working unchanged if a later QAIRT honours it), and the baseline it restores
+  to after a tool turn's temp-0 is the sampler the dialog was CREATED with --
+  carrying the per-process seed, not the bundle's on-disk `42` -- so the day
+  that call takes effect it cannot re-arm the fixed-seed replay.
 
   Two JSON shapes worth knowing, both found by probing: the sampler config
   must be wrapped as `{"sampler": {...}}` (a bare object returns -8 "Missing
@@ -456,7 +915,25 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   by whatever was already there. That happened during the window benchmarking
   and was caught only because `/props` disagreed with the bundle just loaded.
   A server that silently answers from the wrong model is the same failure mode
-  as a silent CPU fallback, so it now refuses instead.
+  as a silent CPU fallback, so it now refuses instead. The socket is then
+  BOUND -- not yet listening -- before the load rather than after it, which
+  closes the other half of the race. A second instance started while the first
+  is still loading used to find the port free, load beside it and race it to
+  the bind; it still passes this check, since nothing is accepting yet, but is
+  stopped by its own BIND failing (`cannot bind ...`, WinError 10048, or 10013
+  when the second binder is the wildcard one), ahead of its load, with a line
+  saying the holder may be on ANY `GENIE_HOST`. Turning `allow_reuse_address`
+  off was only most of the fix: two sockets with DIFFERENT addresses on one
+  port -- `0.0.0.0` and `127.0.0.1` -- still bound happily in either order, so
+  a second instance on the default host slipped through both guards during a
+  wildcard instance's load. `Server.server_bind` now sets
+  `SO_EXCLUSIVEADDRUSE`, which is the only option that makes a port this
+  process holds unavailable to every other address on it, so the guard is
+  cross-host. (It replaces `SO_REUSEADDR` rather than joining it -- both at
+  once fails the bind with `WSAEINVAL` -- and costs nothing on restart, since
+  TIME_WAIT applies to accepted connections, not to a listening socket.) The
+  listen comes after the load, so an answering port always means a resident
+  model (see startup order under [Run](#run)).
 
 - **Single-flight.** The NPU serves one query at a time (concurrent HTP access
   wedges the device), so requests are serialized by a lock. Fine for one agent.
@@ -567,9 +1044,32 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   **Decode is largely immune to all of it; prefill is not.** Genie decode
   measured 17.70 t/s charging at 33% and 17.91 settled at 100% -- 1.2% apart --
   while prefill separates backends 2x. Check the pack before quoting a prefill
-  figure; a decode figure survives a messier box. `bench_endpoint` and
-  `bench_contention` both record pack, draw and clock alongside their numbers
-  now, so a run's conditions are in its output rather than in someone's memory.
+  figure; a decode figure survives a messier box. Every bench tool here records
+  pack, draw and clock alongside its numbers now -- `bench_endpoint` and
+  `bench_contention` per measurement, `bench_servers` per row of its JSON,
+  `bench.py` per GEMM case -- all through the one sampler
+  (`bench_endpoint.box_state`) and under the one key, `clock_pct`, which is the
+  `% Processor Performance` counter. So a run's conditions are in its output
+  rather than in someone's memory, and the columns are comparable across tools.
+  The sampler's row is culture-proof -- its doubles are formatted with the
+  invariant culture -- so it reads the same on a comma-decimal Windows (de-DE,
+  fr-FR), where `79,2` used to add a field, fail the parse and blind every
+  consumer at once, `bench_contention`'s on-battery abort included. That abort
+  needed its own reader fixed as well, since the cool gate reads the clock
+  counter directly rather than through the shared sampler: both of
+  `bench_contention`'s reads are invariant-formatted too, and the abort fires
+  under `CurrentCulture='de-DE'` where it could not before. That abort is no
+  longer the only thing that catches a run taken on battery, either: it never
+  runs at all with `--cool-floor 0`, with a clock that never dipped below the
+  floor (the power source is read only when the gate is waiting), or with a
+  counter that cannot be read -- so the per-round `power_samples[].on_ac` is
+  checked once more at the end of every sweep and a run that was on battery is
+  warned about there. Only the gate stops a sweep, so the exit code is unchanged.
+  (`bench_servers` used to compute its own clock from `Win32_Processor`
+  `CurrentClockSpeed / MaxClockSpeed`; sampled at the same instant the two
+  instruments differed by about 7 points, which is why the README's "42-79% of
+  base" for the cross-server run is not the same quantity as the 34.8% and
+  48.9% figures in this file.)
 
 - **The contention ABSOLUTES could not be established on this box, and that is
   a property of the hardware rather than a gap in effort.** The poll ratios are
@@ -622,19 +1122,25 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   template and every tokenizer file are byte-identical, and the only
   `metadata.json` difference is the KV shapes.
 
-  | compiled n_ctx | HTP alloc | prefill (median) | decode (median) | cost per doubling |
+  | compiled n_ctx | HTP alloc (MiB) | prefill (median) | decode (median) | cost per doubling |
   |---|---|---|---|---|
-  | 4096 | 328 MB | **1157 t/s** | **18.0 t/s** | -- |
-  | 8192 | 647 MB | **458 t/s** | **8.8 t/s** | 2.05x decode, 2.54x prefill |
-  | 16384 | 1195 MB | **176 t/s** | **3.3 t/s** | 2.69x decode, 2.59x prefill |
+  | 4096 | 328 (343,933,440 B) | **1157 t/s** | **18.0 t/s** | -- |
+  | 8192 | 617 (646,971,904 B) | **458 t/s** | **8.8 t/s** | 2.05x decode, 2.54x prefill |
+  | 16384 | 1195 (1,253,048,832 B) | **176 t/s** | **3.3 t/s** | 2.69x decode, 2.59x prefill |
+
+  (Units fixed 2026-09-16: the 8192 row read "647 MB" -- decimal megabytes --
+  between two rows that were MiB under the same "MB" heading. All three are MiB
+  now, with the bytes beside them, as in `IMPLEMENTATION_PLAN.md`.)
 
   So **decode is roughly inverse-linear in the window up to 8192 and worse
   beyond it**: the first doubling costs 2.05x (almost exactly the 2x a fixed
   per-token tax predicts), the second 2.69x. Prefill is consistently worse than
   inverse-linear, ~2.55x per doubling. HTP allocation is exactly linear at
-  73,983 bytes per token of window, which doubles as a check that a bundle is
-  the window it claims -- the 8192 bundle allocated 646,971,904 bytes against a
-  646,971,904 prediction.
+  73,984 bytes per token of window (909,115,392 B over the 12,288 positions
+  between the 4096 and 16384 bundles; this line said 73,983 until 2026-09-16,
+  which does not reproduce the next figure), which doubles as a check that a
+  bundle is the window it claims -- the 8192 bundle allocated 646,971,904 bytes
+  against a 646,971,904 prediction.
 
   Decode is FLAT with depth on both self-exported bundles, which is the tell:
   the 16384 bundle decoded 3.26 t/s holding 469 tokens and 3.27 t/s holding
@@ -751,7 +1257,7 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   (`past_key_0_in` / `past_value_0_in` are `dtype: uint8` with a fixed quant
   scale), not assumed. For this model that is 36 layers x 2 x 8 KV heads x 128
   head_dim x 1 byte = 73,728 B/token; the measured HTP allocation delta between
-  the two bundles works out to 73,983 B/token, 0.3% off. Any fp16 estimate of
+  the bundles works out to 73,984 B/token, 0.35% off. Any fp16 estimate of
   KV size for this bundle is 2x too high.
 
 - **Throughput is bandwidth-bound.** Decode is ~18 t/s on a quiet box for the
@@ -760,11 +1266,110 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
   the tables above. It drops
   sharply under memory pressure (the X Elite's 32 GB LPDDR5x is shared by CPU/GPU/NPU),
   so a large resident model elsewhere (e.g. a 26 GB llama-server) will slow it.
-- **`finish_reason`** reports `length` only on context-limit; a `max_tokens` cap
-  currently reports `stop` (Genie signals a normal sentence-end at the cap).
+- **`finish_reason` is `length` when the generation reached its `max_tokens`
+  cap or the context limit** (Anthropic `stop_reason: "max_tokens"`). Genie
+  reports SUCCESS at the cap -- a normal sentence-end -- so the server counts
+  what came back: the number of token callbacks, with a tokenizer re-count of
+  the text as the second opinion when callbacks fall short (a token whose bytes
+  are a partial character may not get a callback of its own). Without a
+  tokenizer it is callbacks only. Until 2026-09-16 a capped generation reported
+  `stop`, and a client could not tell a cut answer from a complete one. On the
+  Anthropic side the full mapping is: `tool_use` when the reply carries a call,
+  else `max_tokens` at the cap, else `stop_sequence` when the request SUPPLIED
+  stop sequences, else `end_turn`. That third one is a heuristic, not a
+  detection -- Genie strips the matched text, so whether a sequence fired is
+  not observable -- and `stop_sequence` (the field) is always `null`. The cap
+  outranks it: a capped generation is `max_tokens` whatever stop list it
+  carried.
+
+- **The output cap: both spellings, resolved once, applied every turn.**
+  `max_tokens` and `max_completion_tokens` are both honoured. For either one
+  `0`, `0.0`, `"0"`, `false` and `null` all mean "not set"; a legacy
+  `max_tokens` that is SET wins; one that is absent or 0 defers to the modern
+  spelling (`{"max_tokens": 0, "max_completion_tokens": 16}` is 16 -- it used
+  to fall through to the default); neither set means `GENIE_MAX_TOKENS`. A
+  negative or non-integer value is a 400 naming the field the client sent. The
+  value is NOT clamped to the window: one too large fails the fit check and
+  gets the overflow 400, which quotes the client's own number back. The cap is
+  written to the resident dialog on EVERY turn, because it lives there -- a
+  request that set none used to run under whatever the previous request had
+  left behind.
+
+- **A streaming failure is an error-shaped frame, never content.** Once the
+  200 has gone out a failure cannot be a status, so it is sent the way each API
+  spells it, after whatever text was generated before it:
+
+  ```
+  OpenAI      data: {"error": {"message": "...", "type": "server_error"}}
+              data: [DONE]
+  Anthropic   event: error
+              data: {"type": "error", "error": {"type": "api_error", "message": "..."}}
+              event: message_stop
+              data: {"type": "message_stop"}
+  ```
+
+  (Each Anthropic event goes out as ONE write, `event:` and `data:` together;
+  it used to be two, so a client could be handed half an event.)
+
+  No `finish_reason`, no `stop_reason` / `message_delta`, and no usage frame on
+  a failed stream: those say how a turn ENDED, and it did not. This used to be a
+  content delta reading `\n[error: ...]` followed by `finish_reason: "stop"`, so
+  an agent stored the error string as the model's answer and carried on.
+  (`src/genie_smoke.py` still checks for that text, only as a guard against a
+  server old enough to send it.) Non-streaming failures are an ordinary 500 in
+  the endpoint's envelope.
+
+- **Malformed requests are refused at the door, in the envelope of the API they
+  were sent to** -- `{"error": {...}}` on the OpenAI leg, `{"type": "error",
+  "error": {...}}` on `/v1/messages` -- and before anything that costs NPU time
+  (building the prompt can evict, and evicting can summarise). The 400s:
+  `messages` missing or not a list of objects; a message `content` that is
+  neither a string, a list of content blocks nor a single content block
+  (`message content must be a string, a list of content blocks, or one content
+  block -- not int`), which used to flatten to nothing and be answered 200 over
+  a turn with no words in it; `tools` that is not a list of
+  objects (`tools must be a list of objects` -- a string used to be rendered as
+  one "function signature" per character, with a 200); a request with `tools`
+  against a bundle whose tokenizer has no `<tool_call>`; a bad output cap; a
+  prompt that does not fit even after eviction; text that is not valid Unicode,
+  e.g. a lone surrogate `\ud83d` from a string cut through an emoji (`...not
+  valid Unicode...`); and any wrong-typed field that raises before generation
+  -- `temperature: "hot"`, `stop: 5`, `stream_options: "yes"` -- as `malformed
+  request (ExceptionType: detail)`. Body-level refusals come first: bad or
+  negative `Content-Length` (400), a chunked body (411), a body over
+  `GENIE_MAX_BODY_BYTES` (413), JSON that does not parse or is not an object
+  (400). Any other unhandled exception is a 500 (`server_error` / `api_error`)
+  rather than a dropped connection; once headers are out, the connection is
+  closed and the reason logged. The one exception is a turn refused because
+  shutdown had begun, which is a **503** in the same envelope -- see Shutdown
+  above.
+
+- **The log is silent on success and never silent on a refusal.** There is no
+  per-request access line (an agent makes hundreds). What IS printed is one
+  stdout line for every request not served as asked: `[genie] <code> <METHOD>
+  <path>: <message>` for every non-2xx the server writes (400 / 404 / 411 / 413
+  / 429 / 503 / 529 / 500, and the stdlib's own refusals such as 501), plus
+  `engine failure mid-stream`, `dropped ... stopped sending its N-byte body`
+  and `failed mid-response`. The 503 there is the shutdown refusal, not
+  `/health`: a turn the closing engine would not start. When that happens to a
+  STREAM whose 200 is already out, the line reads `refused mid-stream` rather
+  than `engine failure mid-stream` -- nothing about the engine failed, it
+  declined. One line, ASCII, message capped at 300 characters. A `/health` 503
+  is deliberately NOT logged per poll -- it is the answer, not a refusal, and
+  the watchdog announces the state change once.
+
+- **Generated text is decoded incrementally.** A multibyte character split
+  across two Genie callbacks is emitted whole rather than as a pair of U+FFFD,
+  in the stream and in the KV record alike; a partial sequence left dangling at
+  the end is flushed as a single U+FFFD.
 - Model swaps: `run-genie-server.ps1 -Model qwen3-8b` serves the Qwen3-8B
   w4a16 prebuilt (multi-length 4096, id `qwen3-8b-npu`; expect roughly half
-  the 4B's decode -- bandwidth-bound, ~2x the weight bytes per token). For
+  the 4B's decode -- bandwidth-bound, ~2x the weight bytes per token), and
+  `-Model qwen3-8b-8192` the self-exported 8192 multi-length build of the same
+  model (id `qwen3-8b-8192-npu`; the 4096 prebuilt stays the default 8B only
+  until a same-harness AC comparison exists -- see `MODEL_OPTIONS.md`). An
+  explicit `-Model` beats a `GENIE_BUNDLE_DIR` / `GENIE_MODEL_ID` lingering in
+  the shell, and moves the id with the bundle. For
   anything else, point `GENIE_BUNDLE_DIR` at the bundle -- e.g. the 1.7B for
   lower latency. Note that the bundle's **compiled window** is as big a
   latency lever as its parameter count -- see the window-tax note above
@@ -777,13 +1382,138 @@ badly, and restarting on that would turn a bad bundle into a crash loop.
 
 ## Reproducing the cross-server comparison
 
-`src/bench_servers.py` and `src/probe_server_semantics.py` measure this server
-against Qualcomm's two, on the *same* bundle. Both default to a `geniex` model
-id that only exists once you have imported that bundle, so the setup is written
-down here rather than left in someone's shell history.
+Two tools, with different reach. `src/bench_servers.py` measures decode for
+this server against **`geniex serve` only**, on the *same* bundle: its method
+is a delta between two capped requests, and GenieAPIService honours no output
+cap under either spelling, so the delta cannot be formed against it at all.
+`src/probe_server_semantics.py` is the one that takes ANY base URL, so it is
+the tool to point at GenieAPIService -- or at anything else OpenAI-shaped --
+for the seed-replay, overflow and stop-sequence probes. Both default to a
+`geniex` model id that only exists once you
+have imported that bundle, so the setup is written down here rather than left
+in someone's shell history.
 
 The findings these produced are in the README; this is only how to re-run them,
 which is worth doing whenever either vendor ships a release.
+
+**`bench_servers.py` -- what a reader will hit.** It is a hardware tool: it
+needs the NPU, `pip install tokenizers`, and BOTH `GENIE_BUNDLE_DIR` and
+`GENIE_SDK_DIR` set -- it refuses at startup otherwise, where an unset SDK dir
+used to cost three 240-second port waits before saying anything. (`GENIEX_EXE`
+overrides where it looks for `geniex.exe`; the default is `%LOCALAPPDATA%\GenieX
+CLI\geniex.exe`.) A `geniex.exe` that is neither an existing file nor on PATH
+is refused there too, BEFORE the first launch: that is the whole `geniex` arm,
+so every launch of it would fail the same way and the sweep would run
+one-armed to its end and finish `complete`. So is a `--tokens` below
+`GENIE_MIN_DECODE_STEPS`, for the same reason one depth further down -- every
+measurement would be refused as too short a window to be a rate, after the box
+had paid for it.
+
+- **It starts and stops its OWN servers and touches nothing else.** A server
+  already listening on `--ours-port` (default **8123**, which is also the
+  launcher's -- i.e. your resident `genie_server`) or `--geniex-port` (default
+  18181) is REFUSED with its pid and port named, never stopped. Stop it
+  yourself, or pass another port. It used to `taskkill /IM geniex.exe` and
+  force-stop whatever owned both ports before pass 1, which killed a
+  co-tenant's normally-launched server mid-session with no notice on either
+  side.
+- Each arm's stdout and stderr go to `bench_servers-<arm>.log` beside `--out`.
+  A child that exits before its port answers fails that arm-run at once, with
+  its exit code and the log's last lines. For `genie_server` that covers the
+  model load as well -- it does not listen until the model is resident, so a
+  bad bundle or a held HTP exits before the port has answered, and a load that
+  HANGS costs the 240 s port wait and no more. In general, though, an answering
+  port is a TCP connect and not a loaded model: `geniex` binds at once and
+  loads on its first request. So a child that exits AFTER its port answered is
+  looked for too, at the first request that fails. Gone by the warmup, it is
+  recorded in `failed_starts` with its exit code and log tail, and its depths
+  are skipped; gone later, the arm-run stops there and is recorded in
+  `died_mid_run` with the depth it died at.
+- Log tails in those failure lines are printed as ASCII, anything else
+  backslash-escaped (`\u26a0`, `\x97`) -- geniex writes UTF-8 with emoji in
+  exactly its failure messages -- and stdout escapes any character it cannot
+  encode, so a piped or `| Tee-Object` run can no longer end on a
+  `UnicodeEncodeError` over a line whose only job was to say why an arm-run was
+  skipped.
+- A listener this run did not start is found by asking who is LISTENING on the
+  port. A foreign `genie_server` that is still loading holds its port bound but
+  not listening, so it cannot be named; the arm this run then launches exits 1
+  at its own bind (`cannot bind ... 10048`, or 10013 when the arm is the one
+  binding the wildcard address second), and that is reported as a failed start
+  with the log tail. That backstop is now cross-host: the bind is exclusive, so
+  a foreign mid-load instance on `0.0.0.0` can no longer let this run's
+  `127.0.0.1` arm bind beside it and measure against the wrong server.
+- `--out` (default `sweep-results.json`, in the current directory; `''` for
+  none) is NOT overwritten without `--force`, and an existing file or a missing
+  directory is refused BEFORE the sweep rather than after twenty minutes of it.
+  The repo's `.gitignore` covers the default name and the logs.
+- Every arm gets the cap under BOTH spellings (`max_tokens` and
+  `max_completion_tokens`), `cache_prompt: false`, thinking off
+  (`chat_template_kwargs.enable_thinking=false`, `reasoning_effort: "none"`)
+  and `stream: false` -- the same body `bench_endpoint` sends.
+- Depths are resolved against the bundle's window (`dialog.context.size` from
+  its `genie_config.json`, or `--n-ctx`, else an assumed 4096) less `--tokens`
+  less 256: an over-budget depth is dropped with a printed note, a non-integer
+  is a one-line refusal. The graph boundaries INSIDE the window are still yours
+  to respect -- keep depth + `--tokens` inside one compiled length.
+- A sample is kept only if the long run produced at least 90% of `--tokens`
+  AND at least `GENIE_MIN_DECODE_STEPS` (16) steps.
+- `--repeat` and `--depth` are accepted as aliases of `--passes` and
+  `--depths`, because the other bench CLIs spell them that way. Progress reads
+  `[run R/T, pass P/N]`: a pass is one A/B pair, a run is one arm's turn in it.
+- **Exit status is 0 only when the sweep completed.** Interrupted, refused or
+  errored is 1 -- and a Ctrl-C or a bug mid-run still stops the servers this
+  run started and still writes the rows gathered so far, with `outcome` saying
+  which it was. That includes a Ctrl-C during the port wait: the child is
+  registered the moment it exists, before the wait, so it is stopped rather
+  than left holding the Hexagon and its port. `outcome` is about the LOOP: it
+  is still `complete`, and the exit code still 0, when an arm-run failed to
+  start or died mid-run, as long as that arm still produced rows, because the
+  sweep went on without it. Those are on the screen as they happen, in
+  `failed_starts` / `died_mid_run`, and in a closing line printed after the
+  medians -- `NOT every arm-run ran to its end: of N, X failed to start (arm)
+  and Y died mid-run (arm) ...` -- so a table with rows missing cannot pass for
+  a finished A/B.
+
+  A loop that ran to its end and left an ARM with no rows AT ALL is not a
+  comparison whatever the loop did, so that one is `outcome: "incomplete: no
+  rows for <arms>"` and exits 1. It is said after the medians, where the
+  numbers are read: ``NOT an A/B: `geniex` produced no rows at all, so there is
+  nothing to compare -- this run exits non-zero.`` That covers an arm every
+  launch of which failed, an arm that died in every warmup, AND an arm every
+  sample of which was REFUSED -- which the `NOT every arm-run ran to its end`
+  line cannot see, because no arm-run ended early.
+
+The results file says which sweep it was. Top level: `tool`, `outcome`,
+`started`, `finished`, `bundle_dir`, `n_ctx`, `n_ctx_source`, `arms`, `passes`,
+`order`, `depths`, `tokens`, `timeout`, `acceptance`, `cap_spellings`,
+`request_settings`, `depth_means`, `token_counter`, `clock_instrument`, `logs`,
+`failed_starts`, `died_mid_run`, `rows`. `failed_starts` is a list of `{arm,
+pass, run, reason}` and also holds an arm whose server died during the warmup
+after its port had answered; `died_mid_run` is a list of `{arm, pass, run,
+depth, reason}`. Each row: `arm`, `pass`, `run`, `depth`, `rate`,
+`steps`, `secs`, `prompt_tokens`, `on_ac`, `charge_pct`, `charge_w`,
+`clock_pct`. The old row key `clock` (the `Win32_Processor` ratio, `-1` on a
+failed read) is gone; `clock_pct` is the performance counter and is `null`
+when it could not be read.
+
+**`probe_server_semantics.py`** takes three positionals, `[BASE] [MODEL]
+[CAP]`, defaulting to geniex's (`http://127.0.0.1:18181`,
+`qualcomm/qwen3-4b-ours`, `max_completion_tokens`). For this server:
+
+```powershell
+python src\probe_server_semantics.py http://127.0.0.1:8123 qwen3-4b-npu max_tokens
+```
+
+`GENIE_BUNDLE_DIR` must be the bundle the server under test is serving, and
+must hold `genie_config.json` as well as `tokenizer.json`: PROBE 2's three
+prompt sizes are derived from `dialog.context.size` (0.85x / 1.1x / 2.5x of it
+-- 6963 / 9011 / 20480 at 8192) rather than assuming 8192, so re-running
+against the 4096 8B prebuilt keeps an in-window control row instead of putting
+all three past the window. A missing variable, tokenizer, config or key is a
+named exit, not a traceback; blank completions in PROBE 1 read `EMPTY ... no
+seed verdict` rather than REPLAYS, and a failed run in PROBE 3 reads `NO
+VERDICT`.
 
 **geniex serve -- one command.** It accepts an AI Hub bundle directory
 (`metadata.json` + `part*.bin`) directly, and COPIES it into its own cache

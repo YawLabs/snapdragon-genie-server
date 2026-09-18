@@ -9,6 +9,7 @@ test instead; these tests cover the pure logic around it.
 """
 
 import importlib
+import io
 import json
 import os
 import sys
@@ -27,6 +28,10 @@ class StubEngine:
 
     def __init__(self, chunks=None, finish="stop"):
         self.chunks = list(chunks or [])
+        # What the engine reports the turn ended on. "length" is the token cap
+        # (CONTEXT_EXCEEDED, or the generation reaching max_tokens) and is the
+        # one agentic clients key continuation off -- test_finish_reason.py
+        # drives it through all four response paths.
         self.finish = finish
         self.calls = []          # one record per query / query_stream
         self.aborted = False
@@ -38,25 +43,39 @@ class StubEngine:
         return len(text) // 4
 
     def query(self, prompt, on_text, max_tokens=None, stop=None, sampler=None,
-              commit=True, internal=False):
+              commit=True, internal=False, result=None):
         self.calls.append({"prompt": prompt, "stop": stop, "sampler": sampler,
                            "commit": commit, "max_tokens": max_tokens,
                            "internal": internal})
         for c in self.chunks:
             self.yielded += 1
             on_text(c)
+        # As the real one: whether anyone asked for the turn to stop. Nobody
+        # aborts a stub, so a test that needs True sets `query_aborted`.
+        if result is not None:
+            result["aborted"] = getattr(self, "query_aborted", False)
         return self.finish
 
-    def query_stream(self, prompt, res, max_tokens=None, stop=None, sampler=None):
+    def query_stream(self, prompt, res, max_tokens=None, stop=None, sampler=None,
+                     commit=True, internal=False):
+        # Same signature and the same record as query(): the real
+        # GenieEngine.query_stream takes commit= and internal= too, and a stub
+        # that is narrower than the thing it stands in for turns a handler
+        # passing them into a TypeError only the suite can see.
         self.calls.append({"prompt": prompt, "stop": stop, "sampler": sampler,
-                           "max_tokens": max_tokens})
+                           "commit": commit, "max_tokens": max_tokens,
+                           "internal": internal})
         for c in self.chunks:
             self.yielded += 1
             yield c
         res["finish"] = self.finish
 
-    def signal_abort(self):
+    def signal_abort(self, any_turn=False, stalled=False):
+        # The real one returns what the abort did (False when no turn was
+        # there). The stub has no turns to scope to, so it records the ask
+        # and says yes.
         self.aborted = True
+        return True
 
 
 class Wire:
@@ -80,7 +99,18 @@ class Wire:
         return b"".join(self.chunks).decode("utf-8", "replace")
 
     def sse_frames(self):
-        """Every `data:` payload, excluding the [DONE] sentinel."""
+        """Every `data:` payload, excluding the [DONE] sentinel.
+
+        splitlines(), so this is structurally BLIND to the frame terminator:
+        it cannot tell a stream of frames from one frame that never ends, and
+        a server that wrote `\n` where `\n\n` belongs would leave every
+        assertion built on this method green. Deliberately not fixed here --
+        several tests cut a stream mid-frame on purpose (Wire(fail_after=...),
+        the client that left), so a terminator assertion in this method would
+        fire on a case the suite is testing. The framing is pinned once,
+        against the emitted bytes, by the "bytes on the wire" section of
+        test_api.py; read h.wfile.chunks directly for anything else about it.
+        """
         out = []
         for line in self.text().splitlines():
             if line.startswith("data: "):
@@ -95,6 +125,14 @@ def gs():
     """A freshly reloaded genie_server with module state pinned for tests."""
     import genie_server as g
     importlib.reload(g)
+    # BEFORE load_chat_template, not after: that reader opens
+    # BUNDLE_DIR/metadata.json, and the reload above has just re-read BUNDLE_DIR
+    # from the developer's GENIE_BUNDLE_DIR. Every real bundle carries a
+    # genie.chat_template, so with the documented export in place the "no
+    # bundle" comment on the next line was simply false -- the suite rendered
+    # with whatever template the ambient bundle held. "" is the no-bundle path
+    # for every reader, this one included.
+    g.BUNDLE_DIR = ""
     g.TEMPLATE = g.load_chat_template()   # no bundle -> standard ChatML fallback
     g._CONTEXT_SIZE = 4096                # pin, so no genie_config.json is read
     g._CONTEXT_LENGTHS = [512, 1024, 2048, 4096]   # a multi-length bundle
@@ -127,6 +165,27 @@ def gs():
     # exercise the env var itself reload the module deliberately, which
     # overrides this.
     g.THINKING_DEFAULT = False
+    # The same rule, applied to the knobs it had missed -- each one a
+    # module-level os.environ read that the reload re-executes, each one the
+    # documented default, and each one measured flipping tests when exported:
+    # GENIE_ORPHAN_HOLD_CHARS=0 is a setting docs/GENIE_SERVER.md recommends to
+    # a human reading the stream, and it failed the orphan-gate streaming tests;
+    # GENIE_SUMMARIZE_EVICTED=0 failed every summarisation test;
+    # GENIE_WINDOW_MARGIN moves every eviction budget; and the two token caps
+    # feed the default max_tokens and summary_token_cap() arithmetic. This repo
+    # has no CI, so a developer's shell is the only place the suite ever runs.
+    #
+    # NOT pinned, deliberately: HOST / PORT / MODEL_ID / MAX_BODY_BYTES /
+    # FIXED_SEED and the supervision timeouts. Tests that depend on those
+    # either assert against the module's own value or reload under
+    # monkeypatch.setenv, and HEALTH / _INFLIGHT are BUILT from theirs at
+    # import, so assigning the constant afterwards would pin a number the live
+    # object no longer reads.
+    g.ORPHAN_HOLD_CHARS = -1
+    g.SUMMARIZE_EVICTED = True
+    g.WINDOW_MARGIN = 64
+    g.DEFAULT_MAX_TOKENS = 512
+    g.SUMMARY_MAX_TOKENS = 192
     g.ENGINE = StubEngine()
     return g
 
@@ -147,6 +206,47 @@ def handler(gs):
         h.close_connection = False
         return h
     return make
+
+
+def request(gs, make_handler, method, path, body=None, headers=None):
+    """One request through a socketless Handler -> (code, parsed_body, handler).
+
+    The ONE place a test sets path / headers / rfile and keeps the status code.
+    The `handler` fixture builds the Handler and its Wire but throws the code
+    away (its send_response is a no-op, which is right for the many tests that
+    call _complete / _stream directly), so every file that needed the code grew
+    its own copy of "override send_response, set the path, dispatch" -- four
+    of them, differing only in whether they took bytes or a dict.
+
+    `make_handler` is the `handler` fixture's value. `body` is raw BYTES (the
+    only way to reach the JSON-parse failure), or anything else JSON-encoded,
+    or None for no body at all. `headers` is merged OVER the computed
+    Content-Length, so a test can lie about the length or add
+    Transfer-Encoding. `parsed_body` is None when the response is not JSON (an
+    SSE stream) -- read it off handler.wfile instead. `code` is None when the
+    handler never called send_response.
+
+    `gs` is taken, and unused, as test_api's local helpers took it: a caller
+    that holds `handler` necessarily holds `gs`, and the call then reads in
+    the same order as the test's fixture list.
+    """
+    h = make_handler()
+    h.command = method
+    h.path = path
+    raw = b""
+    if body is not None:
+        raw = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+    h.headers = {"Content-Length": str(len(raw))} if body is not None else {}
+    h.headers.update(headers or {})
+    h.rfile = io.BytesIO(raw)
+    sent = {}
+    h.send_response = lambda code, *a, **k: sent.setdefault("code", code)
+    getattr(h, "do_" + method)()
+    try:
+        parsed = json.loads(h.wfile.text())
+    except ValueError:
+        parsed = None
+    return sent.get("code"), parsed, h
 
 
 def convo(pairs, pad=60, system="You are a coding agent."):
