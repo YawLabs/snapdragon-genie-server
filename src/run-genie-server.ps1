@@ -1,18 +1,72 @@
-# Launch the Genie NPU OpenAI-compatible server.
-# Runs `python` from PATH, or the interpreter GENIE_PYTHON names. Either way it
-# must be a native ARM64 build -- Genie.dll is aarch64-only -- and the launcher
-# refuses anything else rather than walking into the DLL-load failure.
-#
-#   powershell -File src\run-genie-server.ps1                        # Qwen3-4B (default)
-#   powershell -File src\run-genie-server.ps1 -Model qwen3-8b        # Qwen3-8B, AI Hub prebuilt (4096)
-#   powershell -File src\run-genie-server.ps1 -Model qwen3-8b-8192   # Qwen3-8B, self-exported 8192 multi-length
-#
-# NOT here: Qwen3.5-9B. It has no Genie export upstream (open qai-hub-models
-# feature request); it serves through src\run-llama-server.ps1 instead. See
-# docs/MODEL_OPTIONS.md for the whole model matrix.
+<#
+.SYNOPSIS
+Launch the Genie NPU OpenAI-compatible server (src\genie_server.py) under a
+supervisor that restarts it after an NPU wedge or a driver crash.
+
+.DESCRIPTION
+Runs `python` from PATH, or the interpreter GENIE_PYTHON names. Either way it
+must be a native ARM64 build -- Genie.dll is aarch64-only -- and the launcher
+refuses anything else rather than walking into the DLL-load failure.
+
+The bundle and the QAIRT runtime are large external artifacts, found under
+GENIE_NPU_ROOT (default: the genie-npu directory beside this repo). Starting
+the server loads a bundle onto the NPU, which takes 11-35 s. The NPU is one
+device for the whole machine, so on a shared box check that nothing else is
+using it first.
+
+NOT here: Qwen3.5-9B. It has no Genie export upstream (open qai-hub-models
+feature request); it serves through src\run-llama-server.ps1 instead. See
+docs/MODEL_OPTIONS.md for the whole model matrix.
+
+.PARAMETER Model
+The bundle to serve: qwen3-4b (default), qwen3-8b or qwen3-8b-8192.
+
+.PARAMETER Help
+Print a short usage -- models, environment variables, docs -- and exit 0
+without starting anything. -h is the same; so is --help under powershell -File.
+
+.EXAMPLE
+powershell -File src\run-genie-server.ps1
+Qwen3-4B, the 8192 multi-length self-export (default).
+
+.EXAMPLE
+powershell -File src\run-genie-server.ps1 -Model qwen3-8b
+Qwen3-8B, the AI Hub prebuilt (4096).
+
+.EXAMPLE
+powershell -File src\run-genie-server.ps1 -Model qwen3-8b-8192
+Qwen3-8B, the self-exported 8192 multi-length build.
+
+.LINK
+docs/GENIE_SERVER.md
+#>
+
+# (The blank line above is load-bearing: Get-Help reads a comment that touches
+# the help block as more of it, and printed this note under RELATED LINKS.)
+# How each help spelling reaches this script, probe-verified on Windows
+# PowerShell 5.1. With no help block above and no [CmdletBinding()], every
+# one of -Help, -h, --help and -? fell into $args unremarked, and the launcher
+# went on to load the bundle onto the NPU -- on a box another session
+# benchmarks, which is how one reviewer's `-?` became an accidental NPU load.
+# Now:
+#   -?      is PowerShell's own and never runs a line of this script. It shows
+#           the help block above: in-shell, and in a console under
+#           `powershell -File` -- where it prints NOTHING once stdout is
+#           redirected, but still exits 0 without starting anything.
+#   -Help and -h bind to the switch below, which prints the usage block and
+#           exits before anything is read or written. --help does too under
+#           `powershell -File`, which hands it over as -help. In-shell,
+#           `& .\run-genie-server.ps1 --help` is a positional value to
+#           PowerShell, and -Model's ValidateSet refuses it (as it does /?):
+#           an error, not a start.
+#   [CmdletBinding()] turns any other stray argument into a binding error
+#           rather than a default run: `-Modle qwen3-8b` used to serve the 4B.
+[CmdletBinding()]
 param(
     [ValidateSet("qwen3-4b", "qwen3-8b", "qwen3-8b-8192")]
-    [string]$Model = "qwen3-4b"
+    [string]$Model = "qwen3-4b",
+    [Alias("h")]
+    [switch]$Help
 )
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -39,6 +93,43 @@ $DefaultBundle = $Bundles[$Model].dir
 # For the 4B, swap to ...qualcomm_snapdragon_x_elite (4096, also multi-length)
 # for the best decode at depth, or ...ctx16384 for the largest window -- but
 # that one is SINGLE-length and therefore slow at every depth.
+
+# -Help: say what this is and what it reads, then leave -- BEFORE the first env
+# write below, before SDK discovery, and long before python, so asking for
+# usage can never start an 11-35 s load onto an NPU someone else may be using.
+# The model list is read out of $Bundles so it cannot drift from what -Model
+# actually serves.
+if ($Help) {
+    Write-Host "usage: powershell -File src\run-genie-server.ps1 [-Model <name>] [-Help]"
+    Write-Host ""
+    Write-Host "Starts the Genie NPU server (src\genie_server.py, OpenAI-compatible) under a"
+    Write-Host "supervisor that restarts it after an NPU wedge or a driver crash. Starting it"
+    Write-Host "loads a bundle onto the NPU (11-35 s). The NPU is one device for the whole"
+    Write-Host "machine: on a shared box, check that nothing else is using it first."
+    Write-Host ""
+    Write-Host "  -Model <name>   the bundle under <GENIE_NPU_ROOT>\bundles, and the id it is served as:"
+    foreach ($name in ($Bundles.Keys | Sort-Object)) {
+        $mark = if ($name -eq "qwen3-4b") { " (default)" } else { "" }
+        Write-Host ("    {0,-15} {1} -> {2}{3}" -f $name, $Bundles[$name].dir, $Bundles[$name].id, $mark)
+    }
+    Write-Host "  -Help, -h       this text. -? shows the full help (Get-Help -Full has more)."
+    Write-Host ""
+    Write-Host "Environment, all optional; a variable that is set wins over the default:"
+    Write-Host "  GENIE_NPU_ROOT      holds bundles\ and qairt\; default:"
+    Write-Host ("                      " + (Join-Path (Split-Path -Parent (Split-Path -Parent $here)) "genie-npu"))
+    Write-Host "  GENIE_BUNDLE_DIR    ONE bundle directory, the one holding genie_config.json"
+    Write-Host "                      (-Model overrides it)"
+    Write-Host "  GENIE_MODEL_ID      the id advertised to clients"
+    Write-Host "  GENIE_SDK_DIR       the QAIRT runtime; default: the newest version under <root>\qairt"
+    Write-Host "  GENIE_HOST          bind address; default 127.0.0.1"
+    Write-Host "  GENIE_PORT          default 8123"
+    Write-Host "  GENIE_PYTHON        a native ARM64 python; default: python on PATH"
+    Write-Host "  GENIE_MAX_RESTARTS, GENIE_RESTART_WINDOW, GENIE_RESTART_COOLDOWN"
+    Write-Host "                      restart cap, its window and the pause; default 5, 3600 s, 25 s"
+    Write-Host ""
+    Write-Host "Docs: docs/GENIE_SERVER.md, and docs/MODEL_OPTIONS.md for the model matrix."
+    exit 0
+}
 # Every GENIE_* var this script WRITES, saved before the first write and put
 # back -- or removed again -- in the finally at the bottom, so an in-shell run
 # leaves the environment exactly as it found it. Two of these can produce a
@@ -182,6 +273,41 @@ foreach ($pair in @(@("GENIE_BUNDLE_DIR", $env:GENIE_BUNDLE_DIR),
         }
         exit 1
     }
+}
+# A directory is not yet a bundle. The check above only proves the path
+# exists, and the likeliest wrong value exists too: the directory ABOVE the
+# bundle. `qai-hub-models fetch ... --extract -o <dir>` puts the bundle in a
+# subdirectory it names itself, so pointing GENIE_BUNDLE_DIR at <dir> -- or at
+# bundles\ -- passed here, and the server then died in load_engine with a bare
+# FileNotFoundError traceback on genie_config.json, after Genie.dll had loaded.
+# Checked here, before python is even looked for, and the fix is named: the
+# subdirectories that DO hold a genie_config.json one level down, which is
+# where a one-level-off path always leaves it.
+$bundleConfig = Join-Path $env:GENIE_BUNDLE_DIR "genie_config.json"
+if (-not (Test-Path -LiteralPath $bundleConfig -PathType Leaf)) {
+    $nested = @(Get-ChildItem -LiteralPath $env:GENIE_BUNDLE_DIR -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "genie_config.json") -PathType Leaf })
+    Write-Host ""
+    Write-Host "[run] GENIE_BUNDLE_DIR has no genie_config.json: $($env:GENIE_BUNDLE_DIR)"
+    Write-Host "      It must be ONE bundle directory -- the one holding genie_config.json, the"
+    Write-Host "      part*_of_*.bin context binaries and tokenizer.json -- not a directory above it."
+    if ($nested.Count -gt 0) {
+        Write-Host "      One level down, these hold one:"
+        foreach ($sub in ($nested | Select-Object -First 5)) { Write-Host "        $($sub.FullName)" }
+        if ($modelExplicit) {
+            # -Model rewrites GENIE_BUNDLE_DIR every run (see above), so
+            # "point it elsewhere" is advice the next run would undo.
+            Write-Host "      -Model $Model always serves <root>\bundles\$DefaultBundle itself: move"
+            Write-Host "      the nested bundle's files up one level into it, or drop -Model and set"
+            Write-Host "      GENIE_BUNDLE_DIR (plus GENIE_MODEL_ID) to the directory listed."
+        } else {
+            Write-Host "      Set GENIE_BUNDLE_DIR to the one you mean."
+        }
+    } else {
+        Write-Host "      No directory one level down holds one either: the bundle is missing or"
+        Write-Host "      was unpacked somewhere else. See docs/GENIE_SERVER.md."
+    }
+    exit 1
 }
 $env:GENIE_SDK_DIR = $sdkDir
 $bindHost = if ($env:GENIE_HOST) { $env:GENIE_HOST } else { "127.0.0.1" }
@@ -412,14 +538,33 @@ while ($true) {
         # of which kind happened to come last.
         $kinds = @($failures | ForEach-Object { $_.kind } | Sort-Object -Unique)
         $summary = if ($kinds.Count -gt 1) { "crashed and wedged" } else { $kinds[0] }
+        # The reset advice leads with its blast radius. Restarting the Hexagon
+        # node (or rebooting) resets the NPU under EVERY process on the
+        # machine, and on a box shared with other sessions that is someone
+        # else's server or benchmark dying mid-run -- the message used to hand
+        # out the pnputil line with no word of that. This server has already
+        # exited by now, so anything tasklist lists is another process.
+        # tasklist rather than Get-Process .Modules: it is one pasteable line,
+        # and it skips a process it cannot open instead of throwing on it.
+        # The "verified" note is scoped to what was actually verified: the
+        # restart cured the interrupt-delivery crawl (docs/MODEL_OPTIONS.md),
+        # which never reaches this branch -- it emits a token every ~3 s, so
+        # it trips neither stall limit. It is untested on a wedge or a crash.
         Write-Host "[run] the engine $summary $restarts times within ${window}s."
         Write-Host "[run] Giving up rather than looping on a sick device. The HTP may"
-        Write-Host "[run] need a reset before this comes back: from an elevated"
-        Write-Host "[run] PowerShell,  pnputil /restart-device ""ACPI\QCOM0D0A\2&DABA3FF&0"""
+        Write-Host "[run] need a reset before this comes back -- and a reset is MACHINE-WIDE:"
+        Write-Host "[run] restarting the Hexagon device (or rebooting) resets the NPU under EVERY"
+        Write-Host "[run] process on this box, another session's server or benchmark included."
+        Write-Host "[run] Check first that nothing else is using it:  tasklist /m QnnHtp.dll"
+        Write-Host "[run] (this server has exited, so every process listed is someone else's --"
+        Write-Host "[run] run it from the elevated shell to see them all) and warn whoever owns"
+        Write-Host "[run] them. Then, from an elevated PowerShell:"
+        Write-Host "[run]   pnputil /restart-device ""ACPI\QCOM0D0A\2&DABA3FF&0"""
         Write-Host "[run] -- that instance id is the DEV BOX's Hexagon NPU node and is per"
         Write-Host "[run] machine; on another box take yours from"
-        Write-Host "[run] Get-PnpDevice -FriendlyName '*Hexagon*'. (Verified fix for the"
-        Write-Host "[run] interrupt-delivery crawl -- see docs/MODEL_OPTIONS.md), or reboot."
+        Write-Host "[run] Get-PnpDevice -FriendlyName '*Hexagon*'. The restart is verified only"
+        Write-Host "[run] against the interrupt-delivery crawl (docs/MODEL_OPTIONS.md), not against"
+        Write-Host "[run] a wedge or a crash; a reboot is the other way back."
         Write-Host "[run] Raise GENIE_MAX_RESTARTS (or shorten GENIE_RESTART_WINDOW) to retry more."
         exit 75
     }

@@ -14,6 +14,8 @@ replaced INSIDE the module under test by the World below, the two port
 helpers are stubbed where a test is not about them, and the HTTP layer is
 either bench_endpoint.post_timed stubbed whole or a stubbed urlopen under the
 real one. The tokenizer is a word counter, which is all the arithmetic needs.
+The box's process table is the World's too, made up per test: no test lists
+or bakes in the processes of the machine it runs on.
 """
 
 import importlib.util
@@ -119,6 +121,11 @@ class World:
         self.posts = []             # (base, payload) per request
         self.post_hook = None       # may raise, or return a (body, wall) to use
         self.tokenizer_loads = []
+        # The box's OTHER processes, as list_processes would return them --
+        # made up per test, never a real scan. None is a listing that failed.
+        # This run's own children are added by _popen as they launch.
+        self.processes = []
+        self.process_listings = 0
         self.bundle = tmp_path / "bundle"
         self.bundle.mkdir()
         (self.bundle / "genie_config.json").write_text(
@@ -136,14 +143,27 @@ class World:
             Popen=self._popen, run=self._run, STDOUT=subprocess.STDOUT,
             DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired)
         self.time = types.SimpleNamespace(time=lambda: self.now, sleep=self._sleep,
-                                          strftime=self._strftime)
+                                          strftime=self._strftime,
+                                          gmtime=lambda *a: None)
 
     def _sleep(self, secs):
         self.slept.append(secs)
         self.now += secs
 
-    def _strftime(self, _fmt):
-        return "2026-09-16 12:%02d:%02d" % divmod(int(self.now - 1000.0), 60)
+    def _strftime(self, fmt, _t=None):
+        mm, ss = divmod(int(self.now - 1000.0), 60)
+        if fmt == "%Y%m%dT%H%M%SZ":     # the fallback file's stamp: a file name
+            return "20260916T12%02d%02dZ" % (mm, ss)
+        return "2026-09-16 12:%02d:%02d" % (mm, ss)
+
+    def list_processes(self):
+        self.process_listings += 1
+        if self.processes is None:
+            return None
+        ours = [{"pid": p.pid, "ppid": 999, "name": os.path.basename(p.cmd[0]),
+                 "cmdline": " ".join(p.cmd)}
+                for p in self.launched if p.returncode is None]
+        return [dict(p) for p in self.processes] + ours
 
     def _popen(self, cmd, stdout=None, stderr=None, **kw):
         if self.popen_error is not None:
@@ -210,6 +230,7 @@ def world(bs, monkeypatch, tmp_path):
     monkeypatch.setattr(bs, "port_open", lambda port: port in w.listening)
     monkeypatch.setattr(bs, "port_owner", lambda port: w.owners.get(port))
     monkeypatch.setattr(bs, "load_tokenizer", w.load_tokenizer)
+    monkeypatch.setattr(bs, "list_processes", w.list_processes)
     monkeypatch.setattr(bs.be, "post_timed", w.post)
     monkeypatch.setattr(bs, "BUNDLE_DIR", str(w.bundle))
     monkeypatch.setattr(bs, "SDK_DIR", str(w.sdk))
@@ -1566,3 +1587,345 @@ def test_a_depth_only_one_arm_measured_gets_no_verdict_at_all(
     closing = _closing(capsys)
     assert "geniex  no data" in closing
     assert "ranges" not in closing
+
+
+# --- the results file at the END of the sweep --------------------------------
+# The startup refusal only sees what is there when the run begins. A file that
+# appeared during the twenty minutes -- another run writing the same default
+# sweep-results.json -- was overwritten without a word, and an OSError at the
+# write was a traceback with no record anywhere. bench_contention._write_record
+# already had the shape these pin: never over a file it was not given, a
+# timestamped file beside it instead, where it went on the screen, exit 1.
+
+FALLBACK_GLOB = "sweep.2026*.json"
+
+
+def _someone_writes_out(world, text, on_post=1):
+    """A post_hook: on the `on_post`-th request, another writer puts `text` at --out."""
+    count = []
+
+    def hook(base, payload):
+        count.append(1)
+        if len(count) == on_post:
+            world.out.write_text(text, encoding="utf-8")
+    world.post_hook = hook
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_a_file_that_appears_during_the_sweep_is_not_overwritten(
+        bs, world, monkeypatch, capsys, force):
+    # --force is consent to replace what was there at the START; nothing was.
+    _someone_writes_out(world, "other-session-results")
+    argv = ["--passes", "1", "--depths", "250"] + (["--force"] if force else [])
+    assert _main(bs, monkeypatch, world, *argv) == 1, \
+        "a complete sweep whose record is not at --out is not a clean exit"
+    assert world.out.read_text(encoding="utf-8") == "other-session-results"
+    fallbacks = list(world.out.parent.glob(FALLBACK_GLOB))
+    assert len(fallbacks) == 1, "the record went beside it, once"
+    got = json.loads(fallbacks[0].read_text(encoding="utf-8"))
+    assert got["tool"] == "bench_servers" and got["outcome"] == "complete"
+    assert len(got["rows"]) == 2
+    out = capsys.readouterr().out
+    assert "appeared during the sweep" in out and "NOT overwritten" in out
+    assert "wrote %s" % fallbacks[0] in out, "where it went, in the line that says so"
+
+
+def test_force_leaves_alone_a_file_replaced_during_the_sweep(bs, world, monkeypatch, capsys):
+    world.out.write_text("stale", encoding="utf-8")
+    _someone_writes_out(world, "a newer run's results, not the stale file")
+    assert _main(bs, monkeypatch, world, "--passes", "1", "--depths", "250", "--force") == 1
+    assert world.out.read_text(encoding="utf-8") == "a newer run's results, not the stale file"
+    assert len(list(world.out.parent.glob(FALLBACK_GLOB))) == 1
+    assert "was replaced during the sweep" in capsys.readouterr().out
+
+
+def test_force_still_replaces_the_file_it_was_given_and_nothing_else(bs, world, monkeypatch):
+    world.out.write_text("stale", encoding="utf-8")
+    assert _main(bs, monkeypatch, world, "--passes", "1", "--depths", "250", "--force") == 0
+    assert _result(world)["tool"] == "bench_servers"
+    assert list(world.out.parent.glob(FALLBACK_GLOB)) == []
+
+
+def test_an_out_that_became_a_directory_falls_back_without_a_traceback(
+        bs, world, monkeypatch, capsys):
+    # The refuter's run 3: PermissionError out of the write, no record at all.
+    count = []
+
+    def hook(base, payload):
+        count.append(1)
+        if len(count) == 1:
+            world.out.mkdir()
+    world.post_hook = hook
+    assert _main(bs, monkeypatch, world, "--passes", "1", "--depths", "250") == 1
+    fallbacks = list(world.out.parent.glob(FALLBACK_GLOB))
+    assert len(fallbacks) == 1
+    assert json.loads(fallbacks[0].read_text(encoding="utf-8"))["tool"] == "bench_servers"
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def _failing_dump(bs, monkeypatch, fail):
+    """_dump_json that raises for any path `fail` says so for."""
+    real = bs._dump_json
+
+    def dump(path, record, mode):
+        if fail(path):
+            raise PermissionError(13, "Permission denied", path)
+        return real(path, record, mode)
+    monkeypatch.setattr(bs, "_dump_json", dump)
+
+
+def test_an_oserror_writing_out_falls_back_and_says_why(bs, world, monkeypatch, capsys):
+    _failing_dump(bs, monkeypatch, lambda path: path == str(world.out))
+    assert _main(bs, monkeypatch, world, "--passes", "1", "--depths", "250") == 1
+    assert not world.out.exists()
+    fallbacks = list(world.out.parent.glob(FALLBACK_GLOB))
+    assert len(fallbacks) == 1
+    out = capsys.readouterr().out
+    assert "could not be written" in out and "Permission denied" in out
+    assert str(fallbacks[0]) in out
+
+
+def test_when_the_fallback_fails_too_the_run_says_the_numbers_are_only_on_screen(
+        bs, world, monkeypatch, capsys):
+    _failing_dump(bs, monkeypatch, lambda path: True)
+    assert _main(bs, monkeypatch, world, "--passes", "1", "--depths", "250") == 1
+    out = capsys.readouterr().out
+    assert "failed too" in out and "only in the terminal" in out
+    assert "\nwrote " not in out, "no claim of a file that was not written"
+
+
+def test_a_file_appearing_between_the_check_and_the_open_is_not_overwritten(
+        bs, world, monkeypatch):
+    # The check says "nothing there" and the file lands before the open: the
+    # exclusive create is what catches it, not the check.
+    world.out.write_text("landed in the gap", encoding="utf-8")
+    monkeypatch.setattr(bs, "out_state", lambda path: None)
+    written, note = bs.write_results(str(world.out), {"tool": "bench_servers"}, None)
+    assert world.out.read_text(encoding="utf-8") == "landed in the gap"
+    assert written != str(world.out) and "NOT overwritten" in note
+    with open(written, encoding="utf-8") as f:
+        assert json.load(f) == {"tool": "bench_servers"}
+
+
+def test_the_fallback_never_replaces_a_file_either(bs, world, monkeypatch):
+    # Two runs falling back in the same second: the second one's fallback is
+    # created exclusively too, so it fails loudly rather than replacing.
+    world.out.write_text("someone's", encoding="utf-8")
+    monkeypatch.setattr(bs, "_timestamped_beside", lambda path: path + ".fallback")
+    (world.out.parent / "sweep.json.fallback").write_text("first fallback", encoding="utf-8")
+    written, note = bs.write_results(str(world.out), {"x": 1}, None)
+    assert written is None and "failed too" in note
+    assert (world.out.parent / "sweep.json.fallback").read_text(encoding="utf-8") == "first fallback"
+
+
+def test_an_out_that_is_a_directory_is_refused_at_startup_even_with_force(
+        bs, world, monkeypatch):
+    world.out.mkdir()
+    with pytest.raises(SystemExit) as e:
+        _main(bs, monkeypatch, world, "--force")
+    assert "is a directory" in str(e.value) and str(world.out) in str(e.value)
+    assert world.launched == [] and world.tokenizer_loads == []
+
+
+# --- other NPU servers on the box, on ANY port -------------------------------
+# foreign_listener looks at this run's two ports only. A genie_server on 8124,
+# a GenieAPIService on 8910 or a geniex on any port but 18181 went unseen, and
+# the sweep loaded a second ~3 GB bundle onto the Hexagon beside it. Every
+# process table here is made up; none is a scan of a real box.
+
+BS = chr(92)
+
+
+def _win(*parts):
+    return BS.join(parts)
+
+
+PY = _win("C:", "Python312", "python.exe")
+GENIE_SERVER_CMD = '"%s" %s' % (PY, _win("C:", "work", "repo", "src", "genie_server.py"))
+RUN_PATH_CMD = "python -c \"import runpy; runpy.run_path('src/genie_server.py')\""
+
+
+def _proc(pid, name, cmdline="", ppid=1):
+    return {"pid": pid, "ppid": ppid, "name": name, "cmdline": cmdline}
+
+
+@pytest.mark.parametrize("name, cmdline, kind", [
+    ("python.exe", GENIE_SERVER_CMD, "genie_server"),
+    ("python.exe", "python src/genie_server.py", "genie_server"),
+    ("python3.12.exe", "python3.12 -u -X utf8 src/genie_server.py", "genie_server"),
+    ("pythonw.exe", '"%s" "%s"' % (PY, _win("C:", "My Repo", "src", "genie_server.py")),
+     "genie_server"),
+    ("geniex.exe", '"%s" serve --host 127.0.0.1:18199' % _win("C:", "GenieX CLI", "geniex.exe"),
+     "geniex"),
+    ("GENIEX.EXE", "", "geniex"),
+    ("GenieAPIService.exe", "GenieAPIService.exe -c config.json", "GenieAPIService"),
+    # A server run through a module that runs the script it is handed.
+    ("python.exe", "python -m pdb src/genie_server.py", "genie_server"),
+    ("python.exe", "python -m cProfile -o out.prof src/genie_server.py", "genie_server"),
+    # Not servers: the command line only MENTIONS genie_server.
+    ("python.exe", "python -m pytest tests/test_startup.py -k genie_server", None),
+    ("python.exe", "python -m genie_server", None),
+    ("python.exe", RUN_PATH_CMD, None),
+    ("python.exe", 'python -c "import sys; print(sys.argv)" src/genie_server.py', None),
+    ("python.exe", "python", None),                     # a REPL
+    ("bash.exe", 'bash -c "python src/genie_server.py"', None),
+    ("python.exe", "python src/bench_servers.py --ours-port 8200", None),
+    ("py.exe", "py -3 src/genie_server.py", None),       # its python child is the one
+    # An unterminated quote runs to the end of the line, as Windows reads it.
+    ("python.exe", 'python "C:/my repo/src/genie_server.py', "genie_server"),
+    # An apostrophe is part of a path, not a quote (shlex took it for one):
+    # read as a quote, the two below join into one argument ending log.txt.
+    ("python.exe", "python %s --log %s" % (
+        _win("C:", "Users", "O'Brien", "src", "genie_server.py"),
+        _win("C:", "Users", "O'Brien", "log.txt")), "genie_server"),
+    ("explorer.exe", "", None),
+])
+def test_npu_server_kind_goes_by_image_and_script_not_by_words(bs, name, cmdline, kind):
+    assert bs.npu_server_kind(name, cmdline) == kind
+
+
+def test_a_geniex_under_another_file_name_is_still_geniex(bs):
+    exe = _win("C:", "tools", "geniex-0.5.exe")
+    assert bs.npu_server_kind("geniex-0.5.exe", exe + " serve", geniex=exe) == "geniex"
+    assert bs.npu_server_kind("geniex-0.5.exe", exe + " serve") is None
+
+
+def test_other_npu_servers_leaves_out_this_run_and_everything_below_it(bs):
+    procs = [
+        _proc(100, "python.exe", "python src/bench_servers.py"),        # this run
+        _proc(4000, "python.exe", "python src/genie_server.py", ppid=100),
+        _proc(4001, "geniex.exe", "geniex serve", ppid=4000),           # its child
+        _proc(4500, "python.exe", "python src/genie_server.py", ppid=4400),  # orphan of 4400
+        _proc(6100, "python.exe", GENIE_SERVER_CMD, ppid=1),
+        _proc(5150, "GenieAPIService.exe", "GenieAPIService.exe", ppid=6100),
+        _proc(7000, "notepad.exe", "notepad", ppid=1),
+    ]
+    found = bs.other_npu_servers(procs, {100, 4400})
+    assert [(p["pid"], p["kind"]) for p in found] == [(5150, "GenieAPIService"),
+                                                     (6100, "genie_server")]
+
+
+def test_a_parent_loop_in_the_table_does_not_hang_the_walk(bs):
+    procs = [_proc(1, "geniex.exe", ppid=2), _proc(2, "explorer.exe", ppid=1)]
+    assert [p["pid"] for p in bs.other_npu_servers(procs, {99})] == [1]
+
+
+def _stub_listing(bs, monkeypatch, stdout="", returncode=0, platform="win32", raises=None):
+    ran = []
+
+    def run(cmd, **kw):
+        ran.append(cmd)
+        if raises is not None:
+            raise raises
+        return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+    monkeypatch.setattr(bs, "subprocess", types.SimpleNamespace(
+        run=run, TimeoutExpired=subprocess.TimeoutExpired))
+    monkeypatch.setattr(bs, "sys", types.SimpleNamespace(platform=platform))
+    return ran
+
+
+def test_list_processes_reads_the_cim_table_and_stops_nothing(bs, monkeypatch):
+    rows = [{"ProcessId": 6100, "ParentProcessId": 1, "Name": "python.exe",
+             "CommandLine": GENIE_SERVER_CMD},
+            {"ProcessId": 4, "ParentProcessId": None, "Name": "System", "CommandLine": None}]
+    ran = _stub_listing(bs, monkeypatch, stdout=json.dumps(rows))
+    assert bs.list_processes() == [
+        {"pid": 6100, "ppid": 1, "name": "python.exe", "cmdline": GENIE_SERVER_CMD},
+        {"pid": 4, "ppid": 0, "name": "System", "cmdline": ""}]
+    script = " ".join(ran[0])
+    assert "Get-CimInstance" in script and "Win32_Process" in script
+    assert "Stop-Process" not in script and "taskkill" not in script
+
+
+def test_list_processes_takes_a_one_process_table_as_a_list(bs, monkeypatch):
+    one = {"ProcessId": 7, "ParentProcessId": 1, "Name": "geniex.exe", "CommandLine": "g"}
+    _stub_listing(bs, monkeypatch, stdout=json.dumps(one))
+    assert [p["pid"] for p in bs.list_processes()] == [7]
+
+
+@pytest.mark.parametrize("how", [
+    {"stdout": "not json"},
+    {"stdout": "", "returncode": 1},
+    {"raises": subprocess.TimeoutExpired("powershell.exe", 60)},
+    {"raises": FileNotFoundError(2, "no powershell")},
+])
+def test_list_processes_is_none_when_it_could_not_look(bs, monkeypatch, how):
+    _stub_listing(bs, monkeypatch, **how)
+    assert bs.list_processes() is None
+
+
+def test_list_processes_is_none_off_windows_without_running_anything(bs, monkeypatch):
+    ran = _stub_listing(bs, monkeypatch, platform="linux")
+    assert bs.list_processes() is None and ran == []
+
+
+def test_main_refuses_another_npu_server_on_another_port_before_any_launch(
+        bs, world, monkeypatch):
+    world.processes = [_proc(6100, "python.exe", GENIE_SERVER_CMD),
+                       _proc(6200, "geniex.exe", "geniex.exe serve --host 127.0.0.1:18199")]
+    with pytest.raises(SystemExit) as e:
+        _main(bs, monkeypatch, world)
+    said = str(e.value)
+    assert said.startswith("NOT starting")
+    assert "pid 6100" in said and "genie_server" in said
+    assert "pid 6200" in said and "geniex" in said
+    assert "--allow-other-npu-servers" in said, "the deliberate way on"
+    assert world.launched == [], "no bundle loaded beside them"
+    assert world.kills() == [], "and nothing of theirs touched"
+    assert not world.out.exists()
+
+
+def test_another_npu_server_that_appears_mid_sweep_ends_it_as_refused(
+        bs, world, monkeypatch, capsys):
+    def someone_starts_one(base, payload):
+        if not world.processes:
+            world.processes.append(_proc(5150, "GenieAPIService.exe", "GenieAPIService.exe"))
+    world.post_hook = someone_starts_one
+    assert _main(bs, monkeypatch, world, "--passes", "1", "--depths", "250") == 1
+    assert len(world.launched) == 1, "the second arm was never loaded beside it"
+    got = _result(world)
+    assert got["outcome"].startswith("refused:")
+    assert "5150" in got["outcome"] and "GenieAPIService" in got["outcome"]
+    assert [r["arm"] for r in got["rows"]] == ["ours"], "what was measured is kept"
+    assert world.kills() == [["taskkill", "/PID", str(world.launched[0].pid), "/T", "/F"]]
+
+
+def test_the_flag_runs_beside_them_and_the_file_lists_who_was_there(
+        bs, world, monkeypatch, capsys):
+    world.processes = [_proc(6200, "geniex.exe", "geniex.exe serve --host 127.0.0.1:18199")]
+    assert _main(bs, monkeypatch, world, "--passes", "1", "--depths", "250",
+                 "--allow-other-npu-servers") == 0
+    assert len(world.launched) == 2
+    assert "WARNING: running beside 1 other NPU server" in capsys.readouterr().out
+    other = _result(world)["other_npu_servers"]
+    assert other["allowed"] is True and other["unscanned_runs"] == []
+    assert [(p["pid"], p["kind"], p["run"]) for p in other["seen"]] == [
+        (6200, "geniex", 0), (6200, "geniex", 1), (6200, "geniex", 2)]
+
+
+def test_this_runs_own_leftovers_are_not_taken_for_someone_elses(bs, world, monkeypatch):
+    # A grandchild of the `ours` arm (a venv launcher's python child, say)
+    # that outlived the tree kill still descends from a pid this run started.
+    def leftover(base, payload):
+        if not world.processes:
+            world.processes.append(_proc(4999, "python.exe", "python src/genie_server.py",
+                                         ppid=world.launched[0].pid))
+    world.post_hook = leftover
+    assert _main(bs, monkeypatch, world, "--passes", "1", "--depths", "250") == 0
+    assert _result(world)["outcome"] == "complete"
+
+
+def test_a_process_listing_that_fails_is_said_and_recorded_not_taken_for_none(
+        bs, world, monkeypatch, capsys):
+    world.processes = None
+    assert _main(bs, monkeypatch, world, "--passes", "1", "--depths", "250") == 0
+    assert "were NOT looked for" in capsys.readouterr().out
+    assert _result(world)["other_npu_servers"]["unscanned_runs"] == [0, 1, 2]
+
+
+def test_a_clean_box_is_looked_at_before_every_start_and_recorded_as_such(
+        bs, world, monkeypatch):
+    assert _main(bs, monkeypatch, world, "--passes", "1", "--depths", "250") == 0
+    assert world.process_listings == 3, "at startup and before each of the two starts"
+    assert _result(world)["other_npu_servers"] == {
+        "allowed": False, "seen": [], "unscanned_runs": []}

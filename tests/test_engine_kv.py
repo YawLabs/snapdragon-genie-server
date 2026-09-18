@@ -569,7 +569,7 @@ def test_a_rejected_stop_sequence_set_fails_the_request_visibly(eng, gs):
     # Both callers used to discard the status: a rejected set ran the
     # generation without the stops the caller asked for, silently.
     eng.lib.stop_status = -8
-    with pytest.raises(RuntimeError, match="setStopSequence failed, status=-8"):
+    with pytest.raises(RuntimeError, match=r"setStopSequence failed, status=-8 \(ERROR_JSON_SCHEMA\)"):
         run(eng, stop=["X"])
     assert eng.lib.queries == 0, "no generation without the caller's stops"
     assert eng._stop_dirty is False
@@ -602,7 +602,7 @@ def test_a_rejected_reset_does_not_prefill_onto_the_last_conversation(eng, gs):
     eng.lib.chunks = ["hello"]
     run(eng, "USER: hi\n")
     eng.lib.reset_status = -1
-    with pytest.raises(RuntimeError, match="GenieDialog_reset failed, status=-1"):
+    with pytest.raises(RuntimeError, match=r"GenieDialog_reset failed, status=-1 \(ERROR_GENERAL\)"):
         run(eng, "USER: something else\n")
     assert eng.lib.queries == 1, "no generation onto a KV that was not cleared"
     assert eng._committed is None, "and nothing is recorded as resident"
@@ -618,7 +618,7 @@ def test_a_rejected_token_cap_does_not_run_under_the_last_requests_cap(eng, gs):
     run(eng, "USER: hi\n", max_tokens=8)
     eng.lib.max_status = -1
     with pytest.raises(RuntimeError,
-                       match=r"setMaxNumTokens\(64\) failed, status=-1"):
+                       match=r"setMaxNumTokens\(64\) failed, status=-1 \(ERROR_GENERAL\)"):
         run(eng, "USER: and now a long one\n", max_tokens=64)
     assert eng.lib.queries == 1, "no generation under a cap nobody chose"
     assert eng._committed is None
@@ -1070,6 +1070,94 @@ def test_a_stream_consumed_to_the_end_sends_no_abort(eng):
     list(eng.query_stream("p", res))
     assert res["finish"] == "stop"
     assert eng.lib.signals == []
+
+
+# --- who cut the turn short: the stream says when it was the SERVER ---------
+# _finish reports ABORTED as "stop", and a server abort -- shutdown, or the
+# watchdog on a stall -- reached the client as exactly that: a fragment
+# labelled as a finished answer. query_stream now says who aborted it, and
+# Handler._run turns that into an error (test_finish_reason drives the
+# response paths). A client's own abort must not be dressed up the same way.
+
+def test_a_turn_shutdown_aborted_is_reported_as_the_servers_abort(eng, gs):
+    eng.lib.chunks = ["hello"]
+    eng.lib.status = 1                          # ABORTED, as Genie returns it
+    eng.lib.on_query = eng.begin_shutdown       # Ctrl-C lands mid-decode
+    res = {}
+    assert list(eng.query_stream("p", res)) == ["hello"]
+    assert res["aborted_by"] == "shutdown" and res["finish"] == "stop"
+    assert res["error"] == gs.SERVER_ABORTS["shutdown"]
+    assert "closing" not in res, "not the queued turn refused at the door"
+    assert eng.lib.signals == [ABORT]
+
+
+def test_a_turn_the_watchdog_aborted_is_reported_as_the_servers_abort(eng, gs):
+    eng.lib.chunks = ["hello"]
+    eng.lib.status = 1
+    eng.lib.on_query = lambda: eng.signal_abort(any_turn=True, stalled=True)
+    res = {}
+    list(eng.query_stream("p", res))
+    assert res["aborted_by"] == "watchdog"
+    assert res["error"] == gs.SERVER_ABORTS["watchdog"]
+
+
+def test_a_stall_abort_that_landed_as_the_query_finished_is_still_reported(eng, gs):
+    # SUCCESS after the abort: whether the generation was cut cannot be told
+    # (the KV record drops it for the same reason), so the client is not told
+    # it is whole either.
+    eng.lib.chunks = ["hello"]
+    eng.lib.on_query = lambda: eng.signal_abort(any_turn=True, stalled=True)
+    res = {}
+    list(eng.query_stream("p", res))
+    assert res["aborted_by"] == "watchdog"
+
+
+def test_a_consumers_own_abort_is_not_the_servers(eng, gs):
+    # A client leaving aborts its turn through the consumer's bare
+    # signal_abort. That is not the server cutting an answer short -- the
+    # handler returns on `em.gone` without answering -- so nothing here may
+    # read as one.
+    eng.lib.chunks = ["hello", "world"]
+    eng.lib.status = 1
+    signalled = threading.Event()
+    real_signal = eng.lib.GenieDialog_signal
+
+    def signal(dialog, action):
+        signalled.set()
+        return real_signal(dialog, action)
+    eng.lib.GenieDialog_signal = signal
+    # Held inside the query until the consumer's abort arrives, so it lands
+    # on a live query rather than on a turn that has already returned.
+    eng.lib.on_query = lambda: signalled.wait(timeout=5)
+    got, res = [], {}
+    for chunk in eng.query_stream("p", res):
+        got.append(chunk)
+        if len(got) == 1:
+            eng.signal_abort()                  # MINE, from the consumer
+    assert eng.lib.signals == [ABORT]
+    assert "aborted_by" not in res and "error" not in res
+    assert res["finish"] == "stop"
+
+
+def test_a_turn_marked_for_shutdown_that_finished_first_is_whole(eng, gs):
+    # The mark alone decides nothing: begin_shutdown marks the live turn and
+    # then aborts it, and a turn that ends between the two was not cut.
+    eng.lib.chunks = ["hello"]
+
+    def mark_only():
+        with eng._abort_lock:
+            eng._live.shutdown = True
+    eng.lib.on_query = mark_only
+    res = {}
+    list(eng.query_stream("p", res))
+    assert "aborted_by" not in res and "error" not in res
+    assert res["finish"] == "stop"
+
+
+def test_begin_shutdown_marks_only_the_turn_it_aborts(eng, gs):
+    # No live turn: nothing to mark, nothing signalled.
+    assert eng.begin_shutdown() is False
+    assert eng._closing is True
 
 
 def test_a_signal_that_faults_in_the_driver_does_not_escape_the_abort(eng, gs):

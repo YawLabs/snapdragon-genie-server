@@ -24,6 +24,10 @@ models/
 # yourself. Ignored anyway, because the repo has no CI to collect them and a
 # local run should not leave something for `git add -A` to sweep in.
 .coverage
+# Per-process data files: tests that start a subprocess under coverage write
+# `.coverage.<host>.pid<N>.<random>` beside the main file, and `.coverage`
+# alone does not match them.
+.coverage.*
 htmlcov/
 
 # logs / scratch
@@ -33,6 +37,9 @@ htmlcov/
 # raw measurements into the repo. (Its per-arm logs, bench_servers-<arm>.log,
 # are covered by *.log above.)
 sweep-results.json
+# ...and its fallback record, written beside --out as sweep-results.<UTC
+# stamp>.json when --out cannot be written or appeared during the sweep.
+sweep-results.*.json
 
 # staging for a Hugging Face model release -- deliberately untracked, so a
 # `git add -A` cannot sweep an unpublished model card into this repo

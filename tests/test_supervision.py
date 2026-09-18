@@ -15,6 +15,12 @@ separates the two is not elapsed time but whether tokens are still arriving.
 Clocks are passed in rather than read, so nothing here sleeps.
 """
 
+import os
+import shutil
+import subprocess
+import sys
+import time
+
 import pytest
 
 from conftest import request
@@ -213,6 +219,102 @@ def test_health_503s_when_the_engine_cannot_serve(gs, handler):
     assert code == 503
     assert body["status"] == "wedged"
     assert body["detail"], "503 without a reason is not actionable"
+
+
+# --- admission while /health says the engine cannot serve -----------------
+# /health already said wedged while generation requests were still admitted
+# to park behind the stuck turn's engine lock -- until the process exited, or
+# forever under GENIE_WEDGE_EXIT=0 -- and once the permits were gone the rest
+# were told "server busy". The client was never told what the server knew.
+
+MSGS = [{"role": "user", "content": "hi"}]
+
+
+def _make_state(gs, monkeypatch, state):
+    """Put the module's HEALTH into `state` at a pinned 'now' of 10_000."""
+    monkeypatch.setattr(gs.time, "time", lambda: 10_000)
+    if state == "wedged":
+        gs.HEALTH.begin(0)
+        gs.HEALTH.note_stall_signalled(1)
+    elif state == "stalled":
+        gs.HEALTH.begin(9_000)
+    elif state == "failing":
+        for _ in range(gs.HEALTH.fail_threshold):
+            gs.HEALTH.begin(9_999)
+            gs.HEALTH.end(False)
+    assert gs.HEALTH.assess(10_000)[0] == state
+
+
+@pytest.mark.parametrize("state", ["stalled", "wedged"])
+@pytest.mark.parametrize("path,body", [
+    ("/v1/chat/completions", {"messages": MSGS}),
+    ("/v1/chat/completions", {"messages": MSGS, "stream": True}),
+    ("/v1/messages", {"messages": MSGS, "max_tokens": 16}),
+    ("/v1/messages", {"messages": MSGS, "max_tokens": 16, "stream": True}),
+])
+def test_a_request_is_refused_503_while_health_says_the_engine_cannot_serve(
+        gs, handler, monkeypatch, state, path, body):
+    _make_state(gs, monkeypatch, state)
+    code, resp, _h = request(gs, handler, "POST", path, body)
+    assert code == 503, "the code /health answers in the same state"
+    if path == "/v1/messages":
+        assert resp["type"] == "error" and resp["error"]["type"] == "api_error"
+        msg = resp["error"]["message"]
+    else:
+        assert resp["error"]["type"] == "server_error"
+        msg = resp["error"]["message"]
+    assert msg.startswith("engine %s: " % state), "name the state"
+    assert gs.HEALTH.assess(10_000)[1] in msg, "and carry /health's detail"
+    assert "another engine" in msg and "/health" in msg
+    assert gs.ENGINE.calls == [], "never reached the engine"
+    assert gs._INFLIGHT._value == gs.MAX_INFLIGHT, "and never took a permit"
+
+
+def test_the_refusal_names_the_wedge_even_when_every_permit_is_taken(
+        gs, handler, monkeypatch):
+    # The case that used to say "server busy; NPU is single-flight" about an
+    # engine the server already knew was wedged.
+    _make_state(gs, monkeypatch, "wedged")
+    for _ in range(gs.MAX_INFLIGHT):
+        assert gs._INFLIGHT.acquire(blocking=False)
+    try:
+        code, resp, _h = request(gs, handler, "POST", "/v1/chat/completions",
+                                 {"messages": MSGS})
+    finally:
+        for _ in range(gs.MAX_INFLIGHT):
+            gs._INFLIGHT.release()
+    assert code == 503 and "wedged" in resp["error"]["message"]
+    assert "busy" not in resp["error"]["message"]
+
+
+def test_a_failing_engine_still_admits_requests(gs, handler, monkeypatch):
+    # `failing` clears when a generation SUCCEEDS; refusing generations while
+    # it holds would make it permanent.
+    _make_state(gs, monkeypatch, "failing")
+    code, resp, _h = request(gs, handler, "POST", "/v1/chat/completions",
+                             {"messages": MSGS})
+    assert code == 200 and len(gs.ENGINE.calls) == 1
+
+
+def test_an_ok_engine_admits_requests(gs, handler, monkeypatch):
+    monkeypatch.setattr(gs.time, "time", lambda: 10_000)
+    code, _resp, _h = request(gs, handler, "POST", "/v1/messages",
+                              {"messages": MSGS, "max_tokens": 16})
+    assert code == 200 and len(gs.ENGINE.calls) == 1
+
+
+def test_the_admission_check_never_touches_the_engine_lock(gs, handler, monkeypatch):
+    # The stuck thread holds the engine lock during a wedge; a door check that
+    # reached for it would park exactly where the old admission did.
+    _make_state(gs, monkeypatch, "wedged")
+
+    class Untouchable:
+        def __getattribute__(self, name):
+            raise AssertionError("the refusal touched the engine (.%s)" % name)
+    gs.ENGINE = Untouchable()
+    code, _resp, _h = request(gs, handler, "POST", "/v1/chat/completions",
+                              {"messages": MSGS})
+    assert code == 503
 
 
 def test_health_never_touches_the_engine(gs, handler):
@@ -585,11 +687,15 @@ def test_a_wedge_nobody_could_signal_does_not_say_the_abort_was_ignored(H):
 def test_with_exit_disabled_the_watchdog_keeps_watching(gs, capsys, monkeypatch):
     # The stay-up mode the banner advertises. Every other wedge test injects
     # on_wedge, so the production path through _exit_for_supervisor returning
-    # None was never executed. os._exit is patched to RAISE for the duration:
-    # if _exit_for_supervisor ever stopped honouring WEDGE_EXIT, this fails
-    # visibly instead of taking the test runner down with exit 75.
-    monkeypatch.setattr(gs.os, "_exit", lambda code: (_ for _ in ()).throw(
-        AssertionError("os._exit(%d) with GENIE_WEDGE_EXIT=0" % code)))
+    # None was never executed. BOTH ways out are patched to RAISE for the
+    # duration -- _terminate_self, the one _exit_for_supervisor takes, and
+    # os._exit, its fallback: if _exit_for_supervisor ever stopped honouring
+    # WEDGE_EXIT, this fails visibly instead of taking the test runner down
+    # with exit 75.
+    def refuse(code):
+        raise AssertionError("exit(%d) with GENIE_WEDGE_EXIT=0" % code)
+    monkeypatch.setattr(gs, "_terminate_self", refuse)
+    monkeypatch.setattr(gs.os, "_exit", refuse)
     gs.WEDGE_EXIT = False
     health = ScriptedHealth(["wedged"] * 3)
     result = gs.watchdog(FakeEngine(), health, interval=0, iterations=3)
@@ -601,12 +707,120 @@ def test_with_exit_disabled_the_watchdog_keeps_watching(gs, capsys, monkeypatch)
 
 
 def test_with_exit_enabled_the_supervisor_exit_is_what_runs(gs, monkeypatch):
-    # The other branch of the same function, with the exit intercepted.
+    # The other branch of the same function, with the exit intercepted -- at
+    # _terminate_self, the way out it takes, and at os._exit as well, so that
+    # a regression back to os._exit is caught here rather than ending the run.
     codes = []
-    monkeypatch.setattr(gs.os, "_exit", codes.append)
+    monkeypatch.setattr(gs, "_terminate_self", codes.append)
+    monkeypatch.setattr(gs.os, "_exit", lambda code: codes.append(("os._exit", code)))
     gs.WEDGE_EXIT = True
     gs._exit_for_supervisor("detail")
     assert codes == [gs.EXIT_WEDGED]
+
+
+# --- the exit itself: TerminateProcess, not os._exit ------------------------
+# os._exit on Windows is the CRT's _exit, i.e. ExitProcess, which runs
+# DLL_PROCESS_DETACH in every loaded DLL -- Genie.dll, QnnHtp*, libcdsprpc --
+# and a detach that waits on the driver that just wedged hangs the exit, with
+# every other thread (the /health handler included) already gone and the
+# launcher waiting on the child with no timeout. TerminateProcess runs none.
+
+class _K32Fn:
+    def __init__(self, impl):
+        self.impl, self.argtypes, self.restype = impl, None, None
+
+    def __call__(self, *a):
+        return self.impl(*a)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the TerminateProcess path is Windows-only")
+def test_the_exit_is_terminateprocess_with_os_exit_only_behind_it(gs, monkeypatch):
+    seen = []
+
+    class K32:
+        GetCurrentProcess = _K32Fn(lambda: "SELF")
+        # A stand-in that RETURNS, which the real one does not when it is
+        # this process it terminates -- so the fallback behind it shows.
+        TerminateProcess = _K32Fn(lambda h, code: seen.append(("Terminate", h, code)) or 1)
+
+    def windll(name, **kw):
+        assert name == "kernel32", name
+        return K32
+    monkeypatch.setattr(gs.C, "WinDLL", windll)
+    monkeypatch.setattr(gs.os, "_exit", lambda code: seen.append(("os._exit", code)))
+    gs._terminate_self(75)
+    assert seen == [("Terminate", "SELF", 75), ("os._exit", 75)]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the TerminateProcess path is Windows-only")
+def test_the_exit_falls_back_to_os_exit_when_kernel32_is_not_there(gs, monkeypatch):
+    seen = []
+
+    def windll(name, **kw):
+        raise OSError("no kernel32 here")
+    monkeypatch.setattr(gs.C, "WinDLL", windll)
+    monkeypatch.setattr(gs.os, "_exit", seen.append)
+    gs._terminate_self(75)
+    assert seen == [75]
+
+
+def _child_env():
+    return {k: v for k, v in os.environ.items() if not k.startswith("GENIE_")}
+
+
+def test_a_wedge_exit_really_leaves_with_75(gs, tmp_path):
+    # In a real child process, since the real exit ends whatever runs it.
+    src = os.path.dirname(gs.__file__)
+    code = ("import sys; sys.path.insert(0, %r); import genie_server as g; "
+            "g.WEDGE_EXIT = True; print('before', flush=True); "
+            "g._exit_for_supervisor('test'); print('after', flush=True)" % src)
+    r = subprocess.run([sys.executable, "-c", code], env=_child_env(),
+                       cwd=str(tmp_path), capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == gs.EXIT_WEDGED, r.stdout + r.stderr
+    assert "before" in r.stdout and "after" not in r.stdout
+
+
+_SLOW_DETACH_C = """#include <windows.h>
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
+    if (reason == DLL_PROCESS_DETACH) {
+        HANDLE f = CreateFileA("detach_ran.txt", GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, 0, NULL);
+        DWORD n; WriteFile(f, "detach", 6, &n, NULL); CloseHandle(f);
+        Sleep(5000);   /* a detach that waits on a stuck driver */
+    }
+    return TRUE;
+}
+__declspec(dllexport) int ping(void) { return 1; }
+"""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DLL detach is the Windows case")
+@pytest.mark.skipif(shutil.which("clang") is None, reason="needs clang to build a DLL")
+def test_a_wedge_exit_does_not_wait_for_a_dll_detach(gs, tmp_path):
+    # The whole point, measured rather than asserted from the docs: a loaded
+    # DLL whose DLL_PROCESS_DETACH blocks (5s here; a detach waiting on a
+    # wedged driver need never return). os._exit ran it -- 8.02s against the
+    # same DLL in the finding's measurement -- and TerminateProcess does not.
+    (tmp_path / "slow_detach.c").write_text(_SLOW_DETACH_C)
+    build = subprocess.run(["clang", "-shared", "-o", "slow_detach.dll",
+                            "slow_detach.c"], cwd=str(tmp_path),
+                           capture_output=True, text=True, timeout=120)
+    if build.returncode != 0:
+        pytest.skip("clang could not build the DLL: %s" % build.stderr[-300:])
+    src = os.path.dirname(gs.__file__)
+    code = ("import ctypes, os, sys; sys.path.insert(0, %r); "
+            "import genie_server as g; "
+            "ctypes.CDLL(os.path.abspath('slow_detach.dll')).ping(); "
+            "g.WEDGE_EXIT = True; g._exit_for_supervisor('test')" % src)
+    t0 = time.monotonic()
+    r = subprocess.run([sys.executable, "-c", code], env=_child_env(),
+                       cwd=str(tmp_path), capture_output=True, text=True,
+                       timeout=60)
+    took = time.monotonic() - t0
+    assert r.returncode == gs.EXIT_WEDGED, r.stdout + r.stderr
+    assert not (tmp_path / "detach_ran.txt").exists(), "the DLL detach ran"
+    assert took < 3.0, "the exit waited %.1fs for a DLL detach" % took
 
 
 def test_with_exit_disabled_the_wedge_stanza_does_not_promise_a_restart(gs, capsys):

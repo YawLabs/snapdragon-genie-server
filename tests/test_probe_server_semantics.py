@@ -9,10 +9,21 @@ empty completions and "IGNORED" for a base run that never happened.
 The module is imported, not run: its setup (tokenizer, window, argv) lives in
 main() so that importing it has no side effects. That is also why the
 tokenizer-based builder it uses has its own tests in test_prompt_depth.py.
+The command line is covered too -- -h before the bundle is looked for, a BASE
+that is not an http(s) URL refused by name, and a server that is not there
+stopping the run once, with its URL, before any probe. The one subprocess run
+is `--help`, and the one real socket is a loopback port nothing holds; every
+other request is a stubbed urlopen, never whatever serves 8123 or 18181 on the
+box running the suite.
 """
 
+import http.client
 import io
 import json
+import os
+import socket
+import subprocess
+import sys
 import urllib.error
 import urllib.request
 
@@ -291,17 +302,20 @@ class _WordTok:
         return " ".join(ids)
 
 
-def _run_main(monkeypatch, tmp_path, window, argv=("probe",)):
+def _run_main(monkeypatch, tmp_path, window, argv=("probe",), preflight=None):
     bundle = _bundle(tmp_path, {"dialog": {"context": {"size": window}}})
     monkeypatch.setenv("GENIE_BUNDLE_DIR", bundle)
     monkeypatch.setattr(ps, "load_tokenizer", lambda b: _WordTok())
+    # Stubbed, never real: a real preflight would GET whatever holds 8123 or
+    # 18181 on the box running the suite -- another session's server.
+    monkeypatch.setattr(ps, "preflight", lambda base: preflight)
     calls = []
 
     def ask(base, model, cap_key, messages, **kw):
         calls.append((base, model, cap_key, messages, kw))
         return {"text": "ok", "finish": "stop", "usage": None, "wall": 0.0}
     monkeypatch.setattr(ps, "ask", ask)
-    ps.main(list(argv))
+    assert ps.main(list(argv)) == 0
     return calls
 
 
@@ -340,3 +354,172 @@ def test_the_defaults_are_geniex_serve_as_the_docstring_says():
     assert ps.DEFAULT_CAP == "max_completion_tokens"
     assert "[BASE] [MODEL] [CAP]" in ps.__doc__
     assert "8123" in ps.__doc__ and "qwen3-4b-npu" in ps.__doc__
+
+
+# --- the command line: usage, refusals, and a server that is not there ------
+# `--help` was taken as BASE: with GENIE_BUNDLE_DIR unset it printed the env
+# line and exited 1, with it set it ended in a traceback. A dead port cost
+# eight identical refused rows over ~20 s, the URL printed nowhere, exit 0.
+
+def _no_bundle_reads(monkeypatch):
+    """Unset the bundle and make any look at it fail the test loudly."""
+    monkeypatch.delenv("GENIE_BUNDLE_DIR", raising=False)
+
+    def boom(*a, **k):
+        raise AssertionError("the bundle was read")
+    monkeypatch.setattr(ps, "load_tokenizer", boom)
+    monkeypatch.setattr(ps, "read_window", boom)
+    monkeypatch.setattr(ps, "preflight", boom)
+    monkeypatch.setattr(ps, "ask", boom)
+
+
+@pytest.mark.parametrize("argv", [
+    ["probe", "-h"], ["probe", "--help"], ["probe", "/?"],
+    ["probe", "http://127.0.0.1:8123", "--help"],   # asked for after a BASE
+])
+def test_help_prints_the_usage_and_exits_0_before_the_bundle_is_looked_for(
+        monkeypatch, capsys, argv):
+    _no_bundle_reads(monkeypatch)
+    assert ps.main(argv) == 0
+    out = capsys.readouterr().out
+    assert "[BASE] [MODEL] [CAP]" in out
+    for default in (ps.DEFAULT_BASE, ps.DEFAULT_MODEL, ps.DEFAULT_CAP):
+        assert default in out, "each positional's default is in the usage"
+
+
+def test_help_works_from_the_command_line_with_no_bundle_set():
+    # The real entry point, `if __name__ == "__main__"` included: nothing but
+    # the usage is printed and the exit status is 0. Exits before any bundle
+    # read and before any request, so it is safe on a shared box.
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "..", "src", "probe_server_semantics.py")
+    env = {k: v for k, v in os.environ.items() if k != "GENIE_BUNDLE_DIR"}
+    r = subprocess.run([sys.executable, script, "--help"], capture_output=True,
+                       text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert "[BASE] [MODEL] [CAP]" in r.stdout
+    assert "GENIE_BUNDLE_DIR to the bundle" not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("base", [
+    "127.0.0.1:8123", "localhost:8123", "ftp://127.0.0.1:8123",
+    "http://:8123", "http://127.0.0.1:80x",
+])
+def test_a_base_that_is_not_an_http_url_is_refused_by_name(monkeypatch, base):
+    _no_bundle_reads(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        ps.main(["probe", base])
+    assert repr(base) in str(e.value), "the refusal names what it was given"
+
+
+def test_an_http_or_https_base_passes_the_check():
+    for base in ("http://127.0.0.1:8123", "https://example.test", "HTTP://h:1"):
+        assert ps.base_problem(base) is None, base
+
+
+@pytest.mark.parametrize("argv, bad", [
+    (["probe", "--model", "x"], "--model"),          # would have been BASE
+    (["probe", "http://h", "--cap"], "--cap"),       # would have been sent as MODEL
+])
+def test_an_unknown_option_is_refused_not_sent_as_base_or_model(monkeypatch, argv, bad):
+    _no_bundle_reads(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        ps.main(argv)
+    assert "unknown option" in str(e.value) and bad in str(e.value)
+
+
+def test_a_fourth_positional_is_refused_rather_than_dropped(monkeypatch):
+    _no_bundle_reads(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        ps.main(["probe", "http://h", "m", "max_tokens", "extra"])
+    assert "extra" in str(e.value) and "[BASE] [MODEL] [CAP]" in str(e.value)
+
+
+def test_a_dead_server_stops_the_run_once_before_any_probe(monkeypatch, tmp_path, capsys):
+    said = "cannot reach http://127.0.0.1:18181/v1/models (refused) -- nothing was probed"
+    with pytest.raises(SystemExit) as e:
+        _run_main(monkeypatch, tmp_path, 4096, preflight=said)
+    assert str(e.value) == said, "one line, and a non-zero exit"
+    assert "PROBE 1" not in capsys.readouterr().out, "no probe ran"
+
+
+def test_the_output_names_the_server_it_probes(monkeypatch, tmp_path, capsys):
+    _run_main(monkeypatch, tmp_path, 4096,
+              ("probe", "http://127.0.0.1:8123", "qwen3-4b-npu", "max_tokens"))
+    first = capsys.readouterr().out.splitlines()[0]
+    assert "http://127.0.0.1:8123" in first and "qwen3-4b-npu" in first
+    assert "max_tokens" in first
+
+
+def _urlopen_raising(monkeypatch, exc):
+    seen = []
+
+    def urlopen(url, timeout=None):
+        seen.append(url)
+        raise exc
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    return seen
+
+
+def test_preflight_names_the_url_and_the_usual_ports_on_a_refused_connect(monkeypatch):
+    refused = ConnectionRefusedError(10061, "No connection could be made")
+    seen = _urlopen_raising(monkeypatch, urllib.error.URLError(refused))
+    said = ps.preflight("http://127.0.0.1:18181")
+    assert seen == ["http://127.0.0.1:18181/v1/models"]
+    assert "http://127.0.0.1:18181/v1/models" in said
+    assert "Nothing is listening at http://127.0.0.1:18181" in said
+    assert "8123" in said and "18181" in said
+
+
+def test_preflight_stops_on_any_failure_to_connect_but_gives_port_advice_only_on_refusal(
+        monkeypatch):
+    _urlopen_raising(monkeypatch, urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")))
+    said = ps.preflight("http://no-such-host.invalid:8123")
+    assert "http://no-such-host.invalid:8123/v1/models" in said
+    assert "getaddrinfo failed" in said
+    assert "Nothing is listening" not in said
+
+
+@pytest.mark.parametrize("exc", [
+    urllib.error.HTTPError("http://h/v1/models", 404, "Not Found", {}, io.BytesIO(b"")),
+    TimeoutError("timed out"),                      # took the connect, slow to answer
+    ConnectionResetError(10054, "reset"),           # took it, then hung up
+])
+def test_preflight_lets_through_anything_that_took_the_connection(monkeypatch, exc):
+    _urlopen_raising(monkeypatch, exc)
+    assert ps.preflight("http://h") is None
+    _urlopen_raising(monkeypatch, http.client.BadStatusLine("SSH-2.0"))
+    assert ps.preflight("http://h") is None
+
+
+def test_preflight_is_none_when_the_server_answers(monkeypatch):
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda url, timeout=None: _Resp(b'{"data": []}'))
+    assert ps.preflight("http://h") is None
+
+
+def test_preflight_against_a_closed_loopback_port_is_a_named_refusal():
+    # A real connect, to a port that was just bound and released, so nothing
+    # holds it: what urllib actually raises there is what the check keys on.
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    base = "http://127.0.0.1:%d" % port
+    said = ps.preflight(base, timeout=10)
+    assert said is not None
+    assert "%s/v1/models" % base in said
+    assert "Nothing is listening at %s" % base in said
+
+
+@pytest.mark.parametrize("base", [
+    "--help",          # no colon at all: Request() itself raises
+    "127.0.0.1:8123",  # parses a "127.0.0.1" scheme, so urlopen is what raises
+])
+def test_ask_turns_a_base_with_no_scheme_into_a_row_not_a_traceback(base):
+    # The Request used to be built before the try, so `--help` taken as BASE
+    # raised ValueError("unknown url type: '--help/v1/chat/completions'") out
+    # of a function promising a row. Neither base reaches the network.
+    r = ps.ask(base, "m", "max_tokens", [])
+    assert "error" in r and "unknown url type" in r["error"]
+    assert r["wall"] >= 0

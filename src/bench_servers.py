@@ -65,7 +65,13 @@ ends the run with the pid and port named, never with a kill. Stop it yourself, o
 --ours-port / --geniex-port. (It used to `taskkill /IM geniex.exe` and
 force-stop whatever owned both ports before pass 1, which killed a
 co-tenant's normally-launched server mid-session with no notice on either
-side.)
+side.) At the same two moments it lists the box's processes, because the arm
+ports are not the only way to share the Hexagon: a genie_server, geniex or
+GenieAPIService this run did not start, on ANY port, is refused the same way,
+by pid and command line, rather than having an arm's ~3 GB bundle loaded
+beside it. --allow-other-npu-servers goes on beside them deliberately, and the
+results file then lists them. A listing that cannot be taken is said so, and
+recorded, rather than read as "none running".
 
 Each arm's stdout and stderr go to bench_servers-<arm>.log beside --out, and
 a child that exits before its port answers fails the pass at once, with its
@@ -82,9 +88,15 @@ at. Either way the exit code and the log tail are on the screen and in the
 file.
 
 The results file (--out, refused if it exists unless --force, and refused
-BEFORE the sweep) says which sweep it was: the arms, the bundle, the window,
+BEFORE the sweep) is looked at again when it is written: a file that appeared
+there during the sweep, or replaced the one --force was given, is left alone
+-- --force or not -- and so is the record: it goes to a timestamped file
+beside --out, as it does when writing --out fails for any reason, the closing
+lines say where it went, and the run exits non-zero whatever `outcome` says.
+It says which sweep it was: the arms, the bundle, the window,
 both timestamps, the passes, the acceptance rule, every arm-run that failed
-to start or died mid-run and why, and `outcome` -- "complete", "interrupted",
+to start or died mid-run and why, the other NPU servers it ran beside, and
+`outcome` -- "complete", "interrupted",
 "refused: ...", "error: ..." or "incomplete: no rows for <arms>". `outcome`
 is how the LOOP ended, with one exception: a loop that ran to its end and
 left an ARM empty is "incomplete: no rows for ...", because that is not a
@@ -98,9 +110,10 @@ gathered so far; anything but "complete" exits non-zero.
 Needs the NPU, a bundle, GENIE_SDK_DIR (genie_server.py, the `ours` arm,
 exits at load without it), a geniex.exe (GENIEX_EXE, the `geniex` arm) and
 `pip install tokenizers`. The first three, the output path, --tokens against
-the decode floor, the depths and the arm ports are all checked BEFORE the
-first launch, because the cheapest refusal is the one that has not yet loaded
-a 3 GB bundle onto the HTP. Unlike tests/, this is a hardware tool.
+the decode floor, the depths, the arm ports and the other NPU servers on the
+box are all checked BEFORE the first launch, because the cheapest refusal is
+the one that has not yet loaded a 3 GB bundle onto the HTP. Unlike tests/,
+this is a hardware tool.
 
 The --geniex-model default names a model that must be IMPORTED first; standing
 both servers up on one bundle is four steps for one of them and one command for
@@ -109,7 +122,9 @@ docs/GENIE_SERVER.md. Do that before wondering why an arm will not start.
 """
 import argparse
 import json
+import ntpath
 import os
+import re
 import shutil
 import socket
 import statistics
@@ -295,6 +310,166 @@ def foreign_listener(arms):
                     "process keeps answering). Free the port, or pass "
                     "--%s-port." % (arm["port"], name, name))
     return None
+
+
+# The interpreters a genie_server runs under, by image name without ".exe":
+# python, python3, python3.12, pythonw. Not py.exe -- the launcher's own
+# python child carries the same command line and is what gets listed.
+_PYTHON_IMAGE = re.compile(r"^pythonw?[0-9.]*$", re.IGNORECASE)
+
+# Interpreter options that take their value as the NEXT argument, so the value
+# is not mistaken for the script: `python -X utf8 src/genie_server.py`.
+_PYTHON_OPTS_WITH_VALUE = ("-X", "-W")
+
+
+def _win_argv(cmdline):
+    """`cmdline` split the way a Windows program splits its own, near enough:
+    whitespace separates, a double quote groups (an unterminated one runs to
+    the end of the line), and a backslash is a path separator, never an
+    escape. Not shlex: that takes an apostrophe for a quote as well, and
+    C:\\Users\\O'Brien is a path, not the start of a string. The one rule
+    left out, a backslash-escaped quote, does not occur in a script path.
+    """
+    argv, cur, quoted, grouped = [], [], False, False
+    for ch in cmdline or "":
+        if ch == '"':
+            quoted, grouped = not quoted, True
+        elif ch in " \t" and not quoted:
+            if cur or grouped:
+                argv.append("".join(cur))
+            cur, grouped = [], False
+        else:
+            cur.append(ch)
+    if cur or grouped:
+        argv.append("".join(cur))
+    return argv
+
+
+def _is_genie_server_py(arg):
+    return ntpath.basename(arg).lower() == "genie_server.py"
+
+
+def _runs_genie_server(cmdline):
+    """True when a Python command line runs genie_server.py.
+
+    As its script -- the first argument after the interpreter's own options
+    -- or through a module that runs a script it is handed, which is how a
+    server under `-m pdb` or `-m cProfile -o out.prof` looks: there, any
+    later argument naming genie_server.py counts. `-c` runs the code it is
+    given, so what follows it is that code's argv, not a script.
+    """
+    argv = _win_argv(cmdline)[1:]
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "-c":
+            return False
+        if a == "-m":
+            return any(_is_genie_server_py(x) for x in argv[i + 2:])
+        if a in _PYTHON_OPTS_WITH_VALUE:
+            i += 2
+        elif a.startswith("-"):
+            i += 1
+        else:
+            return _is_genie_server_py(a)
+    return False
+
+
+def npu_server_kind(name, cmdline, geniex=None):
+    """'genie_server', 'geniex' or 'GenieAPIService' for a process that is one
+    of the servers that load a bundle onto the HTP, else None.
+
+    By image name for the two executables, and for genie_server by the SCRIPT
+    a Python process runs (see _runs_genie_server) -- not by the words in its
+    command line, which matched a shell whose command merely mentioned
+    genie_server.py, and a pytest run selecting its tests. `geniex` is
+    GENIEX's own path, so a GENIEX_EXE under another file name is still
+    recognised as geniex.
+    """
+    image = ntpath.basename(name or "").lower()
+    stem = image[:-4] if image.endswith(".exe") else image
+    if stem == "geniex" or (geniex and image == ntpath.basename(geniex).lower()):
+        return "geniex"
+    if stem == "genieapiservice":
+        return "GenieAPIService"
+    if _PYTHON_IMAGE.match(stem) and _runs_genie_server(cmdline):
+        return "genie_server"
+    return None
+
+
+def list_processes():
+    """Every process on the box as {"pid", "ppid", "name", "cmdline"}, or None
+    when they cannot be listed (off-Windows, PowerShell failed or timed out).
+
+    Read-only: Win32_Process through Get-CimInstance, which has the command
+    line that Get-Process lacks. None rather than [] on a failure, so the
+    caller can say it did not look instead of saying there was nothing.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             "ConvertTo-Json -Compress -Depth 2 -InputObject @(Get-CimInstance "
+             "Win32_Process -ErrorAction Stop | Select-Object ProcessId,"
+             "ParentProcessId,Name,CommandLine)"],
+            capture_output=True, text=True, errors="replace", timeout=60)
+        if r.returncode != 0:
+            return None
+        rows = json.loads(r.stdout)
+        if isinstance(rows, dict):
+            rows = [rows]
+        return [{"pid": int(p["ProcessId"]),
+                 "ppid": int(p.get("ParentProcessId") or 0),
+                 "name": p.get("Name") or "",
+                 "cmdline": p.get("CommandLine") or ""} for p in rows]
+    except Exception:
+        return None
+
+
+def other_npu_servers(procs, own_pids, geniex=None):
+    """The NPU servers in `procs` that this run did not start, pid order.
+
+    One is this run's if its pid, or any ancestor's, is in `own_pids` -- this
+    process and every child it has launched, so an arm whose tree kill left a
+    grandchild behind is not reported as a stranger. Each entry is the
+    process dict plus its `kind`.
+    """
+    parent = {p["pid"]: p["ppid"] for p in procs}
+
+    def ours(pid):
+        seen = set()
+        while pid and pid not in seen:
+            if pid in own_pids:
+                return True
+            seen.add(pid)
+            pid = parent.get(pid)
+        return False
+
+    found = []
+    for p in procs:
+        kind = npu_server_kind(p["name"], p["cmdline"], geniex)
+        if kind and not ours(p["pid"]):
+            found.append(dict(p, kind=kind))
+    return sorted(found, key=lambda p: p["pid"])
+
+
+def npu_servers_text(found):
+    """One indented line per server: pid, kind and a cut-down command line."""
+    return "\n".join("  pid %-6d %-15s %s" % (p["pid"], p["kind"],
+                                              _ascii((p["cmdline"] or p["name"])[:160]))
+                     for p in found)
+
+
+def npu_refusal(found):
+    """The refusal for other NPU servers on the box, naming each by pid."""
+    return ("%d other NPU server(s) running on this box that this run did not "
+            "start:\n%s\nrefusing to load an arm beside them: each arm puts a "
+            "~3 GB bundle on the Hexagon, two loaded engines contend, and "
+            "concurrent HTP access can wedge the device for every session "
+            "here. Stop them yourself, or pass --allow-other-npu-servers to "
+            "measure beside them deliberately (the results file then lists "
+            "them)." % (len(found), npu_servers_text(found)))
 
 
 def _ascii(text):
@@ -658,6 +833,87 @@ def clock_text(box):
 
 
 # --------------------------------------------------------------------------
+# The results file
+# --------------------------------------------------------------------------
+
+def out_state(path):
+    """What is at `path` now, to tell at write time whether it changed while
+    the sweep ran: None when nothing is, else (file id, size, mtime in ns)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _timestamped_beside(path):
+    """`path` with a UTC timestamp in front of its extension.
+
+    Beside the path that was asked for, not in a temp directory: the operator
+    is looking at the directory they typed, and this has to turn up in it.
+    bench_contention's, as is the whole write-time contract below.
+    """
+    root, ext = os.path.splitext(path)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return "%s.%s%s" % (root, stamp, ext)
+
+
+def _dump_json(path, record, mode):
+    """The one place the record is written, so the asked-for path and the
+    fallback are written identically -- and so a test can make a write fail
+    without a read-only directory. `mode` "x" creates or fails, never
+    replacing what is there."""
+    with open(path, mode, encoding="utf-8") as f:
+        json.dump(record, f, indent=1)
+
+
+def write_results(path, record, at_start):
+    """Write the sweep's record, never over a file it was not given and never
+    discarding it. (path_written, note), bench_contention._write_record's
+    contract: `note` is None only when the record landed on `path`; anything
+    else is one sentence for the operator AND a non-zero exit, because a
+    wrapper that branches on the exit code must not read a fallback write as
+    the file it named.
+
+    `at_start` is out_state(path) from before the sweep. The startup check
+    refuses an existing --out without --force, and could not see the two
+    outcomes this replaces: a file that APPEARED during the sweep (another
+    run writing the same default sweep-results.json) was overwritten without
+    a word, and an OSError at the write -- the directory gone, the volume
+    full, --out now a directory -- was a traceback with no record written
+    anywhere, after twenty minutes of the box. Now a file that is not what
+    was there at the start is left alone, --force or not: --force is consent
+    to replace the file that was there when the run began, not whatever is
+    there when it ends. Where nothing is, the file is created exclusively, so
+    one that appears between this check and the open fails the open rather
+    than being overwritten. Either failure, and any OSError, writes a
+    timestamped file beside `path` instead (itself created exclusively).
+    """
+    now = out_state(path)
+    if now is not None and now != at_start:
+        why = ("%s %s during the sweep (another run writing the same path?) and "
+               "was NOT overwritten" % (path, "appeared" if at_start is None
+                                        else "was replaced"))
+    else:
+        try:
+            _dump_json(path, record, "x" if now is None else "w")
+            return path, None
+        except FileExistsError:
+            why = ("%s appeared during the sweep (another run writing the same "
+                   "path?) and was NOT overwritten" % path)
+        except OSError as exc:
+            why = "%s could not be written (%s)" % (path, exc)
+    fallback = _timestamped_beside(path)
+    try:
+        _dump_json(fallback, record, "x")
+    except OSError as exc:
+        return None, ("%s, and the fallback %s failed too (%s), so this run's "
+                      "numbers exist only in the terminal above"
+                      % (why, fallback, exc))
+    return fallback, "%s, so this run's results went to %s" % (why, fallback)
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -707,7 +963,17 @@ def _parser():
                     help="results JSON (default %(default)s); '' for none. "
                          "Arm logs go beside it.")
     ap.add_argument("--force", action="store_true",
-                    help="overwrite --out if it already exists")
+                    help="overwrite --out if it already exists. Only the file "
+                         "that was there at the start: one that appears or is "
+                         "replaced during the sweep is left alone, and the "
+                         "results go to a timestamped file beside it")
+    ap.add_argument("--allow-other-npu-servers", action="store_true",
+                    dest="allow_other_npu_servers",
+                    help="run although a genie_server, geniex or "
+                         "GenieAPIService this run did not start is already "
+                         "running on the box (they are refused by pid "
+                         "otherwise): the arms then share the Hexagon with "
+                         "them, and the results file lists them")
     return ap
 
 
@@ -748,9 +1014,17 @@ def main():
                  "window to be a rate, so the sweep would spend the box and "
                  "report both arms as no data. Raise --tokens or lower the "
                  "variable" % (a.tokens, be.MIN_DECODE_STEPS))
+    if a.out and os.path.isdir(a.out):
+        # Ahead of the exists check, whose way out is --force: --force cannot
+        # turn a directory into a file, and the write would fail at the end.
+        sys.exit("NOT starting: --out %s is a directory -- it names the "
+                 "results FILE." % a.out)
     if a.out and os.path.exists(a.out) and not a.force:
         sys.exit("NOT starting: %s already exists and would be overwritten. "
                  "Re-run with --force, or pass a different --out." % a.out)
+    # What --force (or nothing) agreed to replace, so the write at the end can
+    # tell that file from one that appeared or was replaced during the sweep.
+    out_at_start = out_state(a.out) if a.out else None
     # The arm logs are opened here at the first launch and the results land
     # here at the end, so a directory that is not there is found out now.
     log_dir = os.path.dirname(os.path.abspath(a.out)) if a.out else os.getcwd()
@@ -784,6 +1058,41 @@ def main():
     if problem:
         sys.exit(problem)
 
+    # The arm ports are not the only way to share the Hexagon. A genie_server,
+    # geniex or GenieAPIService another session loaded on ANY other port holds
+    # a bundle there too, and foreign_listener, which looks only at this run's
+    # two ports, never saw it: the sweep then loaded a second ~3 GB bundle
+    # beside it for twenty minutes. So the box's processes are looked at as
+    # well, here and before every start. `launched` is this process and every
+    # child it has started, whose descendants are this run's own.
+    launched = {os.getpid()}
+    npu_seen = []      # what --allow-other-npu-servers let the run go on beside
+    unscanned = []     # runs whose look could not be taken (0 = at startup)
+
+    def npu_check(run):
+        """A refusal naming the other NPU servers, or None."""
+        procs = list_processes()
+        if procs is None:
+            unscanned.append(run)
+            print("   (could not list this box's processes, so NPU servers on "
+                  "ports other than the arms' were NOT looked for; the arm "
+                  "ports still are)", flush=True)
+            return None
+        found = other_npu_servers(procs, launched, GENIEX)
+        if not found:
+            return None
+        if not a.allow_other_npu_servers:
+            return npu_refusal(found)
+        print("   WARNING: running beside %d other NPU server(s) "
+              "(--allow-other-npu-servers) -- the arms share the Hexagon with:\n%s"
+              % (len(found), npu_servers_text(found)), flush=True)
+        npu_seen.extend(dict(p, run=run) for p in found)
+        return None
+
+    problem = npu_check(0)
+    if problem:
+        sys.exit("NOT starting: %s" % problem)
+
     order = []
     for i in range(a.passes):
         order += ["ours", "geniex"] if i % 2 == 0 else ["geniex", "ours"]
@@ -812,12 +1121,14 @@ def main():
             print("\n[run %d/%d, pass %d/%d] %s (%s)"
                   % (run, len(order), pas, a.passes, name, clock_text(box)),
                   flush=True)
-            problem = foreign_listener(arms)
+            problem = foreign_listener(arms) or npu_check(run)
             if problem:
                 print("   %s" % problem, flush=True)
                 outcome = "refused: %s" % problem
                 break
             child, problem = start(name, arms[name], log_dir, children)
+            if child is not None:
+                launched.add(child["proc"].pid)
             if problem:
                 print("   FAILED to start -- skipping: %s" % problem, flush=True)
                 # In the artifact too: `outcome` says how the LOOP ended, so
@@ -926,6 +1237,7 @@ def main():
               % " and ".join("`%s`" % n for n in empty), flush=True)
         if outcome == "complete":
             outcome = "incomplete: no rows for %s" % ", ".join(empty)
+    write_note = None
     if a.out:
         # Everything a reader needs to tell two sweeps apart. The file used to
         # hold rows, depths and tokens only, so two sweeps against different
@@ -963,11 +1275,25 @@ def main():
                      for name in arms},
             "failed_starts": failed_starts,
             "died_mid_run": died_mid_run,
+            # Who else held the Hexagon: every NPU server the run went on
+            # beside under --allow-other-npu-servers, with the run it was
+            # seen before (0 = at startup), and the runs whose look could not
+            # be taken at all -- "none seen" and "not looked" are different
+            # facts about a number.
+            "other_npu_servers": {"allowed": a.allow_other_npu_servers,
+                                  "seen": npu_seen,
+                                  "unscanned_runs": unscanned},
             "rows": rows,
         }
-        with open(a.out, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=1)
-        print("\nwrote %s (%d samples, %s)" % (a.out, len(rows), outcome), flush=True)
+        # write_results decides WHERE, and says so when it is not where the
+        # operator asked. It never discards the record: the per-row JSON is
+        # not on the screen, and this is the only copy of it.
+        written, write_note = write_results(a.out, result, out_at_start)
+        if write_note:
+            print("\n%s." % write_note, flush=True)
+        if written:
+            print("\nwrote %s (%d samples, %s)" % (written, len(rows), outcome),
+                  flush=True)
     # Non-zero whenever the loop did not run to its end, so a wrapper script
     # cannot take an interrupted, refused or dead run for a finished one --
     # and non-zero too when the loop DID run to its end and left an arm with
@@ -976,6 +1302,10 @@ def main():
     # arm's runs does not change this: the loop went on without them, the arm
     # still has rows, and the gaps are on the screen (as they happened, and
     # again in the closing lines) and in `failed_starts` or `died_mid_run`.
+    # And non-zero when the record is not at --out, whatever the sweep did:
+    # a wrapper reading --out after a 0 would be reading someone else's file.
+    if write_note:
+        return 1
     return 0 if outcome == "complete" else 1
 
 

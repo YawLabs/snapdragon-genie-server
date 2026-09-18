@@ -13,6 +13,10 @@ stubbed at import time; nothing exercised below calls into them. The NaN
 check is a WORD match (`nan`, or `nanx` as `%.1fx` prints it, not inside a
 longer word): the old substring test over the whole output would have failed
 on the words "tenant" or "maintenance" appearing in any message.
+
+The last section is the other way round: a Python WITHOUT the wheels, made so
+by setting them to None in sys.modules, where --help must still work and any
+other run must name what is missing instead of dying on an import.
 """
 
 import importlib
@@ -20,6 +24,7 @@ import importlib.util
 import math
 import os
 import re
+import subprocess
 import sys
 import types
 
@@ -586,3 +591,98 @@ def test_the_cases_get_the_iteration_counts_and_the_model_dir_asked_for(
                            "iters": 5, "warmup": 1, "verify": True}
     assert ran["int8"]["shape"] == (8, 16, 32)
     assert (ran["sweep"]["iters"], ran["sweep"]["warmup"]) == (5, 1)
+
+
+# --- a Python without the wheels --------------------------------------------
+# bench.py imported numpy and onnx unguarded, ahead of argparse: a shell
+# without the venv active got `ModuleNotFoundError: No module named 'onnx'`
+# for any command, --help included, while qnn_ep's guard three lines down
+# already said what to do for a missing onnxruntime. A module set to None in
+# sys.modules is one that will not import, which is how each test below makes
+# its Python lack a package -- whatever this Python actually has installed.
+
+ALL_WHEELS = ("numpy", "onnx", "onnx.helper", "onnx.numpy_helper",
+              "onnxruntime", "onnxruntime_qnn")
+
+
+@pytest.fixture
+def bench_without(bench, monkeypatch):
+    """bench.py as a Python lacking `names` imports it."""
+    def load(*names):
+        for name in names:
+            monkeypatch.setitem(sys.modules, name, None)
+        # Re-imported, so its own guard runs against what is missing now.
+        monkeypatch.delitem(sys.modules, "qnn_ep", raising=False)
+        return importlib.reload(bench)
+    return load
+
+
+def test_help_works_without_any_of_the_wheels(bench_without, capsys):
+    b = bench_without(*ALL_WHEELS)
+    with pytest.raises(SystemExit) as e:
+        b.main(["--help"])
+    assert e.value.code == 0
+    out = capsys.readouterr().out
+    assert "usage:" in out and "--sweep" in out
+
+
+def test_a_usage_error_is_still_argparse_s_without_the_wheels(bench_without, capsys):
+    b = bench_without(*ALL_WHEELS)
+    with pytest.raises(SystemExit) as e:
+        b.main(["--shape", "1,2"])
+    assert e.value.code == 2
+    assert "shape must be M,K,N" in capsys.readouterr().err
+
+
+def test_a_run_without_onnx_names_it_and_the_install_and_does_nothing(
+        bench_without, tmp_path):
+    b = bench_without("onnx", "onnx.helper", "onnx.numpy_helper")
+    model_dir = tmp_path / "models"
+    with pytest.raises(SystemExit) as e:
+        b.main(["--sweep", "--model-dir", str(model_dir)])
+    said = str(e.value)
+    assert "onnx --" in said
+    assert "requirements.txt" in said and "README, Install" in said
+    assert sys.executable in said, "the interpreter it ran under: usually the wrong one"
+    assert "numpy --" not in said, "only what is actually missing"
+    assert not model_dir.exists(), "refused before anything was made"
+
+
+def test_every_missing_package_is_named_at_once(bench_without):
+    b = bench_without(*ALL_WHEELS)
+    with pytest.raises(SystemExit) as e:
+        b.main([])
+    said = str(e.value)
+    for package in ("numpy --", "onnx --", "onnxruntime-qnn --"):
+        assert package in said, package
+    # qnn_ep's own sentence is carried whole, not replaced.
+    assert "onnxruntime-qnn wheel" in said
+
+
+def test_the_report_is_one_line_per_package_under_one_heading(bench):
+    said = bench.missing_report([("onnx", ImportError("No module named 'onnx'"))],
+                                python="/opt/py/bin/python3")
+    lines = said.splitlines()
+    assert lines[0].startswith("bench.py needs packages") and "/opt/py/bin/python3" in lines[0]
+    assert lines[1] == "  onnx -- No module named 'onnx'"
+    assert "requirements.txt" in lines[-1]
+
+
+def test_the_command_line_says_so_too_with_no_traceback(tmp_path):
+    # The real entry point, `if __name__ == "__main__"` and all, in a child
+    # Python whose wheels are made unimportable the same way. Neither run gets
+    # past its imports' report, so nothing here touches a device.
+    script = os.path.join(SRC, "bench.py")
+    boot = ("import runpy, sys; sys.modules.update(dict.fromkeys(%r)); "
+            "sys.argv = [%r] + sys.argv[1:]; runpy.run_path(%r, run_name='__main__')"
+            % (list(ALL_WHEELS), script, script))
+    help_run = subprocess.run([sys.executable, "-c", boot, "--help"],
+                              capture_output=True, text=True, timeout=60)
+    assert help_run.returncode == 0, help_run.stderr
+    assert "usage:" in help_run.stdout
+    run = subprocess.run([sys.executable, "-c", boot, "--sweep", "--model-dir",
+                          str(tmp_path / "m")], capture_output=True, text=True, timeout=60)
+    assert run.returncode == 1
+    assert "requirements.txt" in run.stderr
+    assert "Traceback" not in run.stderr
+    assert not (tmp_path / "m").exists()

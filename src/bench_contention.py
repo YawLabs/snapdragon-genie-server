@@ -178,11 +178,13 @@ import argparse
 import json
 import os
 import re
+import socket
 import statistics
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 import bench_endpoint as be
 
@@ -1172,6 +1174,42 @@ def drift_note(values, what):
 PING_TIMEOUT_S = 60
 WARMUP_TIMEOUT_S = 300
 
+# The TCP connect asked after a failed ping (see _connect_problem). A refused
+# connect comes back in ~2 s on Windows (its SYN retries) and at once
+# elsewhere; this only bounds a host that drops the SYN outright.
+CONNECT_TIMEOUT_S = 10
+
+# Where each label's server is started, for the line that says to start it.
+# The ports are the launchers' own and the flags' defaults.
+LAUNCHERS = {"NPU": ("run-genie-server.ps1", 8123, "--npu"),
+             "GPU": ("`run-llama-server.ps1 -Leg gpu`", 8124, "--gpu")}
+
+
+def _connect_problem(base, timeout=CONNECT_TIMEOUT_S):
+    """Why nothing took a TCP connection at `base`, or None if something did.
+
+    be.chat returns one None for two opposite facts: nothing took the
+    connection (refused, timed out, a host that does not resolve), and
+    something took it and gave no usable answer (an HTTP error, a completion
+    with no usage block). The ping's refusal used to say "is not answering,
+    or reports no usage -- start it first" for both, which is the wrong
+    advice for the second and, for the first, for a genie_server still in
+    its 11-35 s load: it holds the port and refuses connections until the
+    model is resident, the same symptom as nothing running at all.
+
+    Asked only AFTER a failed ping, never as a gate in front of it: a bare
+    socket ignores the proxy settings urllib honours, so as a gate it could
+    refuse a base the ping itself reaches. main() has already refused a base
+    that is not an http(s) URL with a host, so urlsplit here has one.
+    """
+    parts = urllib.parse.urlsplit(base)
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        socket.create_connection((parts.hostname, port), timeout=timeout).close()
+    except OSError as exc:
+        return "%s: %s" % (type(exc).__name__, exc)
+    return None
+
 # Printed as argparse's epilog, which is NOT %-expanded (argparse only formats
 # an epilog that contains "%(prog)"), so a percent sign is written once here.
 # Doubled, it rendered as a literal "13-20%% charge" in --help.
@@ -1316,7 +1354,17 @@ def _validate(a, ap):
     both warmups and then exit 0 reporting both engines incomplete; --ramp -1
     raised from time.sleep AFTER the solo leg, with the generator already
     started. Each exits 2 through ap.error, before the memory gate.
+
+    --npu and --gpu go through bench_endpoint.base_url_problem, the check
+    that tool applies to its --base, in the same words. `--npu
+    127.0.0.1:8123` (no scheme) used to fail the ping as "unknown url type"
+    and then tell the operator to start a server that was already answering
+    on that port.
     """
+    for flag, base in (("--npu", a.npu), ("--gpu", a.gpu)):
+        problem = be.base_url_problem(flag, base)
+        if problem:
+            ap.error(problem)
     if a.repeat < 1:
         ap.error("--repeat must be >= 1 (got %d): zero rounds would pay both "
                  "pings and both warmups to measure nothing" % a.repeat)
@@ -1519,14 +1567,31 @@ def main():
     for name, base, model in engines:
         r = be.chat(base, model, "ping", 1, PING_TIMEOUT_S)
         if r is None:
-            # chat() also returns None for a server that answers but reports
-            # no usage (GenieAPIService reports all zeros); such a server was
+            # chat() returns None both when nothing took the connection and
+            # when something did and answered unusably -- an HTTP error, or no
+            # usage (GenieAPIService reports all zeros; such a server was
             # never measurable here, since every rate is formed from the
-            # server's own counts.
-            print("\n%s at %s is not answering, or reports no usage -- start "
-                  "it first. A server whose usage block is missing or all "
-                  "zeros cannot be measured by this tool."
-                  % (name, base), file=sys.stderr)
+            # server's own counts). They need opposite advice, so a TCP
+            # connect tells them apart (see _connect_problem). A refusal is
+            # still not proof of absence: a genie_server mid-load refuses too,
+            # so that line names both readings (be.STILL_LOADING) before it
+            # says to start one.
+            refused = _connect_problem(base)
+            if refused:
+                launcher, port, flag = LAUNCHERS[name]
+                print("\n%s at %s is not answering: nothing listening (%s) -- "
+                      "either it is not running, or %s. Otherwise start it "
+                      "first: %s serves on %d, so pass %s to match if yours "
+                      "is elsewhere."
+                      % (name, base, refused, be.STILL_LOADING, launcher,
+                         port, flag), file=sys.stderr)
+            else:
+                print("\n%s at %s took the connection but did not answer the "
+                      "ping with a usable completion (the reason is on the "
+                      "line above) -- something is serving there, so do not "
+                      "start another on that port. A server whose usage "
+                      "block is missing or all zeros cannot be measured by "
+                      "this tool." % (name, base), file=sys.stderr)
             return 2
         served = r.get("model")
         w = be.n_ctx(base)

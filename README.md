@@ -110,7 +110,7 @@ because one of them takes four undocumented steps. The comparison is in
 | **A decode window under ~16 steps** | measures per-request overhead, not decode: a 4-step window reported 0.60 t/s against a true 17.6 |
 | **Sequential A/B on a drifting box** | hands all the drift to whichever arm ran second; interleave instead |
 | **On Windows, a second process can bind a port another is serving** | both binds succeed, the OLD process keeps answering, and your new server logs a clean start while serving nobody. `genie_server` now refuses its own second bind on any `GENIE_HOST` (it asks for the port with `SO_EXCLUSIVEADDRUSE`), so this trap is about the other servers compared here: check what is already listening before you trust a fresh launch |
-| **A 200 from `/health` does not mean the model generates** | Qwen3.5-9B Q8_0 on the llama-qnn fork build answers every request with an empty completion and `finish_reason: stop`, at an impossible 66 t/s. Smoke-test the tokens, not the status code |
+| **A 200 from `/health` does not mean the model generates** | Qwen3.5-9B Q8_0 on [the llama-qnn fork build](https://github.com/YawLabs/llama.cpp) answers every request with an empty completion and `finish_reason: stop`, at an impossible 66 t/s. Smoke-test the tokens, not the status code |
 
 ## Target
 
@@ -189,6 +189,29 @@ python -m venv .venv
 pip install -r requirements.txt        # onnxruntime-qnn pulls onnxruntime in as a dep
 ```
 
+**On a stock Windows box `Activate.ps1` is blocked by the execution policy**
+(`... cannot be loaded because running scripts is disabled on this system`),
+and so is every `.ps1` launcher below. Watch for it here in particular: the
+next line still runs, with no venv active, and `pip` installs into whatever
+Python is first on PATH -- the non-clean environment this section warns
+about. Loosen the policy no further than you need to. Either allow scripts
+for your own account only, once:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+or leave the policy alone and skip activation -- call the venv's interpreter
+directly (`.\.venv\Scripts\python.exe -m pip install -r requirements.txt`,
+and `.\.venv\Scripts\python.exe` wherever this page says `python`) -- and run
+a launcher with `powershell -ExecutionPolicy Bypass -File ...`, which applies
+to that one process only. Changing the machine-wide policy is never needed.
+
+`python src\bench.py --help` works before the wheels are installed, and any
+other `bench.py` run under a Python that cannot import them names every
+missing package and the interpreter it ran under -- usually a venv that is
+not active -- instead of ending in a bare `ModuleNotFoundError`.
+
 **Why clean, corrected 2026-09-17 by opening the wheels.** This section used to
 say the `onnxruntime` and `onnxruntime-qnn` wheels "ship the same `onnxruntime`
 module and collide", and told you to keep plain `onnxruntime` out of the venv.
@@ -239,6 +262,47 @@ obtained by you, from Qualcomm.
   archs this box can serve, is in
   [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md).
 
+## Run the server
+
+The server needs no pip packages -- only a native ARM64 Python and the two
+artifacts above. The launcher finds them itself if they sit in a `genie-npu`
+directory BESIDE your clone of this repo, laid out like this:
+
+```
+<parent>\
+  snapdragon-genie-server\        your clone of this repo (any name)
+  genie-npu\
+    bundles\
+      qwen3_4b-genie-w4a16-x-elite-ctx8192-multi\   one bundle per directory: genie_config.json,
+                                                    part*_of_*.bin, tokenizer.json, metadata.json
+    qairt\
+      2.45.0.260326\              the extracted QAIRT SDK; the newest version directory wins
+```
+
+Then, from the repo root:
+
+```powershell
+powershell -File src\run-genie-server.ps1                 # Qwen3-4B, the default bundle above
+powershell -File src\run-genie-server.ps1 -Model qwen3-8b  # or another bundle; -Help lists them
+```
+
+(On a box whose execution policy blocks scripts, put `-ExecutionPolicy Bypass`
+before `-File` -- see [Install](#install).) It serves on
+`http://127.0.0.1:8123`, prints `port 127.0.0.1:8123 is reserved` at once and
+`endpoint on http://127.0.0.1:8123` once the 11-35 s model load is done -- the
+port refuses connections until then -- and restarts the server if the NPU
+wedges. The NPU is one device for the whole machine, so run one server at a
+time. If the artifacts live elsewhere, point `GENIE_NPU_ROOT` at the directory
+holding `bundles\` and `qairt\`, or set `GENIE_BUNDLE_DIR` (the bundle
+directory itself) and `GENIE_SDK_DIR` (the QAIRT root) directly; the launcher
+checks both before the load and names what it tried. `python src\genie_smoke.py`
+then confirms it generates.
+
+Everything else -- endpoints, every `GENIE_*` variable, supervision, and what
+each startup exit means -- is in [docs/GENIE_SERVER.md](docs/GENIE_SERVER.md#run).
+The Qwen3.5-9B llama-server legs are launched the same way with
+`src\run-llama-server.ps1`; see [docs/MODEL_OPTIONS.md](docs/MODEL_OPTIONS.md).
+
 ## Run the benchmark
 
 ```powershell
@@ -262,7 +326,8 @@ the placement check from hard-fail to a flag in the output.
 `src/bench.py` measures one matmul. To measure a whole served model, point
 `src/bench_endpoint.py` at a running server. It starts nothing itself, and
 `--base` defaults to `http://127.0.0.1:8123`, where `run-genie-server.ps1`
-serves (a bare `python src\genie_server.py` is on `GENIE_PORT`, default 8080):
+serves ([Run the server](#run-the-server); a bare `python src\genie_server.py`
+is on `GENIE_PORT`, default 8080):
 
 ```powershell
 python src\bench_endpoint.py                          # prefill + decode sweep
@@ -270,11 +335,13 @@ python src\bench_endpoint.py --base http://127.0.0.1:8123 --decode-only
 ```
 
 When `/health` does not answer 200 it says which of four problems you have
-rather than "start the server first". `nothing listening at <base> ...` names
-both ports to try, and now applies only when the connection was never made --
-which is also what a `genie_server` that is still loading looks like, since it
-does not listen until its model is resident. `server at <base> is up but not
-ready: HTTP 503 state=... (detail)` tells you NOT to start another. And
+rather than "start the server first". `nothing listening at <base> ...`
+applies only when the connection was never made, and the line itself gives
+both readings: no server is running there, or a `genie_server` there is still
+loading its bundle (it holds the port but does not listen until its model is
+resident). In that case wait for its `endpoint on` line and re-run rather than
+start another; otherwise it names both ports to try. `server at <base> is up
+but not ready: HTTP 503 state=... (detail)` tells you NOT to start another. And
 `something at <base> accepted the connection but gave /health no usable answer
 (...)` -- a timeout, a reply that is not HTTP or not JSON -- means a
 listener IS there, so do not start another either: it may still be starting,
@@ -294,6 +361,17 @@ status 0 only if both a plain and a streamed completion came back with
 content, and the streamed one's frames were blank-line terminated -- a stream
 no SDK can dispatch is a FAIL even when every payload parses; `-h` prints its
 usage).
+
+Before any request it refuses, with exit 1: a `--base` that is not an
+`http://` or `https://` URL with a host and a port in 1-65535 (`--base must
+start with http:// or https:// (got '127.0.0.1:8123' -- try
+http://127.0.0.1:8123): ...`); a `--tokens` below 1, or below
+`GENIE_MIN_DECODE_STEPS` (16) unless `--prefill-only`; a `--repeat` or
+`--repeat-deep` below 1 (they used to be raised to 1 without a word); and a
+non-integer `--depths` (it used to be caught only after `/health` and the
+warmup). A run in which no measurement was accepted -- every point failed, was
+skipped or was refused -- exits 1 with `no measurement was accepted ...`, not
+0; a run with some accepted points still exits 0.
 
 It reports prefill and decode in tokens/sec at several context depths. Decode
 is measured as the delta between an N-token and a 1-token run at the same depth,
@@ -460,7 +538,7 @@ Lint with the same config CI would have used, if there were CI:
 python -m ruff check src tests
 ```
 
-1159 tests (`python -m pytest --collect-only -q | tail -1` is the count that
+1555 tests (`python -m pytest --collect-only -q | tail -1` is the count that
 cannot go stale; this sentence said 417 long after it stopped being true), and
 **none of them need the NPU, a Genie bundle, or the QAIRT SDK** -- they drive
 the handlers with a fake socket and a stub engine, and the benchmark tools
@@ -474,8 +552,12 @@ unpinned on purpose; the tests that touch those assert against the module's
 own value or reload under a patched environment. Two groups skip rather than
 fail where their one outside dependency is missing: the launcher tests, which
 lift statements out of the two `.ps1` files and need a `powershell` or `pwsh`
-on PATH to run them (neither launcher is ever executed as a script), and one
-IPv6 bind test.
+on PATH to run them, and one IPv6 bind test. A launcher is run WHOLE only
+where PowerShell's own parameter binding decides the outcome (the help flags,
+a stray argument, a missing binary), and then only under an environment that
+stops it at its first real check -- a `GENIE_NPU_ROOT` with no bundle and a
+`GENIE_PYTHON` that does not exist, or a `LLAMA_BIN_DIR` with no
+`llama-server.exe` -- so no test run can get as far as starting a server.
 
 That device-free property is load-bearing rather than incidental, and it has a
 cost worth stating: the ctypes bindings and every Genie call are NOT covered.
@@ -573,6 +655,10 @@ because the Hexagon is single-flight and they cannot both hold it. It starts
 and stops its OWN two servers and nothing else: a listener it did not start on
 either arm's port -- a resident `genie_server` on the launcher's 8123 is the
 usual one -- ends the run with the pid and port named, never with a kill.
+So does another NPU server on ANY port (a `genie_server`, `geniex` or
+`GenieAPIService` it did not start, named by pid and command line), unless
+`--allow-other-npu-servers` says to measure beside it deliberately; the
+results file then lists it.
 Decode is a two-request delta at one prompt (a cap of 1 against a cap of 121),
 so prefill and per-request HTTP overhead cancel -- which is what makes two
 different HTTP stacks comparable at all. The cap goes out under BOTH spellings
@@ -685,6 +771,18 @@ Reasons to use something else, none of them hypothetical:
   a Genie bundle today and serves via `src/run-llama-server.ps1` on the CPU
   or Adreno instead -- the model matrix and the reasons are in
   [docs/MODEL_OPTIONS.md](docs/MODEL_OPTIONS.md).
+- **The server's request paths, checked on the NPU on 2026-09-18** against
+  both `master` at cc65d97 and the branch that added `--help` and the other
+  first-run fixes, with the 4B multi-length 8192 bundle. Each passed on both
+  commits: the OpenAI and Anthropic APIs, streamed and not; a 6-token
+  `max_tokens` cap reporting `finish_reason: "length"` and
+  `stop_reason: "max_tokens"`; a tool call on both APIs, with the right
+  function name, arguments and streamed call `index`; a client that hangs up
+  two seconds into a 600-token generation, where the next request was served
+  in under a second instead of after the ~31 s the generation would have held
+  the engine; decode at 18.3 and 15.9 t/s; `/props` reporting the bundle as
+  multi-length; and `--help` exiting in 0.26 s with the real bundle configured,
+  loading nothing. `/health` stayed `ok` with no failures booked throughout.
 - **Full-model prefill and decode, measured** via `src/bench_endpoint.py`. The
   variable that matters is the bundle's LENGTH CLASS, not its window: a
   single-length export pays for its whole compiled window on every token, while
@@ -735,12 +833,30 @@ Reasons to use something else, none of them hypothetical:
   tool calling, so it is disqualified rather than merely unproven.
 - **Power draw**, which is the NPU's real claimed edge over CPU and GPU.
 
+**Untested here on the hardware (built and covered by device-free tests
+only):**
+- **The wedge exit and the restart after it.** The server's exit 75 on a
+  wedged NPU, and `run-genie-server.ps1` restarting it, have never run against
+  a real wedged device -- only in the device-free tests. Whether Genie's ABORT takes
+  effect during a long PREFILL is unmeasured. The exit now uses
+  `TerminateProcess`, so no DLL's detach code can hang it, but a thread stuck
+  in KERNEL mode can still keep the process from exiting, and the launcher
+  waits on the child with no deadline, so that case would hang the
+  supervisor too.
+- **The `pnputil /restart-device` reset** is verified only for the
+  interrupt-delivery crawl
+  ([docs/MODEL_OPTIONS.md](docs/MODEL_OPTIONS.md)); it is untested against a
+  wedge or a driver crash. It also resets the NPU for every process on the
+  machine -- check `tasklist /m QnnHtp.dll` before using it.
+
 ## Layout
 
 ```
 src/qnn_ep.py             register + pick-NPU + build-session + HTP placement assertion
 src/bench.py              CLI GEMM benchmark (FP16 / INT8 QDQ / prompt-length sweep)
-src/genie_server.py       OpenAI + Anthropic HTTP server over a resident Genie bundle
+src/genie_server.py       OpenAI + Anthropic HTTP server over a resident Genie bundle;
+                          configured only through GENIE_* env vars, --help prints
+                          its usage and any other argument is refused (exit 2)
 src/bench_endpoint.py     prefill/decode benchmark against any OpenAI-compatible server
 src/genie_smoke.py        HTTP smoke test of an ALREADY-RUNNING server (it loads nothing
                           itself): /v1/models, then one non-streamed and one streamed
@@ -756,8 +872,10 @@ src/probe_server_semantics.py  seed replay / overflow / stop-sequence probes, an
 src/prompt_depth.py       one tokenizer-based prompt-at-depth builder, shared by
                           bench_servers.py and probe_server_semantics.py
 src/run-genie-server.ps1  launcher + supervisor; finds the bundle/SDK itself (-Model picks 4B/8B)
-src/run-llama-server.ps1  Qwen3.5-9B llama-server legs: CPU (Q4_0) / Adreno (Q4_K_M)
-tests/                    1159 device-free tests (no NPU, no bundle, no SDK needed)
+src/run-llama-server.ps1  Qwen3.5-9B llama-server legs: CPU (Q4_0) / Adreno (Q4_K_M), on
+                          the YawLabs llama.cpp fork. Both launchers answer -Help (and -h)
+                          with their usage and start nothing
+tests/                    1555 device-free tests (no NPU, no bundle, no SDK needed)
 
 docs/GENIE_SERVER.md      the server: endpoints, env vars, and its measured limits
 docs/IMPLEMENTATION_PLAN.md  living plan + decision log; start here for the why

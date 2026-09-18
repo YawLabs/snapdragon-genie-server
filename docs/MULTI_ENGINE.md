@@ -509,7 +509,10 @@ typed, not here**:
    as a real capability claim. A 503 now also comes back on a REQUEST, not only
    from `/health`: a turn refused because the server is shutting down answers
    503 rather than 500, for the same reason -- shedding is the right response to
-   both, and neither means the request was malformed.
+   both, and neither means the request was malformed. So does a turn shutdown
+   cut short in flight, and any generation request while `/health` says
+   `stalled` or `wedged` (refused at the door rather than queued behind the
+   stuck call); the full status list is in `TYPED_ROUTER_BRIEF.md`.
 
 ## Answered: does concurrent GPU + NPU inference hold up?
 

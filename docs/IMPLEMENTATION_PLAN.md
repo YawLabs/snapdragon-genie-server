@@ -355,8 +355,8 @@ Exit criterion: a self-converted small dense model (Llama-3.2-1B / Qwen2.5-1.5B)
 
 ### Phase 3 -- serving for the agent workload [~] BUILT; benchmarking and routing outstanding
 Goal: a drop-in local endpoint the agent config can point at. Delivered as `src/genie_server.py`
-(stdlib only, ~4680 lines as of 2026-09-17), documented in `docs/GENIE_SERVER.md`, covered by the
-repo's device-free suite (1159 tests in all as of the same date, the bench tools and launchers
+(stdlib only, ~5500 lines as of 2026-09-17), documented in `docs/GENIE_SERVER.md`, covered by the
+repo's device-free suite (1555 tests in all as of the same date, the bench tools and launchers
 included; `python -m pytest --collect-only -q | tail -1` for today's count).
 - [x] Genie wrapped via the C API (ctypes -> `Genie.dll`), model resident so requests skip the reload.
 - [x] OpenAI `/v1/chat/completions` **and** Anthropic `/v1/messages`, both with SSE streaming.
@@ -624,7 +624,8 @@ and record tg uplift + acceptance rate per model.
 - 2026-09-03: **HTP interrupt delivery can degrade, and then `poll: false` is the slow setting** (~0.3 t/s
   against 5.8 s for the same 100-token request at `poll: true`). Diagnostic: a crawl at `poll: false` that
   is normal at `poll: true` means degraded interrupt delivery, not a bad bundle; `pnputil /restart-device`
-  on the NPU node fixes it without a reboot. Bundles stay at `poll: false`. `docs/MODEL_OPTIONS.md`.
+  on the NPU node fixes it without a reboot (machine-wide: it resets the NPU for every process on the box;
+  check `tasklist /m QnnHtp.dll` first). Bundles stay at `poll: false`. `docs/MODEL_OPTIONS.md`.
 - 2026-09-04: **8B 8192 multi-length export** (three attempts, ~9 h; needed a WSL memory cap). 10.92 t/s
   decode at d250, 10.08 at d978, on battery. The 4096 prebuilt keeps the 8B default pending a same-harness
   AC comparison -- not because of a window tax, since both 8B bundles are multi-length.

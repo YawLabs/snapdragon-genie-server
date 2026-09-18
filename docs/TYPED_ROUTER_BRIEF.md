@@ -12,12 +12,12 @@ NPU and serves it over HTTP. It speaks both APIs typed already knows:
 
 | endpoint | notes |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI, SSE streaming, `tools`, `stop` |
-| `POST /v1/messages` | Anthropic, SSE streaming, `tools`, `stop_sequences` |
-| `GET /props` | llama.cpp-shaped: `default_generation_settings.n_ctx`, `model_alias`. Plus a namespaced `genie` block: `engine`, `single_flight`, `context_lengths`, `multi_length`, `poll` -- see the capability notes below |
+| `POST /v1/chat/completions` | OpenAI, SSE streaming (**not incremental by default** -- see below), `tools`, `stop` |
+| `POST /v1/messages` | Anthropic, SSE streaming (**not incremental by default**), `tools`, `stop_sequences` |
+| `GET /props` | llama.cpp-shaped: `default_generation_settings.n_ctx`, `model_alias`. Plus a namespaced `genie` block: `engine`, `single_flight`, `context_lengths`, `multi_length`, `poll` -- see the capability notes below. `multi_length` and `poll` are TRI-state: **`null` means unknown** (no compiled-length list in the bundle's metadata; no `poll` key read from its config), never `false` or `true`, so do not rank on a null |
 | `GET /v1/models` | superset item satisfying both OpenAI and Anthropic shapes |
 | `GET /v1/models/<id>` | the same item for the served id; any other id is a 404 with `code: "model_not_found"` naming the model that IS served (2026-09-16) |
-| `GET /health` | **engine** state (alias `/healthz`). 200 = can generate; 503 + `state` (`failing` / `stalled` / `wedged`) + `detail` = cannot. Answers during a wedge, so it is usable as a failover signal. Client aborts and full-window finishes do not count toward `failing`; an abort the server's own watchdog sent for a STALL does, so a device that stalls every turn but honours each abort still reaches `failing` (that turn's client sees an ordinary `stop`). Nothing connects, `/health` included, until the model is resident: the port is bound before the 11-35s load but listens only after it, so a refused connect or a timeout during startup means "not up yet" and an answering port means a loaded model. `token_counts` is `exact` or `estimated` -- whether the usage figures are the tokenizer's or a chars/4 guess. |
+| `GET /health` | **engine** state (alias `/healthz`). 200 = can generate; 503 + `state` (`failing` / `stalled` / `wedged`) + `detail` = cannot. Answers during a wedge, so it is usable as a failover signal. Client aborts and full-window finishes do not count toward `failing`; an abort the server's own watchdog sent for a STALL does, so a device that stalls every turn but honours each abort still reaches `failing` (that turn's client gets an error -- a 500, or a stream's error frame -- not a finish). While it says `stalled` or `wedged`, every generation POST is refused 503 too, rather than queued behind the stuck call. Nothing connects, `/health` included, until the model is resident: the port is bound before the 11-35s load but listens only after it, so a refused connect or a timeout during startup means "not up yet" and an answering port means a loaded model. `token_counts` is `exact` or `estimated` -- whether the usage figures are the tokenizer's or a chars/4 guess. |
 
 Routing ignores the query string and a trailing slash, so `/health?probe=1`
 and `/v1/messages?beta=true` route like their bare forms. `/v1/messages`
@@ -28,7 +28,34 @@ request; every other endpoint reports the served id.
 A streaming engine failure arrives as an error-shaped frame -- an OpenAI
 `data: {"error": ...}` frame, an Anthropic `error` event -- rather than as
 `[error: ...]` text inside a content delta (changed 2026-09-16), so a router
-can detect it structurally instead of by parsing content.
+can detect it structurally instead of by parsing content. A turn the SERVER
+cut short -- its watchdog aborting a stall, or shutdown aborting the turn in
+flight -- ends the same way now (on a non-streaming request: 500 for the
+stall, 503 for shutdown), with no `finish_reason` / `stop_reason`, where it
+used to end as an ordinary `stop` / `end_turn` over a fragment. The full list
+of codes and what to do with each is under **Status codes** in "What to
+build".
+
+**Streaming is not incremental by default, and a router must not time it as
+if it were.** With the server's default `GENIE_ORPHAN_HOLD_CHARS=-1` (which
+the launcher does not change), a plain streamed reply arrives as ONE content
+frame at the end, together with the finish frame: before it the client sees
+only the opening frame (the OpenAI role delta; Anthropic's `message_start` /
+`content_block_start`) and keep-alives (`: keep-alive` comments on OpenAI,
+`ping` events on Anthropic), which still flow while the reply is held. The
+reason is correctness, not buffering for its own sake: with reasoning
+suppressed Qwen3 sometimes writes its reasoning anyway and closes it with a
+stray `</think>`, then answers again, and SSE cannot retract a frame -- so the
+server holds the reply until it knows whether that orphan close is coming,
+and strips the duplicate (a bounded hold was measured leaking). Consequences:
+**time to first token equals total latency** on this endpoint, so TTFT and
+inter-token timing over SSE must not be used to rank it or to measure its
+decode rate (use `usage` over wall time, or `bench_endpoint`'s non-streamed
+delta). Two exceptions stream incrementally even under the default: a
+request that asks for thinking (the gate starts open), and a server started
+with `GENIE_ORPHAN_HOLD_CHARS=0` (which ships the occasional doubled answer).
+Tool streams are buffered whatever the setting, since a half-emitted
+`<tool_call>` is worse than a slower one.
 
 Default bind is `127.0.0.1:8123` **when launched through
 `src/run-genie-server.ps1`**, which is the supported way to start it and the
@@ -178,7 +205,9 @@ every token, which is why it is flat across far wider spans (16384: 3.26 t/s at
 mechanism was read off the context binaries, not inferred from timings: 2
 compiled graphs in the single-length bundle, 10 in the multi-length one. Table
 and provenance in the **bundle build note** inside the concurrency section;
-`/props` reports `genie.multi_length` so a router can tell which kind it has.
+`/props` reports `genie.multi_length` so a router can tell which kind it has
+-- `true`, `false`, or `null` when the bundle's metadata carries no compiled
+lengths, which is unknown and must not be read as `false` (single-length).
 
 For a router: **a rate measured at d469 will overstate a multi-length endpoint
 -- the 4096 prebuilt and the default 8192-multi alike -- by ~40% on a long
@@ -414,7 +443,8 @@ zero extra HTP memory. **A router should therefore not assume a deep-window NPU
 endpoint is slow on short prompts** -- that depends on how the bundle was built,
 which `n_ctx` alone cannot tell you. `/props` now reports it directly as
 `genie.multi_length`, so prefer reading it; measuring at two depths remains the
-fallback for any endpoint that does not publish the field.
+fallback for any endpoint that does not publish the field -- and for one that
+publishes it as `null` (build unknown).
 
 *Verified, for the bare NPU figures, by a second fingerprint:* every one was
 reported as `shallow median X t/s (n=3)`. That string occurs once in this repo,
@@ -575,7 +605,20 @@ background load, the warmup sends one request in exactly that shape -- the full
 `--load-tokens`, under the generator's own 180 s cap -- to EACH server, and the
 run refuses if either cannot serve it, printing that server's `n_ctx` --
 otherwise every generator request would fail the same way and the "contended"
-legs would be measured against an idle peer. `--load-depth` /
+legs would be measured against an idle peer. An `--npu` or `--gpu` that is not
+an `http://` / `https://` URL with a host and a port in 1-65535 is refused at
+startup too (argparse's usage line plus the error, exit 2) -- a bare
+`127.0.0.1:8123` used to fail the ping as "unknown url type" and then say to
+start a server that was already answering on that port. And a ping
+that fails (still exit 2) now says which of two things it met, since they need
+opposite advice: **nothing listening** -- either the server is not running, or
+a `genie_server` there is still loading its bundle (11-35 s: it holds the
+port but refuses connections until the model is resident), so wait for its
+`endpoint on` line before starting another -- or **something took the
+connection** and did not answer the ping with a usable completion, so
+something is serving there and a second server must not be started on that
+port. Only on that failure path, one TCP connect (10 s cap) tells them apart.
+`--load-depth` /
 `--load-tokens` shape the background load separately
 from the measurement (both default to `--depth` / `--tokens`), and the peer's
 load is reported per engine as served / `shed` (429 or 529) / `failed` with
@@ -619,15 +662,51 @@ misconfigured bundle and is withdrawn.
    routing, but it is precisely the shed-to-next-engine signal a dispatcher
    needs. Treat it as "try another engine", not as an error to surface.
 
-   A second shed code joins it: a request the server would not START because
-   shutdown had begun is answered **503** (`server_error` / `api_error`), not
-   500 -- nothing was attempted and nothing about the request was wrong. Both
-   messages name it (`the engine is shutting down: no new generation will
-   start, ...` for a turn already parked on the engine lock when Ctrl-C
-   arrived, `the engine is closed: ...` once the dialog is freed). Route it
-   like the 429/529, not like a failure of the request. On a stream whose 200
-   is already out it arrives as the usual error frame or event instead, since
-   there is no status left to carry it.
+   A second shed code joins it: **503** (`server_error` / `api_error`) on a
+   generation POST, in three cases, none of which says anything was wrong
+   with the request:
+
+   - shutdown had begun, so the server would not START the turn (`the engine
+     is shutting down: no new generation will start, ...` for a turn already
+     parked on the engine lock when Ctrl-C arrived, `the engine is closed:
+     ...` once the dialog is freed);
+   - shutdown cut the turn that was IN FLIGHT part-way (`the server is
+     shutting down: this generation was aborted part-way and did not finish.
+     Retry on another engine.`) -- it used to come back as a 200 `stop` over a
+     fragment;
+   - `/health` already says the engine is `stalled` or `wedged` (`engine
+     <state>: <detail>. Not queued behind it -- retry on another engine; GET
+     /health reports when this one recovers.`) -- such requests used to park
+     behind the stuck call and then be told 429/529 "busy".
+
+   Route all three like the 429/529, not like a failure of the request. On a
+   stream whose 200 is already out a server-side cut arrives as the usual
+   error frame or event instead, since there is no status left to carry it.
+
+   **Status codes.** Every status the server sends, and what a router should
+   do with it (the envelope always follows the API the path names, except
+   the unknown-path 404 below):
+
+   | code | when | router action |
+   |---|---|---|
+   | 200 | served; a stream may still END on an error frame (above) | use it -- but on a stream, treat an error frame as a failure of that engine's turn, never as content |
+   | 400 `invalid_request_error` | the request's own fault: `messages` missing or malformed, a bad output cap, a bad `Content-Length`, JSON that does not parse or is not an object, invalid Unicode, and `malformed request (<ExceptionType>: ...)` for a wrong-typed field (`temperature: "hot"`) | a client bug: fail the request, do NOT shed -- another engine gets the same body |
+   | 400, `tools` on a bundle without them | `... Retry without \`tools\`.` | disable tools for this endpoint (the `probeLocalToolCalls` case) |
+   | 400, too big for the window | the prompt, or its last tool unit, does not fit even after eviction; the message names the token counts | route to a larger window, or fail -- not a shed |
+   | 404 | an unknown path (OpenAI envelope on every path, `/v1/messages` GET included), or `GET /v1/models/<id>` for another id (`code: "model_not_found"`) | a client bug |
+   | 411 | a chunked body (`Transfer-Encoding`); send `Content-Length` | a client bug; the connection is closed |
+   | 413 | a body over `GENIE_MAX_BODY_BYTES` (8 MiB default) | a client bug; the connection is closed |
+   | 429 (OpenAI) / 529 `overloaded_error` (Anthropic) | the single-flight queue is full | **shed** to another engine |
+   | 503 | the three cases above; also `GET /health` when the engine cannot serve | **shed**; poll `/health` for recovery |
+   | 500 `server_error` / `api_error` | the engine failed the turn: a Genie error (`GenieDialog_query failed, status=N (NAME)` -- the HTP `Code 1003` fault arrives this way on a non-streaming request), the watchdog cutting a stall, or an unhandled exception | fail over this request; count it against the engine; `/health` says whether it is still usable |
+   | 501 | `HEAD` or `OPTIONS` on any path (the stdlib's text/html refusal) | probe liveness with `GET /health`, never `HEAD` |
+
+   The server sends no `Retry-After` or `x-should-retry` header. An
+   OpenAI or Anthropic SDK left at its default retries a 429 / 529 on its
+   own -- measured: two retries, ~1.3 s before the error surfaced -- so a
+   router built on one should set `max_retries=0` and make the shed decision
+   itself. (typed's own local provider uses raw fetch, so this bites only a
+   router built on an SDK.)
 4. ~~**Health checks that survive the wedge.**~~ **DONE server-side 2026-08-24
    -- `/health` is no longer a liveness ping.** It reports engine state and
    returns 503 with a `state` (`failing` / `stalled` / `wedged`) and a `detail`
@@ -649,7 +728,10 @@ misconfigured bundle and is withdrawn.
    concurrent GPU + NPU win (1.70x to 1.26x in the controlled A/B; an earlier
    uncontrolled run read this as a net loss and that reading is retracted). If
    typed ever manages these bundles, assert the flag rather than trusting the
-   vendor default.
+   vendor default. `/props` reports it as `genie.poll`: `true`, `false`, or
+   `null` when no `poll` key was read (absent from the config, or the config
+   unreadable) -- which is unknown, NOT the shipped `true`, since what the
+   runtime does with the key absent is not measured.
 6. **Engine lifecycle -- and a hot spare is free.** This brief recommended
    stopping an idle engine rather than parking it hot, on the strength of a 15%
    penalty a merely-resident NPU server imposed on the GPU. That penalty was
@@ -750,10 +832,17 @@ These are properties of the NPU endpoint that a router must not assume away:
   likelier reading), not a detection -- and `stop_sequence` is always `null`.
   (This bullet claimed a real distinction until 2026-09-16.) `max_tokens`
   (`finish_reason: "length"` on the OpenAI side) is reported when the cap is
-  hit -- real at the cap as of 2026-09-16; before that a generation that ran
-  into its cap reported as a natural stop and `length` meant only the engine's
-  context-exceeded warning. `tool_use` takes precedence when the reply carries
-  a tool call.
+  hit -- as of 2026-09-16; before that a generation that ran into its cap
+  reported as a natural stop and `length` meant only the engine's
+  context-exceeded warning. **Checked on the NPU on 2026-09-18:** a 6-token
+  cap on the 4B multi-length bundle returned `finish_reason: "length"` and
+  `stop_reason: "max_tokens"` on both APIs, on `master` and on the branch
+  after it. That is one bundle and one cap size, so a router should still
+  allow for an unexpected `stop` near the cap on other bundles.
+  `tool_use` takes precedence when the reply carries a tool call. None of
+  these can be a turn the server cut short any more: a stall the watchdog
+  aborted, or a turn shutdown aborted, arrives as an error (500 / 503, or an
+  error frame), so `stop_sequence` / `end_turn` no longer hide a stall.
 - **Sampling is server-level, not per-request.** `temperature` / `top_p` /
   `top_k` are accepted and **not honoured** -- the runtime binds its sampler at
   load time and ignores a later change. Do not build routing logic that depends

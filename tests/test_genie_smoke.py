@@ -418,6 +418,13 @@ def test_the_refused_fail_names_the_launcher_port_and_the_bare_one(monkeypatch, 
     assert "Nothing is listening at http://127.0.0.1:8123" in out
     assert "run-genie-server.ps1 serves on 8123" in out
     assert "GENIE_PORT" in out and "8080" in out, "and where a bare server is"
+    # And the other reading of a refused connect, BEFORE the ports: a
+    # genie_server still loading refuses connects exactly like a closed port,
+    # and "start one" is then advice to load a second bundle onto a shared NPU.
+    # The same words bench_endpoint.STILL_LOADING uses (copied, not imported).
+    assert "still loading its bundle" in out
+    assert "wait for its `endpoint on` line" in out
+    assert out.index("still loading") < out.index("run-genie-server.ps1 serves")
 
 
 def test_nothing_listening_is_a_refused_connect_and_nothing_else():
