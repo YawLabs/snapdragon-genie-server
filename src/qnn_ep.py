@@ -30,8 +30,21 @@ import os
 import sys
 import tempfile
 
-import onnxruntime as ort
-import onnxruntime_qnn as qnn
+try:
+    import onnxruntime as ort
+    import onnxruntime_qnn as qnn
+except ImportError as e:
+    # Both wheels are Snapdragon-only and the README's Install section is the
+    # whole fix (a clean venv; the pinned onnxruntime-qnn 2.x REQUIRES plain
+    # onnxruntime and pulls it in -- only the 1.x line shipped its own copy and
+    # collided with it); say so here, because
+    # nothing below this line can run without them and the hint that used to
+    # live in get_qnn_device's error text was unreachable for exactly this
+    # case -- a missing package fails at this import, never in that function.
+    raise ImportError(
+        "qnn_ep needs the onnxruntime-qnn wheel (and the onnxruntime it pulls in): "
+        "`pip install -r requirements.txt` in a clean venv -- "
+        "see README, Install. Original error: %s" % e) from e
 
 QNN_EP_NAME = "QNNExecutionProvider"
 
@@ -74,9 +87,12 @@ def get_qnn_device(kind: str = "NPU"):
     devices = [d for d in list_qnn_devices() if d.device.type == want]
     if not devices:
         available = [(d.ep_name, str(d.device.type)) for d in list_qnn_devices()]
+        # Reaching here means onnxruntime_qnn imported, so "is the package
+        # installed?" is answered already; the message used to ask it anyway.
         raise RuntimeError(
             f"No QNN {kind} device found. Available QNN devices: {available}. "
-            "Is onnxruntime-qnn installed and the machine a Snapdragon with HTP?"
+            "onnxruntime-qnn is importable, so this is not a missing package: "
+            "is the machine a Snapdragon with the Hexagon HTP driver present?"
         )
     return devices[0]
 
@@ -88,24 +104,35 @@ def capture_native_output():
     ONNX Runtime's QNN logger writes the HTP compile stages at the C level, so
     Python-level redirection (contextlib.redirect_stdout) does not catch them;
     we have to dup2 the file descriptors. Yields a dict whose "text" key holds
-    the captured output once the block exits.
+    the captured output once the block exits -- filled whether the body
+    returned or raised, so a caller that catches can still read it.
+
+    The redirect itself happens inside the try: if the second dup2 failed
+    after the first had already pointed fd 1 at the temp file, a setup outside
+    the try had nothing to put it back, and every later print in the process
+    went into that file. Each saved descriptor is restored and closed only if
+    it was actually taken.
     """
     box = {"text": ""}
     tmp = tempfile.TemporaryFile(mode="w+b")
-    saved_out, saved_err = os.dup(1), os.dup(2)
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os.dup2(tmp.fileno(), 1)
-    os.dup2(tmp.fileno(), 2)
+    saved_out = saved_err = None
     try:
+        saved_out = os.dup(1)
+        saved_err = os.dup(2)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(tmp.fileno(), 1)
+        os.dup2(tmp.fileno(), 2)
         yield box
     finally:
         sys.stdout.flush()
         sys.stderr.flush()
-        os.dup2(saved_out, 1)
-        os.dup2(saved_err, 2)
-        os.close(saved_out)
-        os.close(saved_err)
+        if saved_out is not None:
+            os.dup2(saved_out, 1)
+            os.close(saved_out)
+        if saved_err is not None:
+            os.dup2(saved_err, 2)
+            os.close(saved_err)
         tmp.seek(0)
         box["text"] = tmp.read().decode("utf-8", "replace")
         tmp.close()
@@ -161,8 +188,21 @@ def build_session(
             opts.update(extra_options)
         so.add_provider_for_devices([device], opts)
 
-    with capture_native_output() as box:
-        session = ort.InferenceSession(model_path, sess_options=so)
+    box = {"text": ""}   # stays empty if the capture's own setup raises
+    try:
+        with capture_native_output() as box:
+            session = ort.InferenceSession(model_path, sess_options=so)
+    except Exception as e:
+        # fd 2 was redirected for the whole build, so the HTP backend's own
+        # error text -- which ORT's exception does not carry -- landed in the
+        # capture and used to go nowhere: the exception propagated, the
+        # finally filled box["text"], and no one read it. The capture has
+        # already run its finally by the time this clause executes, so the
+        # text is complete here; it rides along as a note on the same
+        # exception (type and traceback unchanged) and prints with it.
+        e.add_note("Captured native QNN/ORT output during the failed build (first 2KB):\n"
+                   + (box["text"][:2048] if box["text"] else "<empty>"))
+        raise
     log = box["text"]
 
     if use_npu:
@@ -190,7 +230,16 @@ def build_session(
 
 
 def assert_htp_placement(info: dict) -> None:
-    """Raise PlacementError unless `info` (from build_session) proves HTP use."""
+    """Raise PlacementError unless `info` (from build_session) proves HTP use.
+
+    A library helper for callers outside this repo. Nothing in here calls it:
+    build_session(verify=True) raises the same PlacementError itself, and
+    bench.py passes its own verify flag through and copies
+    info["htp_verified"] into the result row instead. It stays because the
+    README lists this module as "register + pick-NPU + build-session + HTP
+    placement assertion", and a caller that builds with verify=False and
+    decides later needs exactly this check.
+    """
     if not info.get("htp_verified"):
         raise PlacementError(
             f"HTP placement not verified; providers={info.get('providers')}"

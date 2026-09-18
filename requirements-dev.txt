@@ -11,13 +11,28 @@
 pytest>=8.0
 ruff>=0.16          # lint gate, configured in pyproject.toml
 tokenizers>=0.20    # NOT a server dependency, and not needed by the tests
-                    # either. src/bench_servers.py counts generated tokens
-                    # locally because one of the servers it measures reports
-                    # `usage` as all zeros, and measuring one arm through the
-                    # usage block and the other through a fallback would be
-                    # two instruments rather than one measurement.
+                    # either -- they stub the tokenizer. Two hardware tools
+                    # need it: src/bench_servers.py and
+                    # src/probe_server_semantics.py size their prompts with
+                    # the bundle's own tokenizer.json (via
+                    # src/prompt_depth.py, which imports it lazily and exits
+                    # with a `pip install tokenizers` sentence when it is
+                    # missing), and bench_servers counts the GENERATED tokens
+                    # with it too -- so both arms of a comparison are
+                    # measured by ONE instrument rather than by each
+                    # server's own `usage` convention. (The server that
+                    # reports `usage` as all zeros is GenieAPIService, which
+                    # honours no output cap and so cannot be a bench_servers
+                    # arm at all.)
 numpy>=1.26         # NOT a server dependency. tests/test_bench.py imports
                     # src/bench.py, which needs numpy for real; onnx and
                     # onnxruntime are stubbed there because they are
                     # win_arm64-only wheels. numpy is not stubbed because
                     # stubbing it would mean testing against a fake array.
+#
+# pytest-cov is deliberately NOT listed: nothing above needs coverage and the
+# repo has no CI to collect it. In a venv built from THIS file, `python -m
+# pytest --cov` is therefore "unrecognized arguments: --cov" until you `pip
+# install pytest-cov` yourself -- your own venv may already have it from
+# somewhere else, and the flag works there. .gitignore already covers what
+# it writes.

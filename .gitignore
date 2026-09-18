@@ -18,12 +18,21 @@ __pycache__/
 *.gguf
 models/
 
-# coverage (pytest --cov writes this; the repo has no CI to collect it)
+# coverage. `pytest --cov` writes these, and that flag comes from pytest-cov,
+# which is deliberately NOT in requirements-dev.txt -- in the documented dev
+# venv it is "unrecognized arguments: --cov" until you `pip install pytest-cov`
+# yourself. Ignored anyway, because the repo has no CI to collect them and a
+# local run should not leave something for `git add -A` to sweep in.
 .coverage
 htmlcov/
 
 # logs / scratch
 *.log
+# src/bench_servers.py's default --out, written to the CWD -- so a sweep run
+# from the repo root leaves it here, and a `git add -A` would sweep a box's
+# raw measurements into the repo. (Its per-arm logs, bench_servers-<arm>.log,
+# are covered by *.log above.)
+sweep-results.json
 
 # staging for a Hugging Face model release -- deliberately untracked, so a
 # `git add -A` cannot sweep an unpublished model card into this repo

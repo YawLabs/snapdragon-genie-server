@@ -63,14 +63,15 @@ if (-not (Test-Path $server)) {
 # --- per-leg defaults (locals; an explicitly exported LLAMA_* wins) ---------
 $hf = $env:LLAMA_HF
 $gguf = $env:LLAMA_GGUF
+$cpuDefaultHf = "unsloth/Qwen3.5-9B-GGUF:Q4_0"
 if ($Leg -eq "cpu") {
     # The operator's CPU serving config, with the quant corrected to Q4_0 (see
     # the correctness note above -- Q8_0 does not generate on this build).
     # Via -hf: llama-server fetches into the HF cache itself (~5.4 GB once).
     # 8080 because this leg IS typed's local endpoint; the Genie NPU server
     # stays on 8123.
-    if (-not ($hf -or $gguf)) { $hf = "unsloth/Qwen3.5-9B-GGUF:Q4_0" }
-    $port  = if ($env:LLAMA_PORT) { $env:LLAMA_PORT } else { "8080" }
+    if (-not ($hf -or $gguf)) { $hf = $cpuDefaultHf }
+    $portDefault = "8080"
     # No -a by default on this leg, deliberately: without it the server
     # reports the -hf spec ("unsloth/Qwen3.5-9B-GGUF:Q4_0"), which is what
     # the hand-run instances have always advertised -- a client keyed on that
@@ -81,14 +82,34 @@ if ($Leg -eq "cpu") {
     # both legs can serve at once. Fetch the file with:
     #   hf download unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-Q4_K_M.gguf --local-dir <root>\gguf
     if (-not ($hf -or $gguf)) { $gguf = Join-Path $root "gguf\Qwen3.5-9B-Q4_K_M.gguf" }
-    $port  = if ($env:LLAMA_PORT) { $env:LLAMA_PORT } else { "8124" }
+    $portDefault = "8124"
     # A fresh endpoint nothing routes on yet, so it gets a clean self-id.
     $alias = if ($env:LLAMA_ALIAS) { $env:LLAMA_ALIAS } else { "qwen3.5-9b-gpu" }
 }
+# Port: parsed and range-checked here, before any child exists, in the shape
+# the health timeout below uses. It used to be raw-cast at the conflict check,
+# where LLAMA_PORT=abc died with a bare "Cannot convert value" -- no [run]
+# line, nothing naming the variable. Junk falls back loudly to the leg default.
+$port = $portDefault
+if ($env:LLAMA_PORT) {
+    $p = 0
+    if ([int]::TryParse($env:LLAMA_PORT, [ref]$p) -and $p -ge 1 -and $p -le 65535) { $port = "$p" }
+    else { Write-Host "[run] WARNING: LLAMA_PORT='$($env:LLAMA_PORT)' is not a port number (1-65535); using $portDefault." }
+}
+# When both are exported the GGUF wins -- -m and -hf cannot both go to the
+# server, and a local file is the more deliberate of the two -- and the
+# launcher says so: a silently dropped LLAMA_HF is the kind of thing an
+# operator finds out about from the model id in a benchmark table. The quant
+# warnings below run against the SELECTED source only; matching the
+# concatenation of both used to flag a Q8_0 in the spec that was discarded.
+if ($hf -and $gguf) {
+    Write-Host "[run] note: both LLAMA_HF and LLAMA_GGUF are set; using LLAMA_GGUF ($gguf), ignoring LLAMA_HF ($hf)."
+    $hf = $null
+}
+$src = if ($gguf) { $gguf } else { $hf }
 # An exported model spec still applies to whichever leg runs next, so say so
 # out loud when it lands the known-wrong quant on an engine. Warn, not refuse:
 # the operator may be measuring exactly this.
-$src = "$hf$gguf"
 if ($src -match "Q8_0") {
     Write-Host "[run] WARNING: a Q8_0 model is selected. On this build Qwen3.5-9B Q8_0 does"
     Write-Host "[run] NOT generate -- empty completions / bare newlines, verified against the"
@@ -110,8 +131,17 @@ $bindHost = if ($env:LLAMA_HOST) { $env:LLAMA_HOST } else { "127.0.0.1" }
 # The bind address is not always a dialable address: the health probe cannot
 # dial 0.0.0.0 on Windows, so probe loopback when binding wildcard.
 $probeHost = if ($bindHost -eq "0.0.0.0" -or $bindHost -eq "::") { "127.0.0.1" } else { $bindHost }
+# An IPv6 literal needs brackets in a URL. An unbracketed "http://::1:8124" is
+# unparseable: Invoke-WebRequest threw on every probe, the empty catch below
+# swallowed it, and a healthy server was killed at the deadline as "not
+# healthy". Used for the probe and for the printed endpoint.
+$urlHost = if ($probeHost -match ":") { "[$probeHost]" } else { $probeHost }
 $ctx     = if ($env:LLAMA_CTX)     { $env:LLAMA_CTX }     else { "64000" }
 $threads = if ($env:LLAMA_THREADS) { $env:LLAMA_THREADS } else { "6" }
+# Prompt-cache budget in MiB. 16384 is sized for THIS box: a 32 GB pool shared
+# with the Genie server and a 64000-token q8_0 KV. A 16 GB machine wants it
+# lower. Passed through as a string like ctx and threads; the server validates.
+$cacheRam = if ($env:LLAMA_CACHE_RAM) { $env:LLAMA_CACHE_RAM } else { "16384" }
 # Health timeout: parsed and clamped HERE, before any child process exists. A
 # junk value used to throw at the [int] cast AFTER Start-Process -- the
 # launcher died and the just-started server was orphaned, unsupervised. And a
@@ -133,10 +163,15 @@ if (-not (Test-Path $slotDir)) { New-Item -ItemType Directory -Force $slotDir | 
 # Refuse a port something is already serving, for the same reason the Genie
 # server does: on Windows two processes can both hold a port and the OLD one
 # keeps answering, so a clean startup log proves nothing about who your
-# requests reach (it happened -- see GENIE_SERVER.md). Checked via the
-# listener table, not a dial: a dial to loopback cannot see a listener bound
-# to a single non-loopback interface, and a wildcard bind coexists with such
-# a listener silently. A conflict is: we bind wildcard and ANYTHING listens
+# requests reach (it happened -- see GENIE_SERVER.md). The two sides check
+# differently on purpose, and neither is the other's fallback: genie_server.py
+# dials the address it is about to bind (port_in_use; loopback for a wildcard
+# bind), because Python has no listener table without psutil or a netstat
+# parse and a dial answers the question that server needs answered.
+# PowerShell gets Get-NetTCPConnection for free, so this side reads the
+# listener table, which also covers the shapes a loopback dial cannot see: a
+# listener bound to one non-loopback interface, or a wildcard bind coexisting
+# with such a listener. A conflict is: we bind wildcard and ANYTHING listens
 # on the port, or something listens on wildcard, or on our exact address.
 $wildcards = @("0.0.0.0", "::")
 $conflict = Get-NetTCPConnection -LocalPort ([int]$port) -State Listen -ErrorAction SilentlyContinue |
@@ -150,11 +185,31 @@ if ($conflict) {
 
 $logDir = Join-Path $root "logs"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory $logDir | Out-Null }
-# Port in the name, not just the leg: the refusal above says "set LLAMA_PORT"
-# to run a second instance, and two same-leg instances sharing one log file
-# would have the second TRUNCATE the first's live log (verified: the redirect
-# open succeeds against the in-use file).
-$log = Join-Path $logDir "llama-server-qwen3.5-9b-$Leg-$port.log"
+# The stem names the model actually selected, not a hardcoded qwen3.5-9b:
+# LLAMA_HF / LLAMA_GGUF can pick anything (the quant warnings above exist
+# because they do), and a log named for a model it does not contain is worse
+# than an anonymous one. The leaf of the spec -- the file name, or the
+# repo:quant tail of an -hf spec -- carries the quant, which on this leg has
+# been the whole story more than once; characters a file name cannot hold
+# become dashes. Port in the name, not just the leg: the refusal above says
+# "set LLAMA_PORT" to run a second instance, and two same-leg instances
+# sharing one log file would have the second TRUNCATE the first's live log
+# (verified: the redirect open succeeds against the in-use file).
+$stem = ((Split-Path -Leaf $src) -replace '\.gguf$', '') -replace '[^A-Za-z0-9._-]', '-'
+$log = Join-Path $logDir "llama-server-$stem-$Leg-$port.log"
+# Keep the previous run's logs. -RedirectStandardOutput / -RedirectStandardError
+# truncate on open, so the relaunch after a crash destroyed the very crash
+# reason the messages below point at as "full logs". One generation, renamed
+# to .prev rather than timestamped: a file per launch grows without bound at
+# the gpu leg's -lv 5 volume, and the post-mortem that matters is the last one.
+$prev = $log -replace '\.log$', '.prev.log'
+$keptPrev = $false
+foreach ($suffix in @("", ".err")) {
+    if (Test-Path ($log + $suffix)) {
+        try { Move-Item -Force ($log + $suffix) ($prev + $suffix); $keptPrev = $true }
+        catch { Write-Host "[run] WARNING: could not keep the previous log $($log + $suffix): $($_.Exception.Message)" }
+    }
+}
 
 # Start-Process -ArgumentList under PS 5.1 joins elements with spaces and NO
 # quoting, so a path containing a space shatters into two argv entries
@@ -172,7 +227,7 @@ $srvArgs = @(
     "--ctx-size", $ctx,
     "--slot-save-path", (Add-Quotes $slotDir),
     "--slots",
-    "--cache-ram", "16384",
+    "--cache-ram", $cacheRam,
     # Reasoning OFF for the same reason the Genie server suppresses Qwen3's
     # think block by default: 10-17x on an agent turn. preserve_thinking keeps
     # prior-turn thinking in the template so history replays byte-stable.
@@ -223,8 +278,12 @@ else       { $srvArgs = @("-hf", $hf) + $srvArgs }
 if ($env:LLAMA_EXTRA_ARGS) { $srvArgs += ($env:LLAMA_EXTRA_ARGS -split " ") }
 
 Write-Host "[run] starting llama-server ($Leg leg) on ${bindHost}:${port}"
-Write-Host "[run] model: $(if ($gguf) { $gguf } else { $hf + ' (HF cache; ~5.4 GB on first fetch)' })"
+# The ~5.4 GB figure is the cpu-leg default's size and nothing else's, so it
+# is only printed for that spec.
+$hfNote = if ($hf -eq $cpuDefaultHf) { " (HF cache; ~5.4 GB on first fetch)" } else { " (HF cache; fetched on first run)" }
+Write-Host "[run] model: $(if ($gguf) { $gguf } else { $hf + $hfNote })"
 Write-Host "[run] log:   $log(.err)"
+if ($keptPrev) { Write-Host "[run] previous run's logs kept as $prev(.err)" }
 $proc = Start-Process -FilePath $server -ArgumentList $srvArgs `
     -RedirectStandardOutput $log -RedirectStandardError ($log + ".err") `
     -NoNewWindow -PassThru
@@ -262,7 +321,9 @@ function Read-NewText([string]$path, [long]$pos) {
 # otherwise leak fragments). At -lv 5 the server writes 15-20 "D"-severity
 # lines per decoded token; those stay in the file and out of the console.
 $stream = @{ outPos = 0L; errPos = 0L; outCarry = ""; errCarry = "" }
-$filterDebug = ($Leg -eq "gpu")
+# Also when LLAMA_EXTRA_ARGS raises the verbosity on the cpu leg -- the
+# placement report below suggests exactly that -- or the console floods.
+$filterDebug = ($Leg -eq "gpu") -or ($env:LLAMA_EXTRA_ARGS -match '(^|\s)-lv\s+([4-9]|\d{2,})(\s|$)')
 function Drain-Logs {
     foreach ($k in @("out", "err")) {
         $path = if ($k -eq "out") { $log } else { $log + ".err" }
@@ -287,7 +348,8 @@ function Flush-Carry {
 # Wait for health on a wall-clock deadline (an iteration-counted loop ran up
 # to ~3x the stated timeout: each pass is 1s of sleep PLUS up to 2s of probe
 # timeout). The server's own output streams throughout, so a first -hf run's
-# ~5.4 GB download and the model load are visible progress, not silence.
+# download (~5.4 GB for the cpu-leg default) and the model load are visible
+# progress, not silence.
 $deadline = (Get-Date).AddSeconds($timeout)
 $up = $false
 while ((Get-Date) -lt $deadline) {
@@ -296,7 +358,7 @@ while ((Get-Date) -lt $deadline) {
     Drain-Logs
     try {
         $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 `
-             "http://${probeHost}:${port}/health"
+             "http://${urlHost}:${port}/health"
         if ($r.StatusCode -eq 200) { $up = $true; break }
     } catch { }
 }
@@ -309,12 +371,16 @@ if (-not $up) {
         $code = $proc.ExitCode
         if ($null -eq $code) { $code = 1 }
         Write-Host "[run] llama-server exited $code during startup -- see its stderr above; full logs: $log(.err)"
-    } else {
-        Write-Host "[run] server not healthy after ${timeout}s (LLAMA_HEALTH_TIMEOUT, default 1800)."
-        Write-Host "[run] If the lines above show a first-run -hf download still in progress, raise"
-        Write-Host "[run] LLAMA_HEALTH_TIMEOUT or pre-download with 'hf download'. Stopping the server; logs: ${log}.err"
-        Stop-Process -Id $proc.Id -Force -Confirm:$false
+        # The server's own code, as the post-health loop propagates it; both
+        # startup failures used to leave as 1, so an outer script could not
+        # tell a crash-on-load from an expired health timeout. The timeout
+        # keeps 1 below: there the launcher, not the server, decided to stop.
+        exit $code
     }
+    Write-Host "[run] server not healthy after ${timeout}s (LLAMA_HEALTH_TIMEOUT, default 1800)."
+    Write-Host "[run] If the lines above show a first-run -hf download still in progress, raise"
+    Write-Host "[run] LLAMA_HEALTH_TIMEOUT or pre-download with 'hf download'. Stopping the server; logs: ${log}.err"
+    Stop-Process -Id $proc.Id -Force -Confirm:$false
     exit 1
 }
 
@@ -323,18 +389,47 @@ if (-not $up) {
 # error, requests answered, at CPU speed by the wrong engine. The device line
 # in the log is the one signal worth trusting; a throughput number is not (a
 # CPU-vs-GPU pair measured 0.2% apart here).
-$dev = Select-String -Path $log, ($log + ".err") -Pattern "using device" -SimpleMatch -ErrorAction SilentlyContinue | Select-Object -First 2
-if ($dev) { $dev | ForEach-Object { Write-Host "[run] placement: $($_.Line.Trim())" } }
-else      { Write-Host "[run] placement: no 'using device' line found -- CPU-only load (KleidiAI)." }
+#
+# That line exists only at -lv 5 (this build maps the library's INFO above its
+# default verbosity 3), and only the gpu leg passes -lv 5. So on the cpu leg
+# the honest report is "not checked". The old line asserted "CPU-only load
+# (KleidiAI)" on every cpu-leg start against a placement it could not see, and
+# the assertion was wrong in a way that matters: this leg pins neither
+# --device nor -ngl, the fork's -ngl default is auto, and a real cpu-leg log on
+# this box shows the OpenCL backend engaged in the process. What can be seen is
+# reported; what cannot is named as unchecked, with the two knobs that settle
+# it; and a log that cannot be read says so instead of being folded into "no
+# line found".
+function Find-InLog([string]$pattern) {
+    # try/catch rather than -ErrorAction: under $ErrorActionPreference = "Stop"
+    # a Select-String path error is terminating whatever the parameter says
+    # (probe-verified on PS 5.1), and this runs OUTSIDE the try/finally below
+    # -- a throw here would orphan the healthy server it just probed.
+    try { return @(Select-String -Path $log, ($log + ".err") -Pattern $pattern -SimpleMatch) }
+    catch { $script:logReadError = $_.Exception.Message; return @() }
+}
+$logReadError = $null
+$dev = @(Find-InLog "using device") | Select-Object -First 2
+if ($logReadError) { Write-Host "[run] placement: could not read the log -- $logReadError" }
+elseif ($dev)      { $dev | ForEach-Object { Write-Host "[run] placement: $($_.Line.Trim())" } }
+elseif ($Leg -eq "gpu") { Write-Host "[run] placement: no 'using device' line found." }
+else {
+    Write-Host "[run] placement: not checked -- the device line needs -lv 5, which only the gpu leg passes."
+    if (@(Find-InLog "OpenCL").Count -gt 0) {
+        Write-Host "[run] The log mentions the OpenCL backend: with this build's -ngl default (auto), some"
+        Write-Host "[run] layers may be on the Adreno rather than the CPU this leg is named for."
+    }
+    Write-Host "[run] LLAMA_EXTRA_ARGS='-lv 5' shows the device line; LLAMA_EXTRA_ARGS='--device none' pins the CPU."
+}
 if ($Leg -eq "gpu") {
-    $onGpu = Select-String -Path $log, ($log + ".err") -Pattern "using device GPUOpenCL" -SimpleMatch -Quiet -ErrorAction SilentlyContinue
+    $onGpu = (@(Find-InLog "using device GPUOpenCL").Count -gt 0)
     if (-not $onGpu) {
         Write-Host "[run] WARNING: gpu leg requested but no 'using device GPUOpenCL' in the log."
         Write-Host "[run] Requests may be served by the CPU on the WRONG quant for it (Q4_K_M)."
         Write-Host "[run] Verify with the GPU engine-utilisation counter before trusting numbers."
     }
 }
-Write-Host "[run] up: http://${probeHost}:${port}/v1/chat/completions  (Ctrl-C stops it)"
+Write-Host "[run] up: http://${urlHost}:${port}/v1/chat/completions  (Ctrl-C stops it)"
 
 # Stream the logs until the server exits or the operator Ctrl-Cs. finally runs
 # on Ctrl-C in PowerShell, so the child does not outlive the launcher. One

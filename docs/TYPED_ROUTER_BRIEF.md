@@ -16,9 +16,27 @@ NPU and serves it over HTTP. It speaks both APIs typed already knows:
 | `POST /v1/messages` | Anthropic, SSE streaming, `tools`, `stop_sequences` |
 | `GET /props` | llama.cpp-shaped: `default_generation_settings.n_ctx`, `model_alias`. Plus a namespaced `genie` block: `engine`, `single_flight`, `context_lengths`, `multi_length`, `poll` -- see the capability notes below |
 | `GET /v1/models` | superset item satisfying both OpenAI and Anthropic shapes |
-| `GET /health` | **engine** state. 200 = can generate; 503 + `state` (`failing` / `stalled` / `wedged`) + `detail` = cannot. Answers during a wedge, so it is usable as a failover signal. |
+| `GET /v1/models/<id>` | the same item for the served id; any other id is a 404 with `code: "model_not_found"` naming the model that IS served (2026-09-16) |
+| `GET /health` | **engine** state (alias `/healthz`). 200 = can generate; 503 + `state` (`failing` / `stalled` / `wedged`) + `detail` = cannot. Answers during a wedge, so it is usable as a failover signal. Client aborts and full-window finishes do not count toward `failing`; an abort the server's own watchdog sent for a STALL does, so a device that stalls every turn but honours each abort still reaches `failing` (that turn's client sees an ordinary `stop`). Nothing connects, `/health` included, until the model is resident: the port is bound before the 11-35s load but listens only after it, so a refused connect or a timeout during startup means "not up yet" and an answering port means a loaded model. `token_counts` is `exact` or `estimated` -- whether the usage figures are the tokenizer's or a chars/4 guess. |
 
-Default bind is `127.0.0.1:8123`.
+Routing ignores the query string and a trailing slash, so `/health?probe=1`
+and `/v1/messages?beta=true` route like their bare forms. `/v1/messages`
+ECHOES the request's `model` string in its reply, as the real Messages API
+does -- which is what lets a dispatcher match a fanned-out reply to its
+request; every other endpoint reports the served id.
+
+A streaming engine failure arrives as an error-shaped frame -- an OpenAI
+`data: {"error": ...}` frame, an Anthropic `error` event -- rather than as
+`[error: ...]` text inside a content delta (changed 2026-09-16), so a router
+can detect it structurally instead of by parsing content.
+
+Default bind is `127.0.0.1:8123` **when launched through
+`src/run-genie-server.ps1`**, which is the supported way to start it and the
+port every other doc here assumes. The server's own bare default (`GENIE_PORT`
+unset, `python src/genie_server.py` by hand) is **8080**, which is the port the
+llama-server CPU leg lives on -- the server refuses to start rather than share
+a held port, so a bare launch beside the CPU leg fails loudly. Register the
+launcher's 8123 and read `/props` to confirm which model answers.
 
 ## The one architectural decision already made
 
@@ -91,7 +109,12 @@ silent, so check the backend line in the server's own startup log before
 believing any GPU figure taken over HTTP.
 
 **Where the GPU figures come from.** Measured on a cooled, quiet box 2026-08-23
-with `src/bench_contention.py` in `snapdragon-genie-server`; Qwen3-4B Q4_K_M
+with **`llama-bench`** -- not `src/bench_contention.py`, as this paragraph said
+until 2026-09-16. The harness only drives HTTP endpoints and the `build-3way`
+`llama-server` of the day could not reach the Adreno (placement note above), so
+in the 2026-08-23/24 run only the NPU leg went through `bench_contention.py`;
+the `+-` stddev these figures carry is `llama-bench`'s column, which the harness
+cannot emit (provenance correction in the concurrency section). Qwen3-4B Q4_K_M
 (2.32 GiB GGUF), decode at context depth 469, n=3. **Supersedes 117 / 6.0** --
 decode was understated 3.0x. Those retired figures came from the same loaded
 window as the NPU's 277, and paid whatever a resident NPU server costs on top
@@ -138,15 +161,29 @@ Interleaved, 250 gives 18.92 / 18.45 / 18.67 against 12.77 / 12.99 / 13.32 at
 rising. The d469 readings (18.02 / 18.04 / 18.19) agree with the flat finding
 exactly; the decline simply starts past ~600 tokens.
 
-The distinction that actually predicts this is **prebuilt versus self-exported**,
-not which window. The 4096 bundle is Qualcomm's prebuilt and pays for the
-context in use; both self-exported bundles are genuinely flat across far wider
-spans (16384: 3.26 t/s at 469 against 3.27 at 10532), paying for their whole
-compiled window on every token. Why is unexplained -- see the window section.
+The distinction that actually predicts this is **multi-length versus
+single-length**, not prebuilt versus self-exported and not which window.
+(Corrected 2026-09-16: until then this paragraph named "prebuilt versus
+self-exported" as the predictor, said both self-exported bundles were
+"genuinely flat", and called the cause unexplained. The self-exported bundles it
+had in hand were the SINGLE-length `[8192]` and `[16384]` builds; the correcting
+measurement had landed further down the same document three hours later.) A
+multi-length bundle runs each token against the smallest compiled graph that
+fits the context, so decode falls as the context grows: the 4096 prebuilt is
+multi-length, and the self-exported **multi-length 8192 falls with depth
+exactly like it** -- 18.2 / 11.5 / 8.1 t/s at d250 / d3300 / d6000. A
+single-length bundle has one graph and pays for its whole compiled window on
+every token, which is why it is flat across far wider spans (16384: 3.26 t/s at
+469 against 3.27 at 10532) -- flat because it is always paying the maximum. The
+mechanism was read off the context binaries, not inferred from timings: 2
+compiled graphs in the single-length bundle, 10 in the multi-length one. Table
+and provenance in the **bundle build note** inside the concurrency section;
+`/props` reports `genie.multi_length` so a router can tell which kind it has.
 
-For a router: **a rate measured at d469 will overstate the 4096 endpoint by
-~40% on a long prompt.** Record the depth a rate was taken at, and do not
-extrapolate a shallow sample across the window.
+For a router: **a rate measured at d469 will overstate a multi-length endpoint
+-- the 4096 prebuilt and the default 8192-multi alike -- by ~40% on a long
+prompt.** Record the depth a rate was taken at, and do not extrapolate a
+shallow sample across the window.
 
 **The CPU leg is not broken -- but this is still a two-engine design, for a
 different reason.** The ~0.2 t/s this brief carried was retracted on 2026-08-24.
@@ -270,10 +307,21 @@ depressed and void -- the ratios are the result:
 | GPU solo | 1.47x | 1.32x | 1.32x | **1.32x** |
 | aggregate both hot | 1.27x | 1.07x | 1.22x | **1.22x** |
 
-The GPU row is the mechanism, measured directly: **an IDLE `genie_server` with
-`poll: true` costs the GPU 25-32% of its throughput**, because the OpenCL
-backend needs host cores per token and the busy-wait takes them. Aggregate
-throughput is 1.22x better with `poll: false`.
+The GPU row was read as the mechanism, measured directly: ~~**an IDLE
+`genie_server` with `poll: true` costs the GPU 25-32% of its throughput**~~,
+because the OpenCL backend needs host cores per token and the busy-wait takes
+them. Aggregate throughput is 1.22x better with `poll: false`.
+
+**Retracted 2026-09-03 (marked here 2026-09-16).** The controlled A/B in
+`MULTI_ENGINE.md` measured the GPU solo leg at 18.20 t/s with a `poll: false`
+NPU server resident against 18.47 with an idle `poll: true` one: 2.9 spinning
+cores cost the GPU leg **nothing measurable** on this 12-core part. The
+busy-wait's cost lands while the NPU is GENERATING -- the GPU keeps 79.2% of
+its rate contended against 64.0% -- not while the NPU sits idle. This table's
+GPU-solo ratio was taken on battery, across a flag flip nobody controlled, and
+it does not survive the controlled repeat. What survives is the direction on
+the contended leg; the idle-penalty figure should not be designed around, and
+the "hot spare is free" conclusion further down is the one to keep.
 
 **A trap in the headline metric, worth knowing before quoting it.** "Speedup vs
 best single engine" divides by a baseline that `poll` itself degrades, and in
@@ -369,12 +417,18 @@ which `n_ctx` alone cannot tell you. `/props` now reports it directly as
 fallback for any endpoint that does not publish the field.
 
 *Verified, for the bare NPU figures, by a second fingerprint:* every one was
-reported as `shallow median X t/s (n=3)`. That string occurs once in this repo
-(`bench_endpoint.py:244`), inside `_verdict()`, which has exactly one call site
-(`bench_endpoint.py:385`, inside `main()`). `bench_contention.py` imports the
-module but calls only `_post`, `chat`, `measure_decode`, `n_ctx` and
-`prompt_of` -- never `main()` or `_verdict()`. So it cannot emit that string,
-and those figures fingerprint to a standalone `bench_endpoint.py` run.
+reported as `shallow median X t/s (n=3)`. That string occurs once in this repo,
+inside `bench_endpoint.py`'s `_verdict()`, which has exactly one call site,
+inside that file's `main()`. (Cited by function rather than by line since
+2026-09-16 -- the line numbers this paragraph carried were stale within two
+weeks of being written, which is the wrong property for a fingerprint that
+sells itself as checkable from source.) `bench_contention.py` imports the
+module but calls only its helpers -- `post_timed`, `chat`, `measure_decode`,
+`n_ctx`, `prompt_of`, `box_state` and `power_reading` (the first and last were
+`_post` and `battery_state` until 2026-09-16) -- never `main()` or
+`_verdict()`. So
+it cannot emit that string, and those figures fingerprint to a standalone
+`bench_endpoint.py` run.
 
 *Verified, for the retention percentages, as derivations:* they were never read
 off a tool. Each is the quotient of two figures that each carry one of the
@@ -477,9 +531,14 @@ changed on disk, by a third party, at 2026-08-24 02:23 -- between the two halves
 of this measurement. Which half a given sample belongs to is inferred from that
 file mtime and from server start times, not from a variable held under control.
 Confirming it deliberately is about fifteen minutes (the `.orig` bundle configs
-still carry the shipped `true`: flip, run, flip back, run) and **has not been
-done**. Weight the result accordingly: the direction is not in doubt, the
-attribution to `poll` is well-supported but inferred.
+still carry the shipped `true`: flip, run, flip back, run) and ~~**has not been
+done**~~. **Done 2026-09-03** (this caveat was left unmarked until 2026-09-16):
+flag flipped between arms with nothing else touched, arm assignment verified
+live by the busy-wait's own 291.6% idle-CPU signature. The direction held --
+1.35x on aggregate, NPU solo 1.37x -- and the net-loss reading did not; see
+the retraction at the head of this section and `MULTI_ENGINE.md`, "The
+controlled poll A/B". Weight this 08-24 run as the weaker, inferred evidence
+it is; the A/B supersedes it.
 
 Three rules fall out for the router:
 
@@ -499,7 +558,42 @@ Three rules fall out for the router:
 Reproduce any of this with `src/bench_contention.py` in `snapdragon-genie-server`
 (`--npu` / `--gpu` base URLs, `--depth`, `--repeat`; it refuses to run on a
 loaded box unless you pass `--allow-loaded`, which stamps every result LOADED).
-Note that it expects both legs over HTTP; since 2026-09-03 the GPU leg is
+As of 2026-09-16 it also exits **2**, not 0, when the sweep is stopped by its
+gate (the box went onto battery -- the sample used to be taken anyway), when
+`--json` names a file that exists and `--force` was not given (refused BEFORE
+the sweep now, not after it), and when an engine answers the ping but not the
+warmup. There is also an exit **3**: the run finished, but its `--json`
+artifact could not go to the path asked for -- a file that appeared DURING the
+sweep, or an OSError out of the write -- so it went beside that path under a
+timestamped name. The results are never discarded; the non-zero exit is there
+so a wrapper branching on it does not read a fallback write as the file it
+named. Two more refusals exit 2 BEFORE the sweep. A `--tokens` below
+`GENIE_MIN_DECODE_STEPS` (16) is refused at startup, since every leg of such a
+sweep would be REFUSED as too short a window to be a rate -- after its requests
+had been paid for. And when `--load-depth` / `--load-tokens` reshape the
+background load, the warmup sends one request in exactly that shape -- the full
+`--load-tokens`, under the generator's own 180 s cap -- to EACH server, and the
+run refuses if either cannot serve it, printing that server's `n_ctx` --
+otherwise every generator request would fail the same way and the "contended"
+legs would be measured against an idle peer. `--load-depth` /
+`--load-tokens` shape the background load separately
+from the measurement (both default to `--depth` / `--tokens`), and the peer's
+load is reported per engine as served / `shed` (429 or 529) / `failed` with
+tokens per second of leg time. Read a non-zero `shed` as a finding: the load
+generator is ONE sequential client, so a healthy single-flight server never
+429s it -- a shed count means something else was in flight. The JSON names the
+engines it measured (`engines.{NPU,GPU}.{base, model, served_model, n_ctx}`),
+and `cpu_clock_pct` is replaced by `gate_clock_pct`, the readings each gated
+solo sample actually passed on.
+**Pass `--gpu http://127.0.0.1:8124` explicitly.** Since 2026-09-03
+`src/run-llama-server.ps1` puts the CPU leg on **8080** and the GPU leg
+(`-Leg gpu`) on **8124**, and the harness has no backend check of its own -- a
+"GPU" leg pointed at 8080 silently measures the CPU leg, and a CPU/GPU pair has
+already landed 0.2% apart on decode here, so nothing in the numbers would give
+it away. The harness default is 8124 as of 2026-09-16; it was 8080 from the
+days the GPU was hand-driven on that port, so a bare run from an older checkout
+measures NPU-versus-CPU labelled "GPU". Note that it expects both legs over
+HTTP; since 2026-09-03 the GPU leg is
 servable over HTTP from the `build-arm64-windows-llvm-release` build (see the
 placement note above) -- only the retired `build-3way` needs driving by hand.
 
@@ -524,6 +618,16 @@ misconfigured bundle and is withdrawn.
    (Anthropic) with `"server busy; NPU is single-flight"`. It was not built for
    routing, but it is precisely the shed-to-next-engine signal a dispatcher
    needs. Treat it as "try another engine", not as an error to surface.
+
+   A second shed code joins it: a request the server would not START because
+   shutdown had begun is answered **503** (`server_error` / `api_error`), not
+   500 -- nothing was attempted and nothing about the request was wrong. Both
+   messages name it (`the engine is shutting down: no new generation will
+   start, ...` for a turn already parked on the engine lock when Ctrl-C
+   arrived, `the engine is closed: ...` once the dialog is freed). Route it
+   like the 429/529, not like a failure of the request. On a stream whose 200
+   is already out it arrives as the usual error frame or event instead, since
+   there is no status left to carry it.
 4. ~~**Health checks that survive the wedge.**~~ **DONE server-side 2026-08-24
    -- `/health` is no longer a liveness ping.** It reports engine state and
    returns 503 with a `state` (`failing` / `stalled` / `wedged`) and a `detail`
@@ -560,11 +664,16 @@ misconfigured bundle and is withdrawn.
 
 These are properties of the NPU endpoint that a router must not assume away:
 
-- **Context is 4096 tokens** on the default bundle. Read it from `/props`; do
-  not hardcode. For scale: a realistic agent preamble (system prompt + 6 tool
-  schemas + one user turn) measured **626 tokens**, leaving ~3470, and real
-  source code runs ~10-13 tokens/line. That is roughly one medium file in
-  context.
+- **Context is 8192 tokens** on the default bundle -- the launcher's default
+  has been the multi-length 8192 export
+  (`qwen3_4b-genie-w4a16-x-elite-ctx8192-multi`) since 2026-08-24; this bullet
+  said 4096 until 2026-09-16, from the day the 4096 prebuilt was the default.
+  Read it from `/props`; do not hardcode -- the 4096 prebuilt and the 16384
+  tier are one `-Model` or env var away and report their own window. For
+  scale: a realistic agent preamble (system prompt + 6 tool schemas + one user
+  turn) measured **626 tokens**, leaving ~7560 at 8192 (~3470 on the 4096
+  tier), and real source code runs ~10-13 tokens/line. That is two to three
+  medium files in context on the default, roughly one on the 4096 tier.
 
 - **A 16384-token bundle now exists, and it is a TIER, not an upgrade.** The
   16k rebuild finished and runs. But a Genie bundle's KV tensors are graph
@@ -578,29 +687,42 @@ These are properties of the NPU endpoint that a router must not assume away:
   | 8192 | **458** | **8.8** |
   | 16384 | **176** | **3.3** |
 
-  Decode is FLAT with depth on both self-exported bundles -- the 16k decodes at
-  3.26 t/s with 469 tokens of context and 3.27 t/s with 10532 -- so the penalty
-  applies to short requests too. A 10532-token prefill takes **60 seconds**.
-  (All measured with `poll: false` in the bundle config; as shipped,
-  `poll: true` busy-waits and costs up to 36% of decode plus 2.7 idle cores.)
+  **The 8192 and 16384 rows are SINGLE-length exports** (`genie.context_lengths`
+  `[8192]` and `[16384]`); the 4096 is the multi-length prebuilt -- so this
+  table measures length class as much as window, a distinction that was not
+  known when it was written (labelled 2026-09-16). Decode is FLAT with depth on
+  both single-length bundles -- the 16k decodes at 3.26 t/s with 469 tokens of
+  context and 3.27 t/s with 10532 -- so on a single-length bundle the penalty
+  applies to short requests too. A 10532-token prefill takes **60 seconds**. A
+  multi-length export of the same window has no such tax: the default
+  8192-multi decodes 18.2 t/s at d250 for the same 646,971,904-byte HTP
+  allocation (bundle build note in the concurrency section). (All measured with
+  `poll: false` in the bundle config; as shipped, `poll: true` busy-waits and
+  costs up to 36% of decode plus 2.7 idle cores.)
 
-  One caveat for a router that measures its own endpoints: the 4096 PREBUILT
-  bundle appears to behave differently from the self-exported ones -- its decode
-  fell ~30%, from 18.9 t/s at 250 tokens of context to 13.0 at 3300, where the
-  exports are flat. **Treat that as unconfirmed.** The same shape turned up on a
-  self-export (18.0 at d~0 against 12.82 at d469) and proved to be the
-  `poll: true` busy-wait rather than depth; the prebuilt sweep was taken in the
-  same era and has not been repeated. Until it is, sample at a depth
-  representative of the traffic or record a rate per depth band -- sound advice
-  whether or not the falloff is real.
+  One caveat for a router that measures its own endpoints: a multi-length
+  bundle -- the 4096 prebuilt and the default 8192-multi alike -- loses decode
+  with depth where a single-length export is flat: the prebuilt fell ~30%, from
+  18.9 t/s at 250 tokens of context to 13.0 at 3300, and the 8192-multi from
+  18.2 to 11.5 over the same span. ~~**Treat that as unconfirmed.**~~
+  **Confirmed** -- this paragraph hedged until 2026-09-16 on the grounds that
+  the prebuilt sweep was `poll: true`-era and unrepeated, but the sweep in the
+  engines section above was interleaved, taken with `poll: false`, and repeated
+  in the deep-ranking table, and the mechanism is graph selection (each token
+  runs against the smallest compiled graph that fits, so a deeper context
+  selects a larger, slower graph). Sample at a depth representative of the
+  traffic or record a rate per depth band; a shallow sample overstates a
+  multi-length endpoint by ~40% on a long prompt.
 
   **Routing rule that falls out of this: send a request to the smallest window
   that fits it.** Do not treat a larger `n_ctx` as strictly better when ranking
-  endpoints -- on this engine it is a latency class. Decode is roughly
-  inverse-linear in the window to 8192 and worse beyond, so 8192 is the
-  sensible default tier and 16384 earns its cost only for requests that
-  genuinely cannot fit in 8192 -- and even then, a smaller endpoint plus
-  server-side eviction/summarisation is often the faster answer.
+  endpoints -- on a single-length bundle it is a latency class, with decode
+  roughly inverse-linear in the window to 8192 and worse beyond; on a
+  multi-length bundle the window costs only the requests that use it. So a
+  multi-length 8192 is the sensible default tier and the single-length 16384
+  earns its cost only for requests that genuinely cannot fit in 8192 -- and
+  even then, a smaller endpoint plus server-side eviction/summarisation is
+  often the faster answer.
 - **Tool calling works.** Verified end-to-end on both APIs. If a bundle cannot
   do tools, the server returns a `400` naming the limitation rather than
   accepting `tools` and ignoring them -- so a 4xx on a tools probe means
@@ -619,17 +741,31 @@ These are properties of the NPU endpoint that a router must not assume away:
   across engines still has to send the suppression field explicitly, or the
   same prompt costs 10-17x more on one engine than another and the difference
   reads as the engine being slow.
-- **`stop` / `stop_sequences` work.** `stop_reason` distinguishes
-  `stop_sequence` from `end_turn`, though the matched sequence is reported as
-  `null` (the runtime strips it before we see it).
+- **`stop` / `stop_sequences` work, but `stop_reason` cannot tell a
+  stop-sequence cut from a natural end.** The runtime strips the matched text
+  before the server sees it, so the server has no signal that a sequence
+  fired. It reports `stop_sequence` whenever the request SUPPLIED stop
+  sequences and generation did not run into its token cap, and `end_turn`
+  otherwise -- a heuristic (the caller opted into that boundary, so it is the
+  likelier reading), not a detection -- and `stop_sequence` is always `null`.
+  (This bullet claimed a real distinction until 2026-09-16.) `max_tokens`
+  (`finish_reason: "length"` on the OpenAI side) is reported when the cap is
+  hit -- real at the cap as of 2026-09-16; before that a generation that ran
+  into its cap reported as a natural stop and `length` meant only the engine's
+  context-exceeded warning. `tool_use` takes precedence when the reply carries
+  a tool call.
 - **Sampling is server-level, not per-request.** `temperature` / `top_p` /
   `top_k` are accepted and **not honoured** -- the runtime binds its sampler at
   load time and ignores a later change. Do not build routing logic that depends
   on varying temperature per request.
 - **Context overflow is handled, not fatal.** Oversized history is evicted
   oldest-first with the system turn and tool schemas anchored, and the evicted
-  turns are summarised into a retained note rather than dropped. A single
-  message too large to fit even alone returns a `400` naming the token counts.
+  turns are summarised into a retained note rather than dropped. The note is
+  persisted server-side (2026-09-16), so a stateless client that resends its
+  history verbatim each turn still gets that summary carried forward and
+  re-summarised as more is evicted, rather than a note that vanished with the
+  response it was made in. A single message too large to fit even alone
+  returns a `400` naming the token counts.
 - **Multi-turn is cheap if you resend history verbatim.** The server reuses the
   resident KV when a prompt is a byte-exact extension of the previous one:
   measured 1.23s cold, then 0.66s / 0.68s on following turns. **Editing earlier
@@ -645,12 +781,18 @@ These are properties of the NPU endpoint that a router must not assume away:
   n=3, the GPU leg driven by `llama-bench` because the `build-3way`
   `llama-server` of the day could not reach the Adreno (a newer build can --
   see the placement note above).
-- **Confirm the `poll` A/B deliberately.** The whole reversal above rests on a
+- ~~**Confirm the `poll` A/B deliberately.** The whole reversal above rests on a
   flag a third party changed on disk between the two halves of the measurement,
   not on a controlled experiment. It is ~15 minutes -- flip it back, re-run
   `bench_contention.py`, flip it forward, re-run -- and nobody has done it.
-  Until then the 1.45x is well-supported but its attribution is inferred.
-  **When you do it, verify the server you launched is the one answering.** The
+  Until then the 1.45x is well-supported but its attribution is inferred.~~
+  **Done 2026-09-03** (this bullet stayed unmarked until 2026-09-16): flag
+  flipped between arms, nothing else touched, arm assignment verified live by
+  the busy-wait's 291.6% idle-CPU signature. `poll: false` is worth 1.35x on
+  aggregate and the attribution is no longer inferred; the net-loss reading is
+  refuted (both arms gain, 1.70x and 1.26x). Numbers, and the graph-boundary
+  measurement bug it exposed, in `MULTI_ENGINE.md`, "The controlled poll A/B".
+  **When you repeat it, verify the server you launched is the one answering.** The
   launcher refuses a port something else already holds, so a readiness check
   that merely curls the port can pass against the PREVIOUS process and hand you
   samples labelled with a config they were never served under. That is exactly
@@ -664,6 +806,8 @@ These are properties of the NPU endpoint that a router must not assume away:
   GPU load drove the clock to **48.9% of base**, and a sequential depth sweep
   taken across that decay produced a clean monotonic 19.65 -> 11.03 t/s that
   looked exactly like a depth effect and was not. Recovery takes ~2 minutes;
-  `bench_contention.py` blocks on clock recovery before every sample for this
-  reason. During an unrelated build here free memory hit **1.1 GB**, and any
+  `bench_contention.py` blocks on clock recovery before every SOLO sample for
+  this reason (the contended leg is deliberately ungated -- the other engine
+  is hot by design, so the gate belongs on the baseline every ratio divides
+  by). During an unrelated build here free memory hit **1.1 GB**, and any
   numbers taken then would have been meaningless.

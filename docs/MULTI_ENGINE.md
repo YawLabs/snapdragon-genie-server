@@ -32,19 +32,32 @@ bundle's own `metadata.json` rather than assuming. `past_key_0_in` /
 is 36 layers x 2 x 8 KV heads x 128 head_dim x **1 byte** = 73,728 B/token. The
 earlier figure assumed fp16 and was exactly 2x high. Confirmed against the
 HTP allocator: the 4096 bundle reports 343,933,440 bytes across 8 buffers and
-the 16384 bundle 1,253,048,832 -- a delta of 73,983 B per extra token of
-window, 0.3% off the uint8 prediction.
+the 16384 bundle 1,253,048,832 -- a delta of 73,984 B per extra token of
+window (909,115,392 / 12,288; this line said 73,983 until 2026-09-16), 0.35%
+off the uint8 prediction.
 
 **And that KV is allocated for the whole COMPILED window up front, not as the
 context fills**, because the KV tensors are statically-shaped graph inputs.
-That makes window size a throughput knob, not just a memory one. Three windows
-of the same model, measured with `poll: false` on a quiet box: **18.0 t/s at
-4096, 8.8 at 8192, 3.3 at 16384** -- at identical, nearly empty context. Decode
-is about inverse-linear in the window to 8192 (2.05x cost per doubling) and
-worse past it (2.69x), so 8192 is the sweet spot and 16384 is a specialist
-tier. See the window-tax note in `GENIE_SERVER.md`; it is the single
-most important number for sizing a multi-engine deployment, because a bigger
-window costs every request rather than only the long ones.
+That makes window size a memory knob -- and, on a SINGLE-length bundle, a
+throughput knob too. Three windows of the same model, measured with
+`poll: false` on a quiet box: **18.0 t/s at 4096, 8.8 at 8192, 3.3 at 16384**
+-- at identical, nearly empty context. **The 8192 and 16384 rows are
+single-length exports** (`genie.context_lengths` `[8192]` and `[16384]`); the
+4096 is the multi-length prebuilt (labelled 2026-09-16 -- this paragraph was
+written the day before the distinction was found and presented the tax as a
+property of window size). On a single-length bundle decode is about
+inverse-linear in the window to 8192 (2.05x cost per doubling) and worse past
+it (2.69x), because every token runs against the whole compiled window. A
+multi-length export of the same window has no such tax: the multi-length 8192
+bundle -- the launcher's default since 2026-08-24 -- decodes 18.2 t/s at d250
+against the single-length 8.8, for the same 646,971,904-byte HTP allocation
+(`GENIE_SERVER.md`, the window-tax note and its ANSWERED section;
+`TYPED_ROUTER_BRIEF.md`, bundle build note). So for sizing a multi-engine
+deployment the number that matters is the bundle's LENGTH CLASS first and its
+window second: a single-length bundle's window costs every request, a
+multi-length bundle's costs only the requests that use the context. 16384
+remains a specialist tier either way -- it only exists here as a single-length
+build.
 
 ## An idle NPU server was stealing 2.7 cores
 
@@ -122,9 +135,24 @@ the thing that predicts it. Both configurations are kept below, because the
 wrong one is what you get if you run a bundle as it ships.
 
 Same model on both legs (Qwen3-4B: Genie w4a16 4096 bundle on the HTP, Q4_K_M
-2.32 GiB GGUF on the Adreno), decode at context depth 469, n=3, every sample
-gated to >=92% of base clock before it is taken. `src/bench_contention.py`
-drives both engines at once and confines sampling to the overlapped stretch.
+2.32 GiB GGUF on the Adreno), decode at context depth 469, n=3.
+
+**Provenance, corrected 2026-09-16.** This paragraph credited
+`src/bench_contention.py` with driving both engines at once and gating every
+sample to >=92% of base clock. Neither holds for this run. The harness's cool
+gate was dead code until `f3cd053` (06:20 on 08-24, about three hours after
+these samples were taken at 02:2x-02:4x): `measure()` took a `cool_floor` that
+no call site passed and no flag could set, so **no sample here was gated by
+the harness** -- at best a manual >=92% shell check preceded each invocation,
+which no artifact can confirm, and even the fixed harness gates only the solo
+leg. And the GPU leg was driven by **`llama-bench`**, not over HTTP: the
+`build-3way` `llama-server` of the day could not reach the Adreno (placement
+note below), so only the NPU leg went through `bench_contention.py`, and the
+`+-` stddev on the GPU cells is `llama-bench`'s column. The figures are bounded
+rather than wrong -- the 2026-09-03 A/B reproduced the solo rates under a
+working gate -- but "gated" and "one harness" were both claims the artifacts
+do not support. `TYPED_ROUTER_BRIEF.md`'s provenance correction has the
+fingerprints.
 
 **`poll: false` -- the current, correct configuration:**
 
@@ -148,9 +176,14 @@ Aggregate **14.15 t/s** against 18.05 -- **0.78x, a net loss** -- at 46% of that
 run's additive ideal (30.87). Note that the GPU's *solo* rate is identical
 across the two tables: nothing about the GPU changed. What changed is that the
 NPU's solo rate rose 45% and the two stopped fighting over the host CPU while
-contended. **The busy-wait costs roughly half the pair's throughput and turns a
-1.45x win into a 0.78x loss.** It is the highest-leverage line of configuration
-on this page.
+contended. **The busy-wait costs roughly half the pair's throughput and ~~turns
+a 1.45x win into a 0.78x loss~~.** **Corrected 2026-09-03 (marked here
+2026-09-16):** the controlled A/B below puts `poll: true` at **1.26x** against
+`poll: false`'s 1.70x -- it gives away about a quarter of the concurrency win
+and stays a gain. The 0.78x table above is the uncontrolled 08-24 reading,
+kept so the retraction has something to point at. Still the highest-leverage
+line of configuration on this page, for the NPU's own +37-55% and the quarter
+of the pair's win -- not for an inversion that does not reproduce.
 
 **The bus is the constraint after all.** The previous revision retired the
 bandwidth premise on the strength of the second table. Restore it.
@@ -184,7 +217,9 @@ and floated a shared package power budget -- `perf_profile: "burst"`,
 `rpc_control_latency: 100` -- as the surviving hypothesis. The premise and the
 hypothesis both go. Re-measured 2026-08-24 against a server verified clean --
 it bound the port itself, served real inference, `poll: false` in its config,
-0.00 idle cores over 15 s -- with the GPU at d469, n=3, cooled to >=92% of base:
+0.00 idle cores over 15 s -- with the GPU at d469, n=3, cooled to >=92% of base
+by a manual check before each `llama-bench` run (the harness gate was not yet
+live; see the provenance note above):
 
 | GPU @ d469 | rate |
 |---|---|
@@ -214,9 +249,12 @@ Two things follow for the design, and they cut back the other way from the
 previous revision:
 
 - **A second hot engine is worth ~1.45x -- if you configure for it.** The gain
-  is real but it is not additive, and it does not merely shrink when the bundle
-  ships `"poll": true`: it inverts. Check that flag before quoting any
-  concurrency number, yours or anyone else's.
+  is real but it is not additive, and it shrinks when the bundle ships
+  `"poll": true`: the controlled A/B below measured 1.70x against 1.26x, so
+  the busy-wait wastes about a quarter of the win. (This bullet said "it
+  inverts" until 2026-09-16; the inversion was the uncontrolled 08-24 reading
+  and does not reproduce.) Check that flag before quoting any concurrency
+  number, yours or anyone else's.
 - **Bandwidth is the ceiling to plan against.** At 84.5 GB/s of additive demand
   the pair already sits at three-quarters of what this memory system delivers,
   so a *third* engine has very little headroom left to divide, whatever its
@@ -271,7 +309,11 @@ separates them is two other axes:
 So the split is prefill-heavy versus decode-heavy, and busy box versus quiet
 box. It is not fast versus slow.
 
-**And NPU decode is flat with depth on the 4096 export after all.** This file
+**And NPU decode is flat between d0 and d469 on the 4096 prebuilt after all**
+-- shallow-to-shallow only: as a multi-length bundle it falls ~30% past ~600
+tokens (the interleaved sweep in `TYPED_ROUTER_BRIEF.md`), while the
+single-length 16384 is flat at every depth because it always pays for its
+whole window (qualifier added 2026-09-16). This file
 flagged a ~29% falloff -- 18.0 at near-empty context against 12.82 at d469 --
 and called it worth resolving before either number was quoted. It is resolved:
 the 12.82 was a busy-wait artefact, the corrected d469 rate is 18.55, and 18.0
@@ -310,6 +352,16 @@ same command, flag flipped between arms, nothing else touched:
 | GPU contended | 14.37 (keeps 79.2%) | 11.04 (keeps 64.0%) | |
 | **aggregate, both hot** | **31.37 t/s** | **23.27 t/s** | **1.35x** |
 | vs best single engine | 1.70x | 1.26x | |
+
+How `keeps` is derived, since it will not reproduce from the cells beside it:
+the harness interleaves solo and contended samples and reports retention as
+the **median of the per-pair contended/solo ratios** (`paired_ratio_median` in
+its JSON), while the solo and contended columns are each a separate median.
+So 17.00 / 18.46 = 92.1% against the 90.4% shown, and 14.37 / 18.20 = 79.0%
+against 79.2% -- the ratio of medians and the median of ratios are different
+statistics, and the harness deliberately reports the second because a slow
+drift across the run lands on both halves of a pair and cancels there, where
+it does not cancel in two independent medians.
 
 **What is confirmed.** `poll: false` is worth **1.35x on aggregate
 throughput**, and the NPU's own solo rate is 1.37x -- squarely inside the
@@ -368,8 +420,10 @@ Not for memory -- capacity was never the constraint -- but, now measured, for
 throughput *and* concurrency. Two reasons stack.
 
 The first is **throughput: 1.45x** for the pair, at 73% of the additive ideal.
-That is not the 2x a naive reading hopes for, and it needs `poll: false` to
-exist at all, but it is a gain. The "not for throughput at all" verdict this
+That is not the 2x a naive reading hopes for, and `poll: false` is worth about
+a quarter of it (1.70x against 1.26x in the controlled A/B above; this line
+said the gain "needs `poll: false` to exist at all" until 2026-09-16, on the
+strength of the retracted 0.78x), but it is a gain. The "not for throughput at all" verdict this
 section carried on 2026-08-23 is withdrawn -- it was measured against a spinning
 NPU server.
 
@@ -452,7 +506,10 @@ typed, not here**:
    engine so it still answers while a wedged thread holds the lock. A stall is
    aborted; if that does not take, the process exits 75 and the launcher
    restarts it. A dispatcher can treat 503 as "shed to another engine" and 200
-   as a real capability claim.
+   as a real capability claim. A 503 now also comes back on a REQUEST, not only
+   from `/health`: a turn refused because the server is shutting down answers
+   503 rather than 500, for the same reason -- shedding is the right response to
+   both, and neither means the request was malformed.
 
 ## Answered: does concurrent GPU + NPU inference hold up?
 
@@ -473,15 +530,16 @@ Caveats that travel with the corrected answer: one pair of engines, one model,
 one depth (d469), n=3; the GPU leg was driven by `llama-bench` rather than over
 HTTP, for the reason in the section above; the aggregate combines two
 experiments, each measuring one engine precisely while the other was driven,
-because the two legs need different harnesses; and the `poll` comparison itself
-was not a controlled A/B -- see the caveat in the contention section. Both
+because the two legs need different harnesses; and the 08-24 `poll` comparison
+itself was not a controlled A/B -- see the caveat in the contention section;
+the 2026-09-03 repeat was, and it is where the 1.26x comes from. Both
 directions were measured and retention is roughly symmetric (72% NPU, 75% GPU).
 
 ## Open questions
 
 - ~~**Confirm the `poll` comparison deliberately.**~~ **DONE 2026-09-03, and
   the answer splits in two.** `poll: false` is confirmed better -- but the
-  *inversion* is not. See "The controlled poll A/B" below.
+  *inversion* is not. See "The controlled poll A/B" above.
 - ~~**Why is CPU decode 0.2 t/s?**~~ **Answered 2026-08-24: it was not.** The
   figure was an artifact of a busy-waiting NPU server, co-tenant benchmarks and
   an all-cores thread count. Re-measured quiet at `-t 6`: 22.57 t/s at d0,
@@ -554,8 +612,38 @@ hand-run sequential depth sweep taken across that decay produced a clean
 monotonic 19.65 -> 11.03 t/s that looked exactly like a depth effect and was
 nothing of the kind. Recovery takes about two minutes. Any figure quoted without
 its thermal and load state is meaningless, which is why `bench_contention.py`
-blocks until the clock is back to >=92% of base before each sample rather than
-detecting the drift afterwards and warning about it.
+blocks until the clock is back to >=92% of base before each SOLO sample rather
+than detecting the drift afterwards and warning about it (the contended leg is
+deliberately ungated -- the other engine is hot by design -- and the gate was
+dead code until `f3cd053` on 2026-08-24, so runs before that were never gated
+by the harness at all; see the provenance note in the contention section).
+What the gate does when it CANNOT gate is recorded rather than silent, as of
+2026-09-16: on battery it aborts and the sweep stops there, exiting 2 (the
+sample used to be taken anyway and the run exited 0); a gate that waits out its
+300 s proceeds and says so; one whose counter cannot be read proceeds ungated
+and says so. All three land in the run's warnings and its JSON, where the
+clock readings each gated solo sample passed on are `gate_clock_pct` (the old
+`cpu_clock_pct` key is gone) and the per-measurement box readings are
+`box_samples`. A fourth entry is independent of the gate: the abort is the only
+one of the three that STOPS a sweep, and three ordinary ways of running leave it
+unable to fire -- the gate is off (`--cool-floor 0`), the clock never fell below
+the floor so the power source was never read, or the counter could not be read
+at all -- so the source recorded per round is checked once more at the END.
+A run whose `power_samples[]` report `on_ac` false in any round gets an
+`ON BATTERY for N of M round(s) ... and no gate stopped it` entry in
+`warnings[]` and in the terminal block, whatever the gate did or did not do.
+The exit code is unchanged: only the gate stops a sweep.
+A run with the gate switched OFF (`--cool-floor 0`) is not left
+unjudged either. `gate_clock_pct` is `[]` on such a run by construction --
+the clock is read only inside the gate -- so the round-start readings
+(`power_samples[].clock_pct`) are judged instead, against 92% of base, the
+gate's own default floor: nothing waited a dip out, so the next solo sample
+was taken AT that reading. A dip below it writes a warning beginning `UNGATED
+run (--cool-floor 0): the round-start clock dipped to X% of base ...` to the
+terminal's warnings block and the JSON `warnings`. The tool's default `--gpu` is `http://127.0.0.1:8124`, the
+launcher's GPU leg -- it was 8080, which is the CPU leg -- and it prints the
+model id each server reports beside its label, because it cannot otherwise
+tell a CPU leg from a GPU one.
 
 **Verify that the server you launched is the one answering.** Not hypothetical:
 two restarts during the concurrency work never bound the port at all --

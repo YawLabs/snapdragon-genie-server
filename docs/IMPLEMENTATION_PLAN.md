@@ -1,15 +1,24 @@
 # NPU LLM Inference: Robustness Implementation Plan
 
-Living document. Status markers: [ ] todo, [~] in progress, [x] done, [!] blocked.
-Last updated: 2026-08-27. **Phases 1 and 2 are DONE and Phase 3 is substantially built.** The route that
+Living document. Status markers: [ ] todo, [~] in progress, [x] done, [!] blocked, [-] superseded or
+deferred -- not scheduled (marker added 2026-09-16; four items below sat as `[ ]` for weeks while reading
+as work to do).
+Last updated: 2026-09-17 (this line said 2026-08-27 through two later content edits, 0f9b592 and 303a409).
+**Phases 1 and 2 are DONE and Phase 3 is substantially built.** The route that
 worked was neither of the two this document spent its length on: **Qualcomm AI Hub Models** emits a
 ready-to-run Genie bundle compiled for the local chipset, which dissolved both the prebuilt-arch-mismatch
 blocker (Phase 1) and the hand-rolled converter chain (Phase 2). A Qwen3-4B w4a16 bundle has been resident
-on the HTP and serving both APIs since 2026-08-23; see `docs/GENIE_SERVER.md`.
+on the HTP and serving both APIs since 2026-08-22 (`254a00c`); see `docs/GENIE_SERVER.md`.
 
-The live open question is no longer "can we run on the NPU" but **"what window should the bundle be
-compiled at"** -- measured 2026-08-23, the compiled context window is a per-token tax on every request, so
-16384 costs ~4x decode and ~5x prefill versus 4096 *even at empty context*. See "The window tax" below.
+The window question that was live here for a day -- **"what window should the bundle be compiled at"** --
+was answered 2026-08-24: the per-token tax is a property of SINGLE-length exports, a multi-length export
+pays only for the context in use, and the default is a multi-length 8192 (see "The window tax" and the
+decision log; this paragraph still called it "the live open question" until 2026-09-16, two hundred lines
+above its own answer). The measurement that raised it stands for single-length bundles: 16384 costs
+~5.5x decode and ~6.6x prefill versus 4096 *even at empty context* (18.0/3.3 and 1157/176 from the
+`poll: false` table below; this line said ~4x / ~5x until 2026-09-16, a `poll: true`-era ratio that
+understated the tax). What is live now is in Phase 3's open items and the 2026-09-03/04 decision-log
+entries: a three-engine comparison on one harness, power, and the 8B tiers.
 
 ## The problem this solves
 
@@ -68,8 +77,10 @@ I already proved the QNN EP runtime works on this box this session: INT8 QDQ mat
      LLM-on-HTP: AOT context binary + KV cache + tokenizer + sampling, all handled. Fastest
      path to a working, robust NPU LLM.
    - **ONNX-RT + onnxruntime-genai + QNN EP** -- ALT. Microsoft's path; `onnxruntime-genai`
-     0.15.2 has a cp314 win_arm64 wheel. More ecosystem tooling (Olive), slightly more moving
-     parts than Genie.
+     0.15.2 has a cp314 win_arm64 wheel (re-verified against PyPI 2026-09-16: cp311 through cp314
+     all ship for win_arm64. `MODEL_CONVERSION.md`, `requirements.txt` and the README said the
+     opposite for three weeks; this line was the correct one). More ecosystem tooling (Olive),
+     slightly more moving parts than Genie.
    - **llama.cpp load-time pre-validation OR out-of-process QNN worker** -- NOT worth it. Both
      essentially reimplement what Genie already does. Keep the llama.cpp QNN backend only as
      the proven micro-benchmark artifact; use CPU + Adreno-GPU for GGUF models there.
@@ -94,6 +105,12 @@ out to price every request -- see "The window tax" under Phase 3.
 
 ### Phase 0 -- environment [x] DONE
 - [x] QAIRT 2.34 SDK on disk; QnnHtp + Genie binaries for aarch64-windows-msvc identified.
+      **The SDK on disk moved to QAIRT 2.45 with the first AI Hub bundle (2026-08-22/23; noted here
+      2026-09-16 -- this plan never recorded the move).** Every bundle served here is compiled against
+      2.45, `src/genie_server.py` expects a 2.45 root in `GENIE_SDK_DIR`, and a bundle is locked to one
+      Hexagon arch AND one QAIRT version (README, "The QAIRT SDK"). So the 2.34-verified hand-rolled
+      chain in Phase 2 has NOT been re-run on 2.45, and a context binary it produced would not load
+      against the served runtime without a rebuild.
 - [x] `onnxruntime-qnn` 2.5.0 working (plugin-EP attach proven, HTP placement verified).
 - [x] Extracted Genie tools + `Genie.dll`/`Genie.lib` + `include/Genie` headers. Deps that must sit
       next to `genie-t2t-run.exe` on PATH: `Genie.dll`, `QnnHtp.dll`, `QnnHtpV73Stub.dll` (v73 = X Elite),
@@ -111,9 +128,14 @@ Goal: one real end-to-end NPU generation with measured t/s, no hang.
 tokenizer + `metadata.json` carrying the chat template) already compiled for the local part -- so the
 "every prebuilt targets the wrong arch/version" blocker below simply does not apply to an artifact built
 for your chipset on demand. The export must run on **Linux/WSL**; the Windows path dies on `fcntl`.
+(Correction 2026-09-16: the 4096 bundle that resolved this phase is AI Hub's own prebuilt for this
+chipset, obtained with `qai-hub-models fetch`, not an export -- README and the launcher say so, this
+paragraph did not. The point stands either way, since AI Hub's artifact targets the local part; the
+export path is what built the 8192 / 16384 bundles that followed. See the Phase 2 correction.)
 
 Exit criterion MET: the NPU generates coherent text end-to-end, no hang, ~11-12 t/s decode on the 4096
-bundle. The dead ends recorded below are kept because they are still true of *prebuilt* bundles, which is
+bundle (a `poll: true`-era figure -- 18.0 t/s once the busy-wait is off, see "The window tax"). The dead
+ends recorded below are kept because they are still true of *third-party prebuilt* bundles, which is
 worth knowing before anyone reaches for one again.
 - [!] FINDING: no prebuilt Genie bundle matches this box. A Genie context binary is tied to BOTH
       the HTP arch AND the QAIRT version, and this box is **v73 + QAIRT 2.34 + Windows**. Surveyed
@@ -121,11 +143,15 @@ worth knowing before anyone reaches for one again.
       Opt-AI/...8gen3 (labelled 8gen3 but htp config says **dsp_arch v75**, and **QAIRT 2.42**).
       Wrong arch OR wrong version -> won't load. (This box is definitively v73: the HMX_V2
       probe errored "not supported in current architecture: 73".)
-- [ ] PIVOT -- two ways to get a v73/2.34-local artifact instead of a prebuilt:
+- [-] PIVOT (superseded 2026-08-23 -- neither pivot was needed once AI Hub built for the local part;
+      kept as the record of what was on the table) -- two ways to get a v73/2.34-local artifact instead
+      of a third-party prebuilt:
       (A) **ONNX-RT + onnxruntime-genai + QNN EP** -- provide an arch-AGNOSTIC ONNX LLM; the QNN EP
           AOT-compiles it for the LOCAL v73 device at session init. Sidesteps the prebuilt-arch
           mismatch entirely. Risk: genai+QNN-EP LLM support on Win-ARM is newer/finicky; genai and
           onnxruntime-qnn may collide on the `onnxruntime` module (isolate in a clean venv).
+          [2026-09-17: true of onnxruntime-qnn 1.x, which ships an `onnxruntime/` package; the 2.5.0
+          this repo pins ships only `onnxruntime_qnn/` and DEPENDS on plain onnxruntime -- README, Install.]
       (B) **Convert for v73/2.34 (Phase 2)** -- qairt-converter + qnn-context-binary-generator with
           `--dsp_arch v73` using the local QAIRT 2.34 tools. Reliable but multi-step.
       Recommended: try (A) first (less to build); fall to (B) if genai+QNN-EP LLM path stalls.
@@ -152,12 +178,19 @@ worth knowing before anyone reaches for one again.
       field worth checking afterwards is `dialog.context.size`, which must match the window the
       graphs were compiled at or Genie silently runs at the config's number.
 - [x] Generated text on the HTP. Via the Genie C API rather than `genie-t2t-run.exe`, because the CLI
-      reloads the model per invocation (~30-50s); `src/genie_server.py` keeps it resident instead.
-      `src/genie_smoke.py` is the one-shot equivalent for isolating problems.
-- [x] Measured prefill and decode: ~900 / ~13 tok/s on the 4096 bundle (`src/bench_endpoint.py`).
+      reloads the model per invocation -- 11-35s, measured on the 8192 multi-length bundle (10.8-15.0s
+      warm, 34.4s after heavy disk traffic; `docs/GENIE_SERVER.md`, Run. This line said "~30-50s", which
+      predated that measurement) -- while `src/genie_server.py` keeps it resident instead.
+      `src/genie_smoke.py` is an HTTP smoke test of that RUNNING server (`/v1/models`, one non-streamed
+      and one streamed completion; defaults to the launcher's :8123, exits non-zero on FAIL). It is not
+      a one-shot runner and loads nothing itself, which this line used to imply.
+- [x] Measured prefill and decode: ~900 / ~13 tok/s on the 4096 bundle (`src/bench_endpoint.py`). The
+      decode figure is `poll: true`-era and retired as the busy-wait number (`docs/MULTI_ENGINE.md`);
+      with `poll: false` the same bundle decodes 18.0 t/s at near-empty context (table under "The
+      window tax") and 18.55 at d469. Kept as the completion record it is.
 - [ ] Compare to llama.cpp CPU + Adreno-GPU on the SAME prompts (14B Q4_0 GPU baseline:
-      73.79 pp / 4.46 tg). Still outstanding -- the existing GPU/CPU rows were taken separately and
-      on a loaded box, so they are not yet a like-for-like comparison. Carried into Phase 3.
+      73.79 pp / 4.46 tg). Still outstanding, re-scoped 2026-09-16 -- see the Phase 3 item; the "taken
+      on a loaded box" premise this line carried is stale, the rows have since been re-measured quiet.
 Deliverable: DELIVERED as `src/genie_server.py` + `src/bench_endpoint.py` (the plan expected
 `src/genie_run.py`; a resident server proved more useful than a one-shot runner).
 Exit criterion: NPU generates coherent text end-to-end without hanging. MET.
@@ -167,8 +200,13 @@ Exit criterion: NPU generates coherent text end-to-end without hanging. MET.
 **What actually ships the bundles: `qai-hub-models export`.** It covers the whole chain end-to-end
 (including the HF -> ONNX-with-KV-cache front end that this phase called "the only unproven stage and the
 hardest"), runs from WSL, and emits a Genie-shaped bundle directly. `--context-lengths N` selects the
-compiled window -- the single most consequential knob, see "The window tax". Both bundles on this box came
-from it: the 4096 one, and a 16384 one exported 2026-08-23.
+compiled window -- the single most consequential knob, see "The window tax". (Corrected 2026-09-16: this
+sentence read "both bundles on this box came from it: the 4096 one, and a 16384 one". The 4096 bundles --
+the 4B and, later, the 8B -- are Qualcomm's AI Hub **prebuilts**, fetched with `qai-hub-models fetch ...
+-r genie -p w4a16 -c qualcomm-snapdragon-x-elite`, not exported; README and `src/run-genie-server.ps1` say
+so and this line did not. The self-exported bundles are the 4B `ctx8192` (single-length, 2026-08-23),
+`ctx16384` (single-length, 2026-08-23), `ctx8192-multi` (2026-08-24, the launcher's default) and the 8B
+`ctx8192-multi` (2026-09-04, `docs/MODEL_OPTIONS.md`) -- six bundles on this box, not two.)
 
 The hand-rolled QAIRT chain below still works and is still the fallback for a model AI Hub does not
 carry. Keep it; do not reach for it first.
@@ -259,7 +297,9 @@ One tool does HF -> quantized Genie binary; this is the documented Windows tutor
 #### PATH B (general fallback) -- QnnHtp context binaries  [~] pipeline VERIFIED end-to-end (Relu), LLM front pending
 Use when a model isn't a composer-supported arch, or you want the QnnHtp backend. Steps 2-4 were RUN on
 this box successfully; step 1 (the hard part) is not yet.
-1. **HF -> ONNX with KV cache** [ ] NOT YET RUN: `python -m onnxruntime_genai.models.builder -m <hf_id>
+1. **HF -> ONNX with KV cache** [-] NOT RUN, and not scheduled -- superseded by `qai-hub-models export`,
+   which covers this stage (Phase 2 header); retained as the fallback recipe, marked 2026-09-16 (it read
+   `[ ] NOT YET RUN` for three weeks under a phase marked DONE): `python -m onnxruntime_genai.models.builder -m <hf_id>
    -o <onnx_dir> -p int4 -e cpu` (Microsoft's builder; emits an LLM ONNX with KV-cache I/O, optionally
    split prompt/token graphs). This is the biggest unknown -- see risks. (`qairt-converter` can also take a
    `.gguf` directly via `--gguf_config`, an alternate front.)
@@ -306,15 +346,22 @@ this box successfully; step 1 (the hard part) is not yet.
 - Quantization quality of native INT4 (a16w4) vs the GGUF Q4/Q6 baselines is still to be measured once a real
   model is through.
 
-Deliverable: `docs/MODEL_CONVERSION.md` upgraded from options-doc to this runnable recipe.
+Deliverable: ~~`docs/MODEL_CONVERSION.md` upgraded from options-doc to this runnable recipe.~~ [-] DROPPED
+2026-09-16. Never delivered -- the doc sat at its 2026-08-22 options text for three weeks under a phase
+marked DONE -- and no longer wanted: AI Hub export superseded this recipe, so `MODEL_CONVERSION.md` now
+leads with the export route as the proven path and points here for this chain as the fallback, rather
+than duplicating it.
 Exit criterion: a self-converted small dense model (Llama-3.2-1B / Qwen2.5-1.5B) runs under Phase 1.
 
 ### Phase 3 -- serving for the agent workload [~] BUILT; benchmarking and routing outstanding
 Goal: a drop-in local endpoint the agent config can point at. Delivered as `src/genie_server.py`
-(stdlib only, ~3140 lines), documented in `docs/GENIE_SERVER.md`, covered by 417 device-free tests.
+(stdlib only, ~4680 lines as of 2026-09-17), documented in `docs/GENIE_SERVER.md`, covered by the
+repo's device-free suite (1159 tests in all as of the same date, the bench tools and launchers
+included; `python -m pytest --collect-only -q | tail -1` for today's count).
 - [x] Genie wrapped via the C API (ctypes -> `Genie.dll`), model resident so requests skip the reload.
 - [x] OpenAI `/v1/chat/completions` **and** Anthropic `/v1/messages`, both with SSE streaming.
-- [x] `/props`, `/v1/models`, `/health` so a client can size the window and probe capability.
+- [x] `/props`, `/v1/models` (and `/v1/models/<id>`), `/health` (alias `/healthz`) so a client can size
+      the window and probe capability.
 - [x] Tool calling, probed from the bundle's own vocab; an honest 400 when the bundle cannot do it.
 - [x] Thinking suppression per request (three spellings) -- 41s vs 2.4s on the same tool turn.
 - [x] Prompt-cache / KV-reuse for multi-turn: byte-exact prefix continuation, 1.23s -> 0.66s.
@@ -322,13 +369,17 @@ Goal: a drop-in local endpoint the agent config can point at. Delivered as `src/
 - [x] Stop sequences; usage accounting on both streaming and non-streaming.
 - [x] Single-flight serialization + bounded queue with a 429/529 backpressure signal.
 - [x] Prefill/decode measured per compiled window (see "The window tax").
-- [ ] Benchmark against the llama.cpp CPU+GPU numbers **on the same prompts** -- the existing GPU/CPU
-      rows in `docs/MULTI_ENGINE.md` were taken separately and on a loaded box, so they are not yet a
-      like-for-like comparison. Re-run all three on a quiet box before quoting a speedup.
+- [ ] Three-engine comparison **on one quiet box with one harness** -- re-scoped 2026-09-16. The premise
+      this item carried ("the GPU/CPU rows were taken separately and on a loaded box") is stale: the
+      baselines table in `docs/MULTI_ENGINE.md` is quiet-box 2026-08-23/24 throughout, and a same-harness
+      NPU+CPU pair exists (`src/bench_contention.py`, 2026-09-03, in that file's open questions). What is
+      actually missing: the table rows are still `llama-bench` (GPU, CPU) against HTTP (NPU), the one
+      same-harness pair mixes models (4B on the NPU, 9B on the CPU), and CPU+GPU is unmeasured. Do not
+      quote a three-way speedup until all three legs come from one harness, one model, one session.
 - [ ] Power measurement (the NPU's real edge: sustained + efficient). Not started.
 - [ ] `dialog_type` sweep: basic -> ssd -> lade -> eaglet. LADE is measured and DISQUALIFIED (see below);
       SSD and Eaglet need a recompiled bundle, so they are blocked on an export, not on config.
-- [ ] Multi-engine routing -- deliberately NOT built here; briefed out to typed in
+- [-] Multi-engine routing -- deliberately NOT built here (out of scope, not pending); briefed out to typed in
       `docs/TYPED_ROUTER_BRIEF.md`.
 Exit criterion: the agent config runs against the NPU endpoint end-to-end.
 
@@ -343,14 +394,18 @@ Same box, same server, same prompts, minutes apart, quiet box. The two bundles a
 `precision`, `tool_versions`, `chipset_attributes`, `config.json`, chat template and every tokenizer file
 are byte-identical; the only difference in `metadata.json` is the KV shapes.
 
-| compiled n_ctx | HTP alloc | prefill (median) | decode (median) | cost per doubling |
+| compiled n_ctx | HTP alloc (MiB) | prefill (median) | decode (median) | cost per doubling |
 |---|---|---|---|---|
-| 4096 | 328 MB | **1157 t/s** | **18.0 t/s** | -- |
-| 8192 | 647 MB | **458 t/s** | **8.8 t/s** | 2.05x decode, 2.54x prefill |
-| 16384 | 1195 MB | **176 t/s** | **3.3 t/s** | 2.69x decode, 2.59x prefill |
+| 4096 | 328 (343,933,440 B) | **1157 t/s** | **18.0 t/s** | -- |
+| 8192 | 617 (646,971,904 B) | **458 t/s** | **8.8 t/s** | 2.05x decode, 2.54x prefill |
+| 16384 | 1195 (1,253,048,832 B) | **176 t/s** | **3.3 t/s** | 2.69x decode, 2.59x prefill |
+
+(Units fixed 2026-09-16: the 8192 row read "647 MB" -- decimal megabytes -- beside two MiB rows under one
+"MB" header. The byte counts are the source; both 8192 bundles allocate exactly 646,971,904.)
 
 All three measured with `poll: false` (see the poll finding below), quiet box, one harness
-(`python src/bench_endpoint.py`). Decode is FLAT with depth on both self-exported bundles -- the 16k
+(`python src/bench_endpoint.py`). Decode is FLAT with depth on both self-exported bundles (both
+single-length -- see ANSWERED below) -- the 16k
 decoded 3.26 t/s holding 469 tokens and 3.27 t/s holding 10532; the 8k, 8.77 versus 8.81. A
 10532-token prefill on the 16k bundle takes 60 seconds.
 
@@ -359,14 +414,16 @@ Three consequences:
    all, and charges for it on every request including the short ones.
 2. **`dialog.context.size` cannot buy the tax back.** It is a software limit, not a graph selector:
    setting 1024 against the 4096-compiled bundle left the HTP allocation byte-identical (343,933,440)
-   and decode unchanged at ~11.0 t/s. The window is fixed by `--context-lengths` at export.
+   and decode unchanged at ~11.0 t/s (a `poll: true`-era rate; the finding is "unchanged", not the
+   number). The window is fixed by `--context-lengths` at export.
 3. **This retroactively justifies the eviction + summarisation work in Phase 3.** It is not a
    workaround for lacking a big bundle -- it is cheaper than having one. Condensing history into a
    note costs one short NPU call when eviction was going to happen anyway; a 4x window costs 4x on
    every request forever.
 
 Also corrected by the same measurement: KV is `uint8` at **~72 KB/token**, not the fp16-assumed 144 --
-36 x 2 x 8 x 128 x 1 byte = 73,728 B/token, against a measured allocator delta of 73,983 B/token.
+36 x 2 x 8 x 128 x 1 byte = 73,728 B/token, against a measured allocator delta of 73,984 B/token
+(909,115,392 B over 12,288 positions; this line said 73,983 until 2026-09-16).
 
 ### RESOLVED -- the 8192 point, and what it says about the curve
 
@@ -426,9 +483,9 @@ shallow-to-deep IN ORDER, which makes any downward drift over the run indistingu
 effect. Interleaving the depths (`--depths 250,3300,250,3300,...`) separates them and is what settled
 it.
 
-### Phase 4 -- optional llama.cpp bridge [ ]
+### Phase 4 -- optional llama.cpp bridge [-] deferred, not scheduled
 Only if you want llama.cpp's ecosystem (GGUF, samplers, grammar) on the NPU:
-- [ ] An out-of-process RPC backend: llama.cpp's `ggml-rpc` client talks to a Genie/ONNX NPU
+- [-] An out-of-process RPC backend: llama.cpp's `ggml-rpc` client talks to a Genie/ONNX NPU
       worker process that is killable on hang. This isolates the driver-hang risk out of the
       main process. Likely unnecessary if Phase 3 serving is enough.
       **Weaker motivation as of 2026-08-24:** this was designed around a hang assumed to be
@@ -510,9 +567,13 @@ and record tg uplift + acceptance rate per model.
   chain and not from a prebuilt.** It compiles for the local chipset, so the arch/version lock that
   killed every surveyed prebuilt stops being a problem, and it covers the HF->ONNX+KV front end that
   Phase 2 flagged as its hardest unproven stage. The QAIRT chain is retained as the fallback for models
-  AI Hub does not carry.
+  AI Hub does not carry. *Correction 2026-09-16: the 4096 bundles (the 4B, and later the 8B) are AI Hub
+  prebuilts fetched with `qai-hub-models fetch`; "not from a prebuilt" was wrong about the bundle serving
+  that day and right about everything exported since (8192, 8192-multi, 16384, 8B 8192-multi).*
 - 2026-08-23: **compile the bundle at the SMALLEST window the workload needs -- window is a throughput
-  decision, not a capacity one.** Measured: 16384 costs ~4x decode and ~5x prefill versus 4096, flat with
+  decision, not a capacity one.** Measured: 16384 costs ~4x decode and ~5x prefill versus 4096 (a
+  `poll: true`-era ratio; the `poll: false` table under "The window tax" makes it ~5.5x / ~6.6x -- worse,
+  so the decision stands; noted 2026-09-16), flat with
   depth, because the KV tensors are statically-shaped graph inputs fed in full every step. Corollary
   decisions: keep 4096 as the default served bundle; treat the 16384 bundle as a separate tier a router
   selects only when a request cannot fit in 4096; and stop treating server-side eviction+summarisation as
@@ -542,6 +603,37 @@ and record tg uplift + acceptance rate per model.
   18.0 at 4096 and 3.3 at 16384: 2x the context for ~half the decode rate, where 16384 gives 4x the
   context for under a fifth. The earlier hope that 8192 might be *disproportionately* cheap was a
   `poll: true` artifact -- see above.
+- 2026-09-03: **Qwen3.5-9B serves through llama.cpp, not Genie.** `qai-hub-models` has no `qwen3_5_9b`
+  target, and the architecture (hybrid linear attention) is not what the Genie chain compiles. Two
+  `llama-server` legs via `src/run-llama-server.ps1`: CPU Q4_0 on **8080**, GPU Q4_K_M on **8124** (the
+  `build-arm64-windows-llvm-release` build reaches the Adreno over HTTP; `build-3way` silently served CPU).
+  The CPU leg's Q8_0 served empty completions with HTTP 200, so the quant moved to Q4_0 and the launcher
+  warns on Q8_0. `docs/MODEL_OPTIONS.md`. (Entries from here to 09-04 were added 2026-09-16; the log had
+  stopped at 08-24 while `docs/MODEL_OPTIONS.md` and `docs/MULTI_ENGINE.md` carried the decisions.)
+- 2026-09-03: **Qwen3-8B NPU tier** from the AI Hub prebuilt (multi-length `[512..4096]`), same per-machine
+  fixes as the 4B (`poll: false`, token-penalty 1.15/128/0.3); ~12 t/s effective end-to-end.
+  `run-genie-server.ps1 -Model qwen3-8b`.
+- 2026-09-03: **the controlled `poll` A/B, and the retraction it forces.** Flag flipped between arms with
+  nothing else touched, arm assignment verified live by the busy-wait's 291.6% idle-CPU signature:
+  `poll: false` is 1.35x on aggregate (31.37 against 23.27 t/s), NPU solo 1.37x. **The 0.78x "net loss"
+  is REFUTED** -- both arms gain over the best single engine (1.70x and 1.26x), so the busy-wait wastes
+  about a quarter of the concurrency win rather than inverting it, and every "inverts" / "net loss" in the
+  docs is retracted. The run also exposed a measurement bug: `measure_decode`'s two calls must land on ONE
+  compiled graph (prompt + generated tokens inside one length), which d469 + 120 tokens does not on a
+  multi-length bundle. `docs/MULTI_ENGINE.md`, "The controlled poll A/B".
+- 2026-09-03: **HTP interrupt delivery can degrade, and then `poll: false` is the slow setting** (~0.3 t/s
+  against 5.8 s for the same 100-token request at `poll: true`). Diagnostic: a crawl at `poll: false` that
+  is normal at `poll: true` means degraded interrupt delivery, not a bad bundle; `pnputil /restart-device`
+  on the NPU node fixes it without a reboot. Bundles stay at `poll: false`. `docs/MODEL_OPTIONS.md`.
+- 2026-09-04: **8B 8192 multi-length export** (three attempts, ~9 h; needed a WSL memory cap). 10.92 t/s
+  decode at d250, 10.08 at d978, on battery. The 4096 prebuilt keeps the 8B default pending a same-harness
+  AC comparison -- not because of a window tax, since both 8B bundles are multi-length.
+  `run-genie-server.ps1 -Model qwen3-8b-8192`.
+- 2026-09-16: **docs sweep for claims the repo had already retired.** The `poll: true` "inversion", the
+  "prebuilt versus self-exported" depth predictor, the harness-gated 08-24 run, the 4096 default window in
+  the router brief, the missing cp314 genai wheel and this file's own stale header were each stated as
+  current somewhere after a later measurement in the same repo had contradicted them. Marked inline rather
+  than deleted, per the convention 303a409 set.
 
 ## Open questions / risks
 - ~~Does a prebuilt Genie model exist for a Qwen3 / Llama size that fits 32GB?~~ ANSWERED 2026-08-23:
@@ -556,7 +648,10 @@ and record tg uplift + acceptance rate per model.
   depth. 8192 multi-length is the default. This entry outlived its answer by three days because the
   measurement was recorded in the decision log and the open-questions list was never re-read against
   it -- worth noting, since a stale open question costs someone a re-measurement.
-- **The GPU/CPU baselines are not like-for-like with the NPU's** -- different prompts, and taken while
-  the box was loaded. Re-measure all three together on a quiet box before quoting any speedup.
+- **The three engines have not been measured together with one harness** -- re-scoped 2026-09-16. This
+  entry said the GPU/CPU rows were taken on a loaded box; they have since been re-measured quiet, and a
+  same-harness NPU+CPU pair exists (`docs/MULTI_ENGINE.md`, open questions). What is missing is one
+  harness, one model, one session across all three legs -- see the Phase 3 item. Do not quote a
+  three-way speedup before then.
 - Quantization quality: native INT4 on HTP vs the GGUF Q4/Q6 baselines -- compare perplexity
   once a converted model exists (ties into the model-selection quality pass).

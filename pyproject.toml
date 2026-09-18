@@ -31,8 +31,14 @@ ignore = [
 # Tests reach into privates on purpose: the pure logic under test (_plan,
 # _commit, _verdict, _probe_crosscheck) is private precisely because it is
 # internal, and testing it through the public surface would need a device.
+#
+# That needs NO entry below. The private-access rule is SLF001, from the
+# flake8-self family, and `select` above does not enable "SLF" -- so it cannot
+# fire anywhere. An SLF001 ignore sat in this list for a while as a no-op,
+# reading as though something were being policed in src/ and waived here. If
+# "SLF" is ever added to `select`, the tests/* ignore has to come back in the
+# same edit: `ruff check --isolated --select SLF001 tests` reports hundreds.
 "tests/*" = [
-    "SLF001",   # see above
     "RUF059",   # unused unpacked variable. Unpacking a function's FULL return
                 # tuple documents its contract at the call site even when one
                 # test only asserts on part of it -- `p, dropped, fits,

@@ -18,6 +18,14 @@ Every NPU run is placement-verified: session build is only accepted if the
 QNN HTP graph compiler actually emitted its compile stages (see qnn_ep.py).
 A silent CPU fallback is treated as a failure, not a slow success.
 
+Each timing keeps its per-iteration samples and reports the median and the
+min beside the mean: the mean is the headline (its meaning is unchanged from
+when it was the only figure), the median is what one co-tenant spike cannot
+move, and the min is the floor the hardware reached. Every case also records
+one box-state reading (power, pack, clock) through bench_endpoint.box_state,
+because a GEMM figure with no record of the clock it ran at cannot be
+compared with the next one -- the same instrument and key the HTTP tools use.
+
 Usage
 -----
     python bench.py --all
@@ -31,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import statistics
 import sys
 import tempfile
 import time
@@ -40,6 +49,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bench_endpoint  # box_state: the one power/clock sampler all the bench tools share
 import qnn_ep
 
 
@@ -101,14 +111,42 @@ def make_qdq_gemm(path: str, M: int, K: int, N: int, seed: int = 0) -> str:
 # Timing
 # --------------------------------------------------------------------------
 
-def time_session(session, feeds: dict, iters: int, warmup: int) -> float:
-    """Return mean seconds/run over `iters` runs after `warmup` warmup runs."""
+def time_session(session, feeds: dict, iters: int, warmup: int) -> list[float]:
+    """Per-iteration seconds over `iters` runs after `warmup` warmup runs.
+
+    One perf_counter read per iteration rather than one window over all of
+    them: the window gave a mean and nothing else, so a single co-tenant
+    spike (this box runs a desktop session and, often, a resident LLM
+    server) moved the headline GFLOP/s with no way to see that it had. The
+    per-read overhead is sub-microsecond against millisecond matmuls.
+    """
     for _ in range(warmup):
         session.run(None, feeds)
-    t0 = time.perf_counter()
+    times = []
     for _ in range(iters):
+        t0 = time.perf_counter()
         session.run(None, feeds)
-    return (time.perf_counter() - t0) / iters
+        times.append(time.perf_counter() - t0)
+    return times
+
+
+def summarise(times: list[float]) -> tuple[float, float, float]:
+    """(mean, median, min) seconds of one timing's per-iteration samples."""
+    return sum(times) / len(times), statistics.median(times), min(times)
+
+
+def _box():
+    """One box-state reading as the dict a result carries; Nones if unread.
+
+    bench_endpoint's sampler and bench_endpoint's keys, so `clock_pct` here
+    is the same instrument under the same name as in the HTTP tools' output.
+    Never raises: a benchmark must not fail because PowerShell did.
+    """
+    try:
+        ac, pct, watts, clock = bench_endpoint.box_state()
+    except Exception:
+        ac = pct = watts = clock = None
+    return {"on_ac": ac, "charge_pct": pct, "charge_w": watts, "clock_pct": clock}
 
 
 def _run_pair(model_path, feeds, M, K, N, iters, warmup, verify, unit):
@@ -119,34 +157,50 @@ def _run_pair(model_path, feeds, M, K, N, iters, warmup, verify, unit):
     raises -- fallback is disabled, so a transient HTP execute error like
     QNN_COMMON_ERROR_SYSTEM Code 1003 surfaces here instead of silently
     producing a CPU number labelled "NPU").
+
+    `npu_ms`/`cpu_ms` are MEANS, as they always were; `*_ms_median` and
+    `*_ms_min` sit beside them and the per-iteration samples are kept under
+    `*_times_ms`. The box state is sampled once, right after the NPU leg --
+    the leg every headline here is formed from.
     """
     ops = 2.0 * M * K * N  # MAC counted as 2 ops
     npu_sess, npu_info = qnn_ep.build_session(model_path, use_npu=True, verify=verify)
-    npu_s = None
+    npu_times = None
     npu_run_error = None
     try:
-        npu_s = time_session(npu_sess, feeds, iters, warmup)
+        npu_times = time_session(npu_sess, feeds, iters, warmup)
     except Exception as e:  # HTP execute failed; fallback is disabled
         # `or [""]` because splitlines() on an empty message returns [] -- an
         # exception with no text would then raise IndexError from inside this
         # handler and replace the device error with one from the error path.
         npu_run_error = f"{type(e).__name__}: {(str(e).splitlines() or [''])[0][:180]}"
+    box = _box()
 
     cpu_sess, _ = qnn_ep.build_session(model_path, use_npu=False, verify=False)
-    cpu_s = time_session(cpu_sess, feeds, iters, warmup)
+    cpu_times = time_session(cpu_sess, feeds, iters, warmup)
+    cpu_s, cpu_med, cpu_min = summarise(cpu_times)
 
     r = {
         "M": M, "K": K, "N": N,
-        "cpu_ms": cpu_s * 1e3, "cpu_gops": ops / cpu_s / 1e9,
+        "cpu_ms": cpu_s * 1e3, "cpu_ms_median": cpu_med * 1e3, "cpu_ms_min": cpu_min * 1e3,
+        "cpu_gops": ops / cpu_s / 1e9,
+        "cpu_times_ms": [t * 1e3 for t in cpu_times],
         "htp_verified": npu_info["htp_verified"],
         "providers": npu_info["providers"],
         "unit": unit,
         "npu_run_error": npu_run_error,
+        "box": box,
     }
     if npu_run_error is None:
-        r.update(npu_ms=npu_s * 1e3, npu_gops=ops / npu_s / 1e9, speedup=cpu_s / npu_s)
+        npu_s, npu_med, npu_min = summarise(npu_times)
+        r.update(npu_ms=npu_s * 1e3, npu_ms_median=npu_med * 1e3, npu_ms_min=npu_min * 1e3,
+                 npu_gops=ops / npu_s / 1e9,
+                 npu_times_ms=[t * 1e3 for t in npu_times],
+                 speedup=cpu_s / npu_s, speedup_median=cpu_med / npu_med)
     else:
-        r.update(npu_ms=float("nan"), npu_gops=float("nan"), speedup=float("nan"))
+        nan = float("nan")
+        r.update(npu_ms=nan, npu_ms_median=nan, npu_ms_min=nan, npu_gops=nan,
+                 npu_times_ms=[], speedup=nan, speedup_median=nan)
     return r
 
 
@@ -174,22 +228,54 @@ def bench_int8(model_dir, shape, iters, warmup, verify):
     return r
 
 
+def _clock_cell(box):
+    """The clock column: a percentage, or '--' when the read failed.
+
+    Never a 0 or a -1 for an unread clock -- both look like measurements.
+    """
+    clock = (box or {}).get("clock_pct")
+    return "--" if clock is None else f"{clock:.0f}"
+
+
 def bench_sweep(model_dir, K, N, iters, warmup, verify, lengths=(128, 512, 2048)):
     print(f"\n=== FP16 prompt-length sweep (K=N={K}) ===")
-    print(f"{'tokens':>7} {'NPU ms':>8} {'CPU ms':>8} {'NPU GFLOP/s':>12} {'NPU win':>8} {'HTP':>4}")
+    print(f"{'tokens':>7} {'NPU ms':>8} {'NPU med':>8} {'CPU ms':>8} {'NPU GFLOP/s':>12} "
+          f"{'NPU win':>8} {'HTP':>4} {'clk%':>5}")
     results = []
     for M in lengths:
         path = make_fp32_gemm(os.path.join(model_dir, f"sweep_{M}.onnx"), M, K, N)
         A = (np.random.default_rng(1).standard_normal((M, K)).astype(np.float32) * 0.05)
         r = _run_pair(path, {"A": A}, M, K, N, iters, warmup, verify, "GFLOP/s")
+        clk = _clock_cell(r.get("box"))
         if r["npu_run_error"]:
-            print(f"{M:>7} {'FAIL':>8} {r['cpu_ms']:>8.2f} {'--':>12} {'--':>8} {'ERR':>4}")
+            print(f"{M:>7} {'FAIL':>8} {'--':>8} {r['cpu_ms']:>8.2f} {'--':>12} {'--':>8} "
+                  f"{'ERR':>4} {clk:>5}")
         else:
             ok = "yes" if r["htp_verified"] else "NO"
-            print(f"{M:>7} {r['npu_ms']:>8.2f} {r['cpu_ms']:>8.2f} "
-                  f"{r['npu_gops']:>12.1f} {r['speedup']:>7.1f}x {ok:>4}")
+            print(f"{M:>7} {r['npu_ms']:>8.2f} {r['npu_ms_median']:>8.2f} {r['cpu_ms']:>8.2f} "
+                  f"{r['npu_gops']:>12.1f} {r['speedup']:>7.1f}x {ok:>4} {clk:>5}")
         results.append(r)
     return results
+
+
+def _box_line(box):
+    """One line of box state, or the honest 'unreadable' -- never a fabricated 0."""
+    box = box or {}
+    parts = []
+    if box.get("clock_pct") is not None:
+        parts.append(f"clock {box['clock_pct']:.0f}% of base")
+    if box.get("charge_pct") is not None:
+        pack = f"pack {box['charge_pct']:.0f}%"
+        if box.get("on_ac") is True:
+            pack += " on AC"
+        elif box.get("on_ac") is False:
+            pack += " ON BATTERY"
+        parts.append(pack)
+    if box.get("charge_w") is not None:
+        parts.append(f"draw {box['charge_w']:.1f} W")
+    if not parts:
+        return "  box: state unreadable (no power or clock record for this case)"
+    return "  box: " + ", ".join(parts)
 
 
 def _print_pair(r):
@@ -199,10 +285,14 @@ def _print_pair(r):
               "transient device error, NOT reported as a CPU number)")
     else:
         ok = "verified" if r["htp_verified"] else "NOT VERIFIED (CPU fallback?)"
-        print(f"  NPU/HTP  {r['npu_ms']:8.2f} ms/run  {r['npu_gops']:8.1f} {r['unit']}   [HTP {ok}]")
-    print(f"  CPU EP   {r['cpu_ms']:8.2f} ms/run  {r['cpu_gops']:8.1f} {r['unit']}")
+        print(f"  NPU/HTP  {r['npu_ms']:8.2f} ms/run  (median {r['npu_ms_median']:.2f}, "
+              f"min {r['npu_ms_min']:.2f})  {r['npu_gops']:8.1f} {r['unit']}   [HTP {ok}]")
+    print(f"  CPU EP   {r['cpu_ms']:8.2f} ms/run  (median {r['cpu_ms_median']:.2f}, "
+          f"min {r['cpu_ms_min']:.2f})  {r['cpu_gops']:8.1f} {r['unit']}")
     if not r["npu_run_error"]:
-        print(f"  NPU speedup: {r['speedup']:.1f}x   providers={r['providers']}")
+        print(f"  NPU speedup: {r['speedup']:.1f}x by mean, {r['speedup_median']:.1f}x by median"
+              f"   providers={r['providers']}")
+    print(_box_line(r.get("box")))
 
 
 # --------------------------------------------------------------------------

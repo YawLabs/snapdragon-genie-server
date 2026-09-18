@@ -67,7 +67,10 @@ claims are neither.
 5. **Genie has no sliding window. Overflowing the compiled window is a hard
    query failure, not a truncation** -- so anything serving on top of it has to
    evict, and eviction has to keep the system turn and never orphan a tool
-   result from its call.
+   result from its call. That includes the END of the conversation: an agent
+   step ends on a tool result, and when that result plus the call that produced
+   it will not fit, the honest answer is a 400 naming the counts, not a 200
+   over a prompt that opens on a bare tool result.
 
 ### If you use ONNX Runtime + the QNN EP instead
 
@@ -90,8 +93,10 @@ Detail and the working attach are in
 | Genie wants `{"stop-sequence": [...]}` | a bare array returns -8 "Top level config is not an object" and is then silently ignored by the generation |
 | GenieAPIService reports `usage` as all zeros | so a client cannot bound a generation *or* detect that it failed to |
 
-Measured with `src/bench_servers.py` and `src/probe_server_semantics.py` --
-standing the other servers up on the same bundle is
+Measured with `src/bench_servers.py` (decode, this server against `geniex
+serve`) and `src/probe_server_semantics.py` (the seed-replay, overflow and
+stop-sequence probes, against any base URL) -- standing the other servers up
+on the same bundle is
 [written down](docs/GENIE_SERVER.md#reproducing-the-cross-server-comparison),
 because one of them takes four undocumented steps. The comparison is in
 [what else serves these bundles](#what-else-serves-these-bundles-and-what-this-does-differently).
@@ -104,7 +109,7 @@ because one of them takes four undocumented steps. The comparison is in
 | **A depth that crosses a compiled-graph boundary** | the 1-token and N-token calls run different graphs, the subtraction stops cancelling, and the noise reads as a convincing thermal curve |
 | **A decode window under ~16 steps** | measures per-request overhead, not decode: a 4-step window reported 0.60 t/s against a true 17.6 |
 | **Sequential A/B on a drifting box** | hands all the drift to whichever arm ran second; interleave instead |
-| **On Windows, a second process can bind a port another is serving** | both binds succeed, the OLD process keeps answering, and your new server logs a clean start while serving nobody |
+| **On Windows, a second process can bind a port another is serving** | both binds succeed, the OLD process keeps answering, and your new server logs a clean start while serving nobody. `genie_server` now refuses its own second bind on any `GENIE_HOST` (it asks for the port with `SO_EXCLUSIVEADDRUSE`), so this trap is about the other servers compared here: check what is already listening before you trust a fresh launch |
 | **A 200 from `/health` does not mean the model generates** | Qwen3.5-9B Q8_0 on the llama-qnn fork build answers every request with an empty completion and `finish_reason: stop`, at an impossible 66 t/s. Smoke-test the tokens, not the status code |
 
 ## Target
@@ -160,7 +165,13 @@ none of them and runs ~10x slower.
 
 `qnn_ep.build_session(...)` captures that native log at the file-descriptor
 level during session construction and **raises `PlacementError`** if the HTP
-compile stages are absent. Placement is asserted, not hoped for.
+compile stages are absent. Placement is asserted, not hoped for. Two failures
+it now explains instead of leaving to a traceback: importing `qnn_ep` without
+the two wheels raises an `ImportError` naming `pip install -r requirements.txt`
+in a clean venv (the [Install](#install) section is the whole fix), and a
+session build that FAILS re-raises the same exception carrying the first 2 KB
+of the native QNN/ORT output it had captured -- the part that says why, which
+the redirect used to swallow.
 
 Note also: the QNN EP HTP only offloads **quantized (QDQ INT8/INT4)** graphs or
 supported float graphs. A plain FP32 op with a bad attach falls back to CPU
@@ -168,20 +179,39 @@ silently -- which is exactly why the verification above matters.
 
 ## Install
 
-The wheels for `onnxruntime` and `onnxruntime-qnn` **ship the same
-`onnxruntime` module** and collide. Install into a clean venv that has **no
-plain `onnxruntime`**:
+Install into a **clean venv** -- one that has never held another
+`onnxruntime` or `onnxruntime-qnn`:
 
 ```powershell
 # Windows ARM64, Python 3.11-3.14
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt        # onnxruntime-qnn pulls onnxruntime 1.29 as a dep
+pip install -r requirements.txt        # onnxruntime-qnn pulls onnxruntime in as a dep
 ```
 
-If a plain `onnxruntime` is already present, do **not** try to patch it in
-place (`uninstall onnxruntime` then `--force-reinstall onnxruntime-qnn
---no-deps` is not enough). Start from a fresh venv.
+**Why clean, corrected 2026-09-17 by opening the wheels.** This section used to
+say the `onnxruntime` and `onnxruntime-qnn` wheels "ship the same `onnxruntime`
+module and collide", and told you to keep plain `onnxruntime` out of the venv.
+That is true of the OLD line and false of the one pinned here:
+
+| wheel | what is inside it | depends on plain `onnxruntime`? |
+|---|---|---|
+| `onnxruntime-qnn` 1.24.4 (the pre-plugin line) | a whole `onnxruntime/` package, 333 files | no -- it IS one, so it collides with the plain wheel |
+| `onnxruntime-qnn` **2.5.0** (pinned in `requirements.txt`) | only `onnxruntime_qnn/` | **yes**: `Requires-Dist: onnxruntime>=1.24.2` |
+
+So with 2.5.0 plain `onnxruntime` is not the enemy, it is the dependency -- which
+is also why the old recovery recipe here (`uninstall onnxruntime`, then
+`--force-reinstall onnxruntime-qnn --no-deps`) was "not enough": it removed the
+only `onnxruntime` module there was. The venv to avoid is one with a 1.x
+`onnxruntime-qnn` left in it, whose files overlap the plain wheel's. A fresh
+venv is still the fix, and still cheaper than untangling one.
+
+The 2.5.0 wheel does not pin WHICH onnxruntime it gets. Everything on this
+page was proven on **1.29.0**, which is what `>=1.24.2` resolved to at the
+time; on 2026-09-17 a fresh install resolves 1.30.0, which has not been run
+here. If the attach misbehaves in a new venv, rebuild it with the proven pair
+pinned in the same resolve -- `pip install onnxruntime==1.29.0 -r
+requirements.txt` -- before suspecting anything else.
 
 ### Getting the bundle and the SDK
 
@@ -221,18 +251,49 @@ python src\bench.py --sweep
 
 It generates the ONNX GEMM models on the fly (into a temp dir), builds an HTP
 session (placement-verified) and a CPU-EP session for each, times both, and
-prints ms/run, GOP/s, and the NPU-vs-CPU speedup. `--no-verify` downgrades the
-placement check from hard-fail to a flag in the output.
+prints ms/run (the mean, with the median and the min beside it), GOP/s, the
+NPU-vs-CPU speedup by mean and by median, and one line of box state per case
+-- clock, pack and charge draw, read through the same sampler and under the
+same `clock_pct` key as the HTTP benchmarks below. `--no-verify` downgrades
+the placement check from hard-fail to a flag in the output.
 
 ### End-to-end LLM throughput
 
 `src/bench.py` measures one matmul. To measure a whole served model, point
-`src/bench_endpoint.py` at a running `genie_server.py`:
+`src/bench_endpoint.py` at a running server. It starts nothing itself, and
+`--base` defaults to `http://127.0.0.1:8123`, where `run-genie-server.ps1`
+serves (a bare `python src\genie_server.py` is on `GENIE_PORT`, default 8080):
 
 ```powershell
 python src\bench_endpoint.py                          # prefill + decode sweep
 python src\bench_endpoint.py --base http://127.0.0.1:8123 --decode-only
 ```
+
+When `/health` does not answer 200 it says which of four problems you have
+rather than "start the server first". `nothing listening at <base> ...` names
+both ports to try, and now applies only when the connection was never made --
+which is also what a `genie_server` that is still loading looks like, since it
+does not listen until its model is resident. `server at <base> is up but not
+ready: HTTP 503 state=... (detail)` tells you NOT to start another. And
+`something at <base> accepted the connection but gave /health no usable answer
+(...)` -- a timeout, a reply that is not HTTP or not JSON -- means a
+listener IS there, so do not start another either: it may still be starting,
+be busy or be stuck, and the tool does not say which, because from outside the
+socket they look alike. A connection something ACCEPTED AND THEN BROKE -- a
+reset, an abort, a broken pipe, a peer that hung up -- gets its own line,
+`something at <base> accepted the connection and then broke it before
+answering /health (...)`, because that symptom does not say whether the thing
+is still there: a wedged server resetting its connections and one being torn
+down look alike. That line names both readings and tells you to re-run -- a
+second attempt that is REFUSED means it has gone. urllib reports this one
+wrapped or bare depending on whether the break beat the send, and both shapes
+now land on that line; the wrapped half used to print "nothing listening ...
+start one" while quoting the reset that contradicts it. For a quick check that
+the server generates at all, `python src\genie_smoke.py` is the tool (exit
+status 0 only if both a plain and a streamed completion came back with
+content, and the streamed one's frames were blank-line terminated -- a stream
+no SDK can dispatch is a FAIL even when every payload parses; `-h` prints its
+usage).
 
 It reports prefill and decode in tokens/sec at several context depths. Decode
 is measured as the delta between an N-token and a 1-token run at the same depth,
@@ -242,6 +303,19 @@ it in understates prefill by ~16% at shallow depths. Failed requests (a 429, a
 400) skip that point rather than killing a twenty-minute sweep. Because it speaks plain OpenAI HTTP, the same command benchmarks
 a `llama-server` GPU or CPU leg -- which is the only way to get a cross-engine
 comparison on identical prompts.
+
+"Any OpenAI-compatible server" is checked rather than assumed, because the
+method rests on the output cap. Every request carries the cap under BOTH
+spellings (`max_tokens` and `max_completion_tokens`), `cache_prompt: false` so
+a llama-server cannot answer the second request of a pair from a cached prefix,
+and thinking off. The warmup's answer is then inspected before anything is
+measured: a server that ignores the cap, serves an empty completion or reports
+no `usage` is refused by name (`refusing to benchmark <base>: ...`) instead of
+producing a table that looks measured. GenieAPIService fails two of those (no
+cap under either spelling, `usage` all zeros) and the Q8_0 llama-server leg in
+the traps table above fails the third. The run header prints the model id the
+SERVER reports beside `--model`, and warns when they differ, so a number
+cannot be filed under an engine that did not produce it.
 
 **Read the result next to the bundle's `n_ctx`.** On Genie the compiled context
 window sets throughput for every request, so a run is only comparable to
@@ -292,6 +366,16 @@ two scripts that produced these:
    2048    20.89   215.99    10.3x
 ```
 
+That block is the run as it was captured and has NOT been re-pasted: it
+predates several things `bench.py` now prints, and no NPU work was done to
+refresh it. Today each NPU and CPU line reads `... ms/run  (median X, min Y)
+... GFLOP/s`, the speedup line reads `NPU speedup: N.Nx by mean, M.Mx by
+median`, every case ends with a `  box: clock ..% of base, pack ..%, draw ..
+W` line, and the sweep table has `NPU med` and `clk%` columns (the paste also
+lacks the `NPU GFLOP/s` and `HTP` columns the tool prints). The ms figures
+above are the MEANS, which is still what the first number on each line is, so
+the arithmetic below is unaffected.
+
 **Read the 22.0x and the 10.3x together -- they are the same GEMM.** The
 standalone FP16 case and the sweep's 512-token row are both `512x4096x4096`,
 in the run pasted above, minutes apart. Working the printed ms back through
@@ -315,15 +399,21 @@ speedup quoted here inherits whatever the ORT CPU EP is doing that minute.
 Thermal state and machine load do move these numbers, and a busy box gives a
 slower CPU EP and thus a *larger* apparent NPU win -- but that is not what
 happened here, and the direction is worth stating. `--all` runs the sweep
-**last** (`src/bench.py:250-256`), so a warming box predicts the sweep's CPU leg
-to be the slower of the two. It is the faster one, by 2.4x. That is unexplained.
+**last** (the end of `main()` in `src/bench.py`), so a warming box predicts the
+sweep's CPU leg to be the slower of the two. It is the faster one, by 2.4x.
+That is unexplained.
 
-Two harness limits to know before quoting any of this: `bench.py` reports a bare
-mean over 30 iterations with no dispersion, and it always times the NPU leg
-before the CPU leg with no interleaving, so a drifting box shows up as a shifted
-ratio rather than as visible spread. Nothing here checks that the NPU's output is
-numerically *correct*, and the FP16 rows compare fp16-on-HTP against fp32-on-CPU
--- a speed comparison, not an identical computation.
+Two harness limits to know before quoting any of this. When the run above was
+taken `bench.py` reported a bare mean over 30 iterations with no dispersion, so
+these figures carry none; it now prints the median and the min beside the mean,
+keeps the per-iteration samples in its result, and records the box's clock,
+pack and draw per case -- which is what a re-run would need to say whether the
+2.4x was one slow leg or a slow box. What has NOT changed is the order: it
+always times the NPU leg before the CPU leg with no interleaving, so a drifting
+box shows up as a shifted ratio rather than as visible spread. Nothing here
+checks that the NPU's output is numerically *correct*, and the FP16 rows
+compare fp16-on-HTP against fp32-on-CPU -- a speed comparison, not an identical
+computation.
 
 The load-bearing, stable result is the **order-of-magnitude FP16 NPU advantage**
 with **HTP placement verified** -- not the GFLOP/s to three digits, and not any
@@ -370,9 +460,22 @@ Lint with the same config CI would have used, if there were CI:
 python -m ruff check src tests
 ```
 
-417 tests, and **none of them need the NPU, a Genie bundle, or the QAIRT
-SDK** -- they drive the handlers with a fake socket and a stub engine, so they
-run anywhere.
+1159 tests (`python -m pytest --collect-only -q | tail -1` is the count that
+cannot go stale; this sentence said 417 long after it stopped being true), and
+**none of them need the NPU, a Genie bundle, or the QAIRT SDK** -- they drive
+the handlers with a fake socket and a stub engine, and the benchmark tools
+with stubbed HTTP, tokenizers and PowerShell, so they run anywhere. "Anywhere"
+includes a shell that already exports `GENIE_*` for a real server: the
+`tests/conftest.py` fixture pins every setting that was measured flipping a
+test when exported (`BUNDLE_DIR` to the no-bundle path, the window, the margin,
+both token caps, the thinking default, the orphan hold, the eviction switch).
+Host, port, model id, body cap, seed and the supervision timeouts are left
+unpinned on purpose; the tests that touch those assert against the module's
+own value or reload under a patched environment. Two groups skip rather than
+fail where their one outside dependency is missing: the launcher tests, which
+lift statements out of the two `.ps1` files and need a `powershell` or `pwsh`
+on PATH to run them (neither launcher is ever executed as a script), and one
+IPv6 bind test.
 
 That device-free property is load-bearing rather than incidental, and it has a
 cost worth stating: the ctypes bindings and every Genie call are NOT covered.
@@ -466,12 +569,19 @@ where being inside the process is the only way to reach the knob.
 
 **Decode is a tie, and that is the useful result.** `src/bench_servers.py`
 runs the two servers A/B/B/A/A/B, three passes each, restarting between passes
-because the Hexagon is single-flight and they cannot both hold it. Decode is a
-two-request delta at one prompt (`max_tokens` 1 vs 121), so prefill and
-per-request HTTP overhead cancel -- which is what makes two different HTTP
-stacks comparable at all. Depths keep prompt + 120 generated tokens inside one
-compiled graph. Tokens are counted locally from the returned text with the
-bundle's tokenizer, never from `usage`, because one server reports zeros there
+because the Hexagon is single-flight and they cannot both hold it. It starts
+and stops its OWN two servers and nothing else: a listener it did not start on
+either arm's port -- a resident `genie_server` on the launcher's 8123 is the
+usual one -- ends the run with the pid and port named, never with a kill.
+Decode is a two-request delta at one prompt (a cap of 1 against a cap of 121),
+so prefill and per-request HTTP overhead cancel -- which is what makes two
+different HTTP stacks comparable at all. The cap goes out under BOTH spellings
+(`max_tokens` and `max_completion_tokens`) to both arms, with thinking pinned
+off and `cache_prompt: false`, exactly as `bench_endpoint.py` sends it; the
+run behind the table below predates that and sent each arm the one spelling it
+honoured. Depths keep prompt + 120 generated tokens inside one compiled graph.
+Tokens are counted locally from the returned text with the bundle's tokenizer,
+never from `usage`: both arms do report usage, but each by its own convention,
 and two instruments would not be one measurement.
 
 | depth | this server | `geniex serve` | ratio |
@@ -497,7 +607,12 @@ to whichever server you run.
 *Conditions: X1E80100, Windows 11 26200, pack 73% on AC, an ordinary desktop
 session running. Base clock varied 42-79% across passes, which is why the runs
 are interleaved rather than sequential -- drift then lands on both arms instead
-of on whichever ran second. The 5x wider spread on geniex is itself a
+of on whichever ran second. That 42-79% is the tool's OLD instrument, the
+`Win32_Processor` `CurrentClockSpeed / MaxClockSpeed` ratio, and is not the
+same quantity as the `% Processor Performance` counter behind the 34.8% and
+48.9% clock figures in the docs: sampled at the same instant on this box the
+two differed by about 7 points. New runs record the counter, under `clock_pct`,
+like every other bench tool here. The 5x wider spread on geniex is itself a
 measurement, and a reason to read a single sample from either as a range.*
 
 What is actually different here, each verified in this tree:
@@ -526,8 +641,9 @@ What is actually different here, each verified in this tree:
 - **It expects the NPU to wedge.** Wedges are detected by stalled token progress
   rather than elapsed time, `/health` answers without taking the engine lock,
   and the process exits for its supervisor instead of unwinding through a
-  `GenieDialog_free` that can itself hang on a stuck driver. 34 device-free
-  tests cover that decision layer.
+  `GenieDialog_free` that can itself hang on a stuck driver. That decision
+  layer is covered device-free by `tests/test_supervision.py` (45 tests), and
+  the launcher's restart loop by `tests/test_launcher_contract.py`.
 - **It handles Qwen3 reopening its own think block** -- measured at 1 request in
   6, and 1 in 12 on a second sample, each producing the answer twice. A
   matched-pair regex provably cannot catch it, because the opening tag is in the
@@ -603,10 +719,15 @@ Reasons to use something else, none of them hypothetical:
   than exported, so do not read the 4096-vs-8192 gap as an export artifact.
 
 **Untested here (documented, not measured):**
-- **The `onnxruntime-genai` path to full-model decode.** genai 0.15.2 has no
-  cp314 win_arm64 wheel (max cp313), so it cannot share the proven 3.14 venv,
-  and it is now the *alternative* rather than the plan -- Genie got there
-  first. See [docs/MODEL_CONVERSION.md](docs/MODEL_CONVERSION.md).
+- **The `onnxruntime-genai` path to full-model decode.** genai 0.15.2 does
+  ship a cp314 win_arm64 wheel (this bullet said otherwise -- "max cp313" --
+  until it was checked against PyPI; 0.16.0 ships one too). It is untested
+  here because Genie got there first, not because of a version gap, and it is
+  now the *alternative* rather than the plan. Keep it in its own venv anyway:
+  it and `onnxruntime-qnn` 2.5.0 both depend on the plain `onnxruntime` wheel,
+  so sharing one is plausible on paper and untested here, and the proven venv
+  should stay the proven one. See
+  [docs/MODEL_CONVERSION.md](docs/MODEL_CONVERSION.md).
 - **The other conversion pipelines** (Olive INT4, Foundry Local) -- documented
   from vendor tooling, not run end-to-end here.
 - **Speculative decoding** (SSD / Eaglet). Not config-only on this bundle:
@@ -621,17 +742,29 @@ src/qnn_ep.py             register + pick-NPU + build-session + HTP placement as
 src/bench.py              CLI GEMM benchmark (FP16 / INT8 QDQ / prompt-length sweep)
 src/genie_server.py       OpenAI + Anthropic HTTP server over a resident Genie bundle
 src/bench_endpoint.py     prefill/decode benchmark against any OpenAI-compatible server
-src/genie_smoke.py        minimal one-shot Genie generation, for isolating server bugs
-src/bench_contention.py   two engines at once: solo vs contended, cool-gated sampling
-src/bench_servers.py      interleaved A/B against another server on the SAME bundle
-src/probe_server_semantics.py  seed replay / overflow / stop-sequence probes
+src/genie_smoke.py        HTTP smoke test of an ALREADY-RUNNING server (it loads nothing
+                          itself): /v1/models, then one non-streamed and one streamed
+                          completion. Defaults to :8123 (GENIE_PORT overrides the port --
+                          a value that is not one is a note and 8123 -- a [BASE] argument
+                          the URL), takes -h for its usage, prints the model id that
+                          answered, exits non-zero on FAIL or an HTTP error
+src/bench_contention.py   two engines at once: solo vs contended, cool-gated SOLO sampling
+                          (gate live since f3cd053, 2026-08-24 -- the 08-24 concurrency
+                          figures in docs/MULTI_ENGINE.md predate it)
+src/bench_servers.py      interleaved A/B against `geniex serve` on the SAME bundle
+src/probe_server_semantics.py  seed replay / overflow / stop-sequence probes, any base URL
+src/prompt_depth.py       one tokenizer-based prompt-at-depth builder, shared by
+                          bench_servers.py and probe_server_semantics.py
 src/run-genie-server.ps1  launcher + supervisor; finds the bundle/SDK itself (-Model picks 4B/8B)
 src/run-llama-server.ps1  Qwen3.5-9B llama-server legs: CPU (Q4_0) / Adreno (Q4_K_M)
-tests/                    417 device-free tests (no NPU, no bundle, no SDK needed)
+tests/                    1159 device-free tests (no NPU, no bundle, no SDK needed)
 
 docs/GENIE_SERVER.md      the server: endpoints, env vars, and its measured limits
 docs/IMPLEMENTATION_PLAN.md  living plan + decision log; start here for the why
-docs/MODEL_CONVERSION.md  full-LLM path: Olive / AI Hub / Foundry Local + genai caveat
+docs/MODEL_CONVERSION.md  full-LLM path: the proven Genie / AI Hub route (fetch or export;
+                          what each step produced here is in IMPLEMENTATION_PLAN.md), the
+                          hand-rolled QAIRT fallback, and the UNTESTED genai-side
+                          alternatives: Olive / prebuilt HF assets / Foundry Local
 docs/MODEL_OPTIONS.md     the model matrix: what serves where (4B/8B NPU, 9B llama.cpp) and why
 docs/MULTI_ENGINE.md      running NPU + GPU + CPU at once -- 1.45x measured, and why
 docs/TYPED_ROUTER_BRIEF.md  self-contained handoff for the routing work in typed
@@ -665,8 +798,10 @@ A bug report that can be acted on names, at minimum:
 
 That last one is not a formality. This repo documents ambient load producing
 false results: a drifting box hands all its drift to whichever arm ran second,
-base clock varied 42-79% across the cross-server passes here, and a busy box
-gives a slower CPU baseline and so a *larger* apparent NPU win. The rest of
+base clock varied 42-79% across the cross-server passes here (by the
+`Win32_Processor` ratio that tool used then, not the performance counter the
+bench tools record now), and a busy box gives a slower CPU baseline and so a
+*larger* apparent NPU win. The rest of
 that list is under
 [if you are measuring anything on this hardware](#if-you-are-measuring-anything-on-this-hardware).
 A number taken on a loaded box is not comparable to one taken here.
